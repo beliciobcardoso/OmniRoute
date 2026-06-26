@@ -1,0 +1,76 @@
+# ──────────────────────────────────────────────────────────────────────
+#  OmniRoute — Docker Compose para Coolify
+# ──────────────────────────────────────────────────────────────────────
+#
+#  Diferenças vs docker-compose.prod.yml:
+#    - target: runner-base (sem CLIs/docker.io → build leve, sem OOM)
+#    - SEM `env_file: .env`  → Coolify injeta env vars pela UI
+#    - SEM publish de portas → proxy do Coolify roteia via SERVICE_FQDN
+#    - Domínio/URL automáticos via magic vars do Coolify
+#
+#  Como usar no Coolify:
+#    1. New Resource → Docker Compose (Based on Git)
+#    2. Compose file: docker-compose.coolify.yml
+#    3. Em Environment Variables, defina os SECRETS obrigatórios (abaixo)
+#    4. Deploy. O domínio é gerado pela magic var SERVICE_FQDN_OMNIROUTE_20128
+#
+#  Secrets obrigatórios (setar na UI do Coolify — NÃO commitar):
+#    JWT_SECRET             openssl rand -base64 48
+#    API_KEY_SECRET         openssl rand -hex 32
+#    STORAGE_ENCRYPTION_KEY openssl rand -hex 32
+#    INITIAL_PASSWORD       senha do primeiro admin
+# ──────────────────────────────────────────────────────────────────────
+
+services:
+  omniroute:
+    container_name: omniroute
+    build:
+      context: .
+      target: runner-base
+    image: omniroute:coolify
+    restart: unless-stopped
+
+    environment:
+      # ── Domínio/URL (Coolify preenche automaticamente) ────────────────
+      # SERVICE_FQDN_OMNIROUTE_20128 gera o domínio + labels do Traefik
+      # e mapeia o proxy para a porta 20128 do container.
+      - SERVICE_FQDN_OMNIROUTE_20128
+      - BASE_URL=${SERVICE_URL_OMNIROUTE}
+      - NEXT_PUBLIC_BASE_URL=${SERVICE_URL_OMNIROUTE}
+
+      # ── Runtime ───────────────────────────────────────────────────────
+      - NODE_ENV=production
+      - HOSTNAME=0.0.0.0
+      - PORT=20128
+      - DATA_DIR=/app/data
+      - INSTANCE_NAME=omniroute
+
+      # ── Segurança (atrás de HTTPS do proxy Coolify) ───────────────────
+      - AUTH_COOKIE_SECURE=true
+      - REQUIRE_API_KEY=${REQUIRE_API_KEY:-false}
+      - ALLOW_API_KEY_REVEAL=${ALLOW_API_KEY_REVEAL:-false}
+
+      # ── Secrets OBRIGATÓRIOS (definir na UI do Coolify) ───────────────
+      - JWT_SECRET=${JWT_SECRET}
+      - API_KEY_SECRET=${API_KEY_SECRET}
+      - STORAGE_ENCRYPTION_KEY=${STORAGE_ENCRYPTION_KEY}
+      - STORAGE_ENCRYPTION_KEY_VERSION=${STORAGE_ENCRYPTION_KEY_VERSION:-v1}
+      - INITIAL_PASSWORD=${INITIAL_PASSWORD}
+
+    # Porta interna exposta ao proxy do Coolify (sem bind no host)
+    expose:
+      - "20128"
+
+    volumes:
+      - omniroute-data:/app/data
+
+    healthcheck:
+      test: ["CMD", "node", "healthcheck.mjs"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+
+volumes:
+  omniroute-data:
+    name: omniroute-data
