@@ -1,0 +1,101 @@
+# ──────────────────────────────────────────────────────────────────────
+#  OmniRoute — Docker Compose (Coolify)
+# ──────────────────────────────────────────────────────────────────────
+#
+#  Deploy target: Coolify (https://coolify.io), as a "Docker Compose"
+#  resource. Adapted from docker-compose.prod.yml with Coolify-specific
+#  conventions instead of a static host deployment:
+#
+#    - No `container_name` — Coolify appends its own suffix per
+#      application/preview deployment; a fixed name collides across
+#      environments.
+#    - No host `ports:` publish on the app service — Coolify's built-in
+#      proxy (Traefik) reaches the container over the internal Docker
+#      network. `expose:` is enough.
+#    - Domain + HTTPS are handled by Coolify via the `SERVICE_FQDN_*`
+#      magic environment variable (declared with no value below —
+#      Coolify injects the generated/assigned domain at deploy time and
+#      also lets you reference `${SERVICE_FQDN_OMNIROUTE_20128}` inside
+#      other environment values, e.g. NEXT_PUBLIC_BASE_URL).
+#    - Secrets (JWT_SECRET, API_KEY_SECRET, OMNIROUTE_WS_BRIDGE_SECRET,
+#      INITIAL_PASSWORD) are NOT baked into this file. Set them as
+#      Coolify "Environment Variables" on the resource — see
+#      docs/guides/DOCKER_GUIDE.md and .env.example for what each does.
+#
+#  Setup in Coolify:
+#    1. New Resource → Docker Compose → point at this repo/branch,
+#       compose file = docker-compose.coolify.yaml.
+#    2. Set the required env vars listed under `omniroute.environment`
+#       below (the ones with no default / no inline value).
+#    3. Assign a domain to the `omniroute` service on port 20128 (or let
+#       Coolify auto-generate one via SERVICE_FQDN_OMNIROUTE_20128).
+#    4. Deploy. `docker stop` gets a 40s grace period so SQLite WAL can
+#       checkpoint — do not shorten `stop_grace_period`.
+#
+#  The realtime WS bridge (LIVE_WS_PORT, default 20132) is a separate
+#  raw WebSocket server, not served through the Next.js HTTP port. It is
+#  opt-in: only expose/map it if you use the "Live" voice/conductor
+#  feature, and give it its own Coolify domain (SERVICE_FQDN_OMNIROUTE_20132)
+#  if so — see docs/guides/DOCKER_GUIDE.md.
+# ──────────────────────────────────────────────────────────────────────
+
+services:
+  # ── Redis (rate limiter / cache backend, required) ──────────────────
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    volumes:
+      - redis-data:/data
+    command: redis-server --save 60 1 --loglevel warning
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+
+  # ── OmniRoute app ────────────────────────────────────────────────────
+  omniroute:
+    build:
+      context: .
+      target: runner-cli
+    restart: unless-stopped
+    stop_grace_period: 40s
+    depends_on:
+      redis:
+        condition: service_healthy
+    environment:
+      # Coolify magic var — auto-assigns/generates the public domain for
+      # this service+port. Reference it below for the app's own base URL.
+      - SERVICE_FQDN_OMNIROUTE_20128
+      - NODE_ENV=production
+      - PORT=20128
+      - DASHBOARD_PORT=20128
+      - API_PORT=20129
+      - API_HOST=0.0.0.0
+      - HOSTNAME=0.0.0.0
+      - DATA_DIR=/app/data
+      - REDIS_URL=redis://redis:6379
+      # Public origin used for OAuth callbacks and generated links.
+      - NEXT_PUBLIC_BASE_URL=${SERVICE_FQDN_OMNIROUTE_20128}
+      # Internal server-to-server URL for scheduled jobs / self-fetches.
+      - BASE_URL=http://omniroute:20128
+      - AUTH_COOKIE_SECURE=true
+      # ── Required secrets — set these in Coolify, do not hardcode ──
+      - JWT_SECRET=${JWT_SECRET:?set JWT_SECRET in Coolify env vars}
+      - API_KEY_SECRET=${API_KEY_SECRET:?set API_KEY_SECRET in Coolify env vars}
+      - OMNIROUTE_WS_BRIDGE_SECRET=${OMNIROUTE_WS_BRIDGE_SECRET:?set OMNIROUTE_WS_BRIDGE_SECRET in Coolify env vars}
+      - INITIAL_PASSWORD=${INITIAL_PASSWORD:?set INITIAL_PASSWORD in Coolify env vars}
+    expose:
+      - "20128"
+    volumes:
+      - omniroute-data:/app/data
+    healthcheck:
+      test: ["CMD", "node", "healthcheck.mjs"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+
+volumes:
+  omniroute-data:
+  redis-data:
