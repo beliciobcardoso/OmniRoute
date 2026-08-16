@@ -3,6 +3,9 @@ import { runManagedDbHealthCheck } from "@/lib/db/core";
 import { isAuthenticated } from "@/shared/utils/apiAuth";
 import { sanitizeErrorMessage } from "@omniroute/open-sse/utils/error";
 
+// Touches the SQLite singleton — must never run during `next build`.
+export const dynamic = "force-dynamic";
+
 export async function GET(request: Request) {
   if (!(await isAuthenticated(request))) {
     return NextResponse.json({ error: { message: "Authentication required" } }, { status: 401 });

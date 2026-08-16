@@ -12,6 +12,10 @@ import { isValidationFailure, validateBody } from "@/shared/validation/helpers";
 import { resolveApiKey, getOrCreateApiKey } from "@/shared/services/apiKeyResolver";
 import { sanitizeErrorMessage } from "@omniroute/open-sse/utils/error";
 
+// Touches the SQLite singleton (migrationRunner/apiKeyResolver) — must never
+// run during `next build`.
+export const dynamic = "force-dynamic";
+
 /**
  * POST /api/cli-tools/guide-settings/:toolId
  *

@@ -475,7 +475,7 @@ test(
   }
 );
 
-test("build phase uses an in-memory database without creating sqlite files", serial, async () => {
+test("build phase uses a no-op stub without creating sqlite files", serial, async () => {
   const dataDir = makeTempDir("omniroute-db-build-");
 
   try {
@@ -488,13 +488,17 @@ test("build phase uses an in-memory database without creating sqlite files", ser
         const core = await importFresh("src/lib/db/core.ts");
         const db = core.getDbInstance();
 
-        assert.ok(
+        // No native handle at all during `next build` (#SIGABRT in page-data
+        // workers): reads return empty, writes are dropped, nothing to destruct.
+        assert.equal(db.driver, "stub");
+        assert.equal(
           db
             .prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?")
-            .get("provider_connections")
+            .get("provider_connections"),
+          undefined
         );
+        assert.deepEqual(db.prepare("SELECT 1").all(), []);
         assert.equal(fs.existsSync(path.join(dataDir, "storage.sqlite")), false);
-        assert.equal(db.pragma("journal_mode", { simple: true }), "memory");
 
         core.resetDbInstance();
       }

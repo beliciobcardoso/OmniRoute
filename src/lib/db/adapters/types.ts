@@ -10,7 +10,8 @@ export interface PreparedStatement {
 }
 
 export interface SqliteAdapter {
-  readonly driver: "better-sqlite3" | "node:sqlite" | "sql.js";
+  /** `stub` = no-op adapter used during the Next.js production build phase. */
+  readonly driver: "better-sqlite3" | "node:sqlite" | "sql.js" | "stub";
   readonly open: boolean;
   readonly name: string;
 

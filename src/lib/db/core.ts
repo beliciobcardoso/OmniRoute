@@ -5,6 +5,7 @@
  */
 
 import type { SqliteAdapter } from "./adapters/types";
+import { createBuildStubAdapter } from "./adapters/buildStub";
 import {
   tryOpenSync,
   getSqlJsAdapter,
@@ -943,10 +944,19 @@ export function getDbInstance(): SqliteDatabase {
   const existing = getDb();
   if (existing) return existing;
 
-  if (isCloud || isBuildPhase) {
-    if (isBuildPhase) {
-      console.log("[DB] Build phase detected — using in-memory SQLite (read-only)");
-    }
+  if (isBuildPhase) {
+    // Never open a native SQLite handle during `next build`: the page-data
+    // workers tear down while better-sqlite3 `Statement` destructors still hold
+    // an environment cleanup hook, which aborts the worker with SIGABRT
+    // (`RemoveEnvironmentCleanupHook ... Assertion failed: (env) != nullptr`).
+    // The build phase never reads real data anyway.
+    console.log("[DB] Build phase detected — using no-op SQLite stub");
+    const stubDb = createBuildStubAdapter();
+    setDb(stubDb);
+    return stubDb;
+  }
+
+  if (isCloud) {
     const memoryDb = openSqliteDatabase(":memory:");
     memoryDb.pragma("journal_mode = WAL");
     memoryDb.exec(SCHEMA_SQL);
