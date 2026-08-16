@@ -227,7 +227,11 @@ function getMigrationFiles(): Array<{ version: string; name: string; path: strin
       return {
         version: match[1],
         name: match[2],
-        path: path.join(MIGRATIONS_DIR, filename),
+        // MIGRATIONS_DIR is resolved at runtime, so Turbopack cannot statically
+        // scope this join and traces the whole project into the NFT list
+        // (18972 files, 424 build warnings). The migrations are already shipped
+        // explicitly via `outputFileTracingIncludes` in next.config.mjs.
+        path: path.join(/*turbopackIgnore: true*/ MIGRATIONS_DIR, filename),
       };
     })
     .filter(Boolean) as Array<{ version: string; name: string; path: string }>;
