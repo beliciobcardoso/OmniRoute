@@ -621,10 +621,42 @@ export function isLiveWsEnabled(): boolean {
   return v === "1" || v.toLowerCase() === "true";
 }
 
+// Resolves once the auto-start settled (bound, or failed non-fatally). `undefined`
+// when the daemon is disabled or in build/test. The instrumentation hook MUST await
+// this — see the SIGABRT note below.
+let autoStartPromise: Promise<void> | undefined;
+
+/**
+ * The auto-start promise, for callers that must not let the startup outlive their
+ * own context.
+ *
+ * `instrumentation-node.ts` only awaited the module `import()`, so
+ * `startLiveDashboardServer()` kept running after Next.js finished `register()` and
+ * tore that context down. The startup path touches SQLite
+ * (`seedLatestCompressionRunFromDb`, and `auth.ts` via `loadAuthModule`), which
+ * leaves native better-sqlite3 `Statement` objects pending finalization. When the
+ * GC finalized them after the `node::Environment` was gone, the destructor called
+ * `RemoveEnvironmentCleanupHook()` on a null env and aborted the whole process:
+ *
+ *   Assertion failed: (env) != nullptr  →  SIGABRT  →  container crash-loop
+ *
+ * Same failure class as the `next build` worker crash fixed by the build-phase
+ * SQLite stub (`src/lib/db/adapters/buildStub.ts`); this is the runtime half.
+ * Awaiting this promise keeps every native handle inside the caller's live context.
+ */
+export function getLiveWsAutoStartPromise(): Promise<void> | undefined {
+  return autoStartPromise;
+}
+
 if (!isBuildOrTest() && isLiveWsEnabled()) {
   const port = parseInt(process.env.LIVE_WS_PORT || String(DEFAULT_PORT), 10);
   const host = process.env.LIVE_WS_HOST || DEFAULT_HOST;
-  startLiveDashboardServer(port, host).catch((err) => {
-    console.error("[LiveWS] Failed to start: %s", err instanceof Error ? err.message : String(err));
-  });
+  autoStartPromise = startLiveDashboardServer(port, host)
+    .then(() => undefined)
+    .catch((err) => {
+      console.error(
+        "[LiveWS] Failed to start: %s",
+        err instanceof Error ? err.message : String(err)
+      );
+    });
 }

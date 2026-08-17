@@ -59,6 +59,11 @@ export function normalizeBootError(err: unknown): Error {
 // close/reload racing with this boot (#6560).
 const TRANSIENT_DB_CLOSED_RE = /database\s*(connection\s*)?(is\s*)?closed/i;
 
+// Upper bound on how long boot waits for the live WebSocket daemon to settle.
+// The wait itself exists to keep the daemon's native SQLite handles inside this
+// context (see the call site); the cap keeps a wedged bind from stalling startup.
+const LIVE_WS_START_TIMEOUT_MS = 10_000;
+
 /**
  * Initialize the SQLite singleton for boot, tolerating one transient
  * "database closed" failure (#6560) by retrying once — the driverFactory
@@ -451,7 +456,20 @@ export async function registerNodejs(): Promise<void> {
     // run in standalone) fires that flag-gated auto-start. Side-effect import + the
     // module's own `.catch` keep it non-fatal.
     try {
-      await import("@/server/ws/liveServer");
+      const liveServer = await import("@/server/ws/liveServer");
+      // Await the auto-start, not just the import. The startup path touches SQLite,
+      // and letting it run past `register()` meant its native better-sqlite3
+      // `Statement` objects were finalized after this context's `node::Environment`
+      // was destroyed — `Assertion failed: (env) != nullptr` → SIGABRT → the
+      // container crash-loop seen on Coolify. Bounded so a hung bind cannot stall
+      // startup forever; still non-fatal.
+      await Promise.race([
+        liveServer.getLiveWsAutoStartPromise() ?? Promise.resolve(),
+        new Promise<void>((resolve) => {
+          const t = setTimeout(resolve, LIVE_WS_START_TIMEOUT_MS);
+          (t as { unref?: () => void })?.unref?.();
+        }),
+      ]);
       console.log("[STARTUP] Live dashboard WebSocket daemon bootstrap invoked");
     } catch (err: unknown) {
       const msg = err instanceof Error ? err.message : String(err);
