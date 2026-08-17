@@ -176,6 +176,8 @@ let lastSyncModelCount = 0;
 let activeSyncIntervalMs = SYNC_INTERVAL_MS;
 let firstSyncDone = false;
 let syncInProgress = false;
+// Set by startPeriodicSync(); read via getArenaInitialSyncPromise().
+let initialSyncPromise: Promise<void> | undefined;
 
 function getErrorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
@@ -470,8 +472,9 @@ function startPeriodicSync(intervalMs?: number): void {
   activeSyncIntervalMs = interval;
   console.log(`[ARENA_ELO_SYNC] Starting periodic sync every ${interval / 1000}s`);
 
-  // Initial sync (non-blocking)
-  syncArenaElo()
+  // Initial sync. Kept as a promise (see getArenaInitialSyncPromise) so the caller
+  // can keep it inside its own context instead of letting it run loose.
+  initialSyncPromise = syncArenaElo()
     .then((result) => {
       if (result.success) {
         console.log(
@@ -552,6 +555,24 @@ export function getArenaEloSyncStatus(): SyncStatus {
  * All errors during initialization or the initial sync are caught and logged
  * — initialization is never fatal.
  */
+/**
+ * The initial sync promise, so a caller can ensure it does not outlive its context.
+ *
+ * The initial sync used to be pure fire-and-forget. It writes model intelligence rows
+ * through better-sqlite3, so when the Next.js `register()` context was torn down while
+ * the sync was still in flight, the native `Statement` finalizers ran against a
+ * destroyed `node::Environment`:
+ *
+ *   Assertion failed: (env) != nullptr  →  SIGABRT
+ *
+ * That crash-looped the container on Coolify. Bounded by design: every leaderboard
+ * fetch carries `AbortSignal.timeout(30000)` and they run in parallel, so awaiting
+ * this adds at most ~30s to boot in the worst case.
+ */
+export function getArenaInitialSyncPromise(): Promise<void> | undefined {
+  return initialSyncPromise;
+}
+
 export async function initArenaEloSync(): Promise<boolean> {
   if (!getEffectiveArenaEloSyncEnabled()) {
     console.log(

@@ -391,9 +391,15 @@ export async function registerNodejs(): Promise<void> {
       // Arena ELO sync: model intelligence from the Arena AI leaderboard, powering the
       // Free Provider Rankings page. On by default; configurable from Dashboard Feature Flags.
       // Non-blocking — the initial sync is fire-and-forget and never fatal.
-      const { initArenaEloSync } = await import("@/lib/arenaEloSync");
+      const { initArenaEloSync, getArenaInitialSyncPromise } = await import("@/lib/arenaEloSync");
       const started = await initArenaEloSync();
       if (started) {
+        // Await the initial sync, not just the scheduler. It writes through
+        // better-sqlite3; leaving it in flight past `register()` meant its native
+        // `Statement` finalizers ran on a destroyed `node::Environment`
+        // (`Assertion failed: (env) != nullptr` → SIGABRT → container crash-loop).
+        // Self-bounded: each leaderboard fetch carries AbortSignal.timeout(30s).
+        await (getArenaInitialSyncPromise() ?? Promise.resolve());
         console.log("[STARTUP] Arena ELO sync initialized");
       }
     } catch (err: unknown) {
