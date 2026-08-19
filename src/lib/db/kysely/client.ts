@@ -2,6 +2,7 @@ import { Kysely } from "kysely";
 
 import { resolveDbDriverConfig } from "../driverConfig";
 import { createPostgresDialect } from "./dialect";
+import { runPostgresBootstrap } from "../postgres/bootstrapPostgres";
 import type { Database } from "./types";
 
 /**
@@ -14,6 +15,7 @@ import type { Database } from "./types";
 export class KyselyNotAvailableError extends Error {}
 
 let cachedDb: Kysely<Database> | null = null;
+let bootstrapPromise: Promise<void> | null = null;
 
 export function getKyselyDb(): Kysely<Database> {
   if (cachedDb) return cachedDb;
@@ -32,8 +34,22 @@ export function getKyselyDb(): Kysely<Database> {
   return cachedDb;
 }
 
+/**
+ * Creates all 104 relational tables (idempotent) if they don't already
+ * exist. Callers that need the schema to exist — a converted domain module,
+ * or app startup in Postgres mode — must call this explicitly; getKyselyDb()
+ * itself stays a plain, synchronous client getter with no I/O side effects.
+ */
+export async function ensurePostgresBootstrap(): Promise<void> {
+  if (!bootstrapPromise) {
+    bootstrapPromise = runPostgresBootstrap(getKyselyDb());
+  }
+  await bootstrapPromise;
+}
+
 /** Test-only: closes and clears the cached client so tests get a fresh instance. */
 export async function resetKyselyDb(): Promise<void> {
+  bootstrapPromise = null;
   if (cachedDb) {
     await cachedDb.destroy();
     cachedDb = null;

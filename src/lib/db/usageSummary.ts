@@ -1,7 +1,7 @@
 import { getDbInstance } from "./core.ts";
 import type { SqliteAdapter } from "./adapters/types.ts";
 import { resolveDbDriverConfig } from "./driverConfig";
-import { getKyselyDb } from "./kysely/client";
+import { ensurePostgresBootstrap, getKyselyDb } from "./kysely/client";
 
 /** Total input+output tokens rolled up in daily_usage_summary for the current calendar month. */
 export async function sumUsageTokensThisMonth(db?: SqliteAdapter): Promise<number> {
@@ -27,6 +27,7 @@ export async function sumUsageTokensThisMonth(db?: SqliteAdapter): Promise<numbe
 async function sumUsageTokensThisMonthPostgres(): Promise<number> {
   const monthStart = `${new Date().toISOString().slice(0, 7)}-01`;
   try {
+    await ensurePostgresBootstrap();
     const row = await getKyselyDb()
       .selectFrom("daily_usage_summary")
       .select((eb) => [
