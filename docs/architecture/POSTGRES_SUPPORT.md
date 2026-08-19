@@ -40,6 +40,21 @@ _optional_ backend.
 needed) and mature `MERGE`/`ON CONFLICT` support used to translate SQLite's
 `INSERT OR IGNORE`/`INSERT OR REPLACE` patterns.
 
+## Deployment topology: external instance by default
+
+The expected setup is an **externally managed Postgres instance** — one already
+running on the host/VPS (or a managed service), shared across whatever else lives
+there, not something OmniRoute provisions or owns. OmniRoute only ever _connects_ to
+it via `DATABASE_URL`; it never creates the server process, and there is no
+lifecycle coupling between "OmniRoute is up" and "Postgres is up." Dev and prod use
+the same pattern — point `DATABASE_URL` at whichever instance is appropriate for that
+environment.
+
+The `postgres` profile in [`docker-compose.yml`](../../docker-compose.yml) is a
+**fallback convenience only**, for someone who doesn't already have a Postgres
+instance available (quick local testing, a from-scratch VPS). It is not the primary
+or recommended path and is never required.
+
 ## Configuration
 
 ```bash

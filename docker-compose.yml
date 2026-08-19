@@ -223,9 +223,11 @@ services:
   # ── Profile: cliproxyapi (CLIProxyAPI as sidecar) ─────────────────
   # ── Profile: postgres (opt-in alternative storage backend) ────
   # Off by default. SQLite remains the default and only backend for the
-  # Electron build. When DB_DRIVER=postgres and DATABASE_URL point here,
-  # OmniRoute's server-mode DB layer uses this instead of SQLite. Not a
-  # data migration path — starts from an empty database. See
+  # Electron build. This service is a FALLBACK CONVENIENCE for local/dev use
+  # only — the expected setup is an externally managed Postgres instance
+  # (dev and prod both just point DATABASE_URL at whichever instance is
+  # appropriate; OmniRoute never owns the Postgres process). Not a data
+  # migration path — starts from an empty database. See
   # docs/architecture/POSTGRES_SUPPORT.md.
   postgres:
     image: postgres:16-alpine
