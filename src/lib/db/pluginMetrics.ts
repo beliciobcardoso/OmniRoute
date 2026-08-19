@@ -13,6 +13,8 @@
  */
 
 import { getDbInstance } from "./core";
+import { resolveDbDriverConfig } from "./driverConfig";
+import { ensurePostgresBootstrap, getKyselyDb } from "./kysely/client";
 
 export interface PluginMetricRow {
   pluginName: string;
@@ -37,12 +39,16 @@ function rowToMetric(row: Record<string, unknown>): PluginMetricRow {
 /**
  * Record a hook execution metric. Uses UPSERT to increment counters.
  */
-export function recordPluginMetric(
+export async function recordPluginMetric(
   pluginName: string,
   event: string,
   durationMs: number,
   isError: boolean
-): void {
+): Promise<void> {
+  if (resolveDbDriverConfig().driver === "postgres") {
+    return recordPluginMetricPostgres(pluginName, event, durationMs, isError);
+  }
+
   try {
     const db = getDbInstance();
     const now = new Date().toISOString();
@@ -61,16 +67,80 @@ export function recordPluginMetric(
   }
 }
 
+async function recordPluginMetricPostgres(
+  pluginName: string,
+  event: string,
+  durationMs: number,
+  isError: boolean
+): Promise<void> {
+  try {
+    await ensurePostgresBootstrap();
+    const now = new Date().toISOString();
+    const errors = isError ? 1 : 0;
+
+    await getKyselyDb()
+      .insertInto("plugin_metrics")
+      .values({
+        plugin_name: pluginName,
+        event,
+        calls: 1,
+        errors,
+        total_duration_ms: durationMs,
+        last_called_at: now,
+      })
+      .onConflict((oc) =>
+        oc.columns(["plugin_name", "event"]).doUpdateSet((eb) => ({
+          calls: eb("plugin_metrics.calls", "+", 1),
+          errors: eb("plugin_metrics.errors", "+", errors),
+          total_duration_ms: eb("plugin_metrics.total_duration_ms", "+", durationMs),
+          last_called_at: now,
+        }))
+      )
+      .execute();
+  } catch {
+    // Best-effort: DB hiccup should never break hook execution
+  }
+}
+
 /**
  * Get plugin metrics, optionally filtered by plugin name.
  */
-export function getPluginMetrics(pluginName?: string): PluginMetricRow[] {
+export async function getPluginMetrics(pluginName?: string): Promise<PluginMetricRow[]> {
+  if (resolveDbDriverConfig().driver === "postgres") {
+    return getPluginMetricsPostgres(pluginName);
+  }
+
   try {
     const db = getDbInstance();
     const rows = pluginName
-      ? db.prepare("SELECT * FROM plugin_metrics WHERE plugin_name = ? ORDER BY event").all(pluginName)
+      ? db
+          .prepare("SELECT * FROM plugin_metrics WHERE plugin_name = ? ORDER BY event")
+          .all(pluginName)
       : db.prepare("SELECT * FROM plugin_metrics ORDER BY plugin_name, event").all();
     return (rows as Record<string, unknown>[]).map(rowToMetric);
+  } catch {
+    return [];
+  }
+}
+
+async function getPluginMetricsPostgres(pluginName?: string): Promise<PluginMetricRow[]> {
+  try {
+    await ensurePostgresBootstrap();
+    let query = getKyselyDb().selectFrom("plugin_metrics").selectAll();
+    if (pluginName) {
+      query = query.where("plugin_name", "=", pluginName).orderBy("event");
+    } else {
+      query = query.orderBy("plugin_name").orderBy("event");
+    }
+    const rows = await query.execute();
+    return rows.map((row) =>
+      rowToMetric({
+        ...row,
+        calls: Number(row.calls),
+        errors: Number(row.errors),
+        total_duration_ms: Number(row.total_duration_ms),
+      } as unknown as Record<string, unknown>)
+    );
   } catch {
     return [];
   }
@@ -79,10 +149,24 @@ export function getPluginMetrics(pluginName?: string): PluginMetricRow[] {
 /**
  * Clear plugin metrics, optionally filtered by plugin name.
  */
-export function clearPluginMetrics(pluginName?: string): number {
+export async function clearPluginMetrics(pluginName?: string): Promise<number> {
+  if (resolveDbDriverConfig().driver === "postgres") {
+    return clearPluginMetricsPostgres(pluginName);
+  }
+
   const db = getDbInstance();
   const result = pluginName
     ? db.prepare("DELETE FROM plugin_metrics WHERE plugin_name = ?").run(pluginName)
     : db.prepare("DELETE FROM plugin_metrics").run();
   return result.changes;
+}
+
+async function clearPluginMetricsPostgres(pluginName?: string): Promise<number> {
+  await ensurePostgresBootstrap();
+  let query = getKyselyDb().deleteFrom("plugin_metrics");
+  if (pluginName) {
+    query = query.where("plugin_name", "=", pluginName);
+  }
+  const result = await query.executeTakeFirst();
+  return Number(result.numDeletedRows ?? 0);
 }
