@@ -3,7 +3,11 @@ import assert from "node:assert/strict";
 import { sql } from "kysely";
 
 import { sumUsageTokensThisMonth } from "../../../src/lib/db/usageSummary";
-import { getKyselyDb, resetKyselyDb } from "../../../src/lib/db/kysely/client";
+import {
+  ensurePostgresBootstrap,
+  getKyselyDb,
+  resetKyselyDb,
+} from "../../../src/lib/db/kysely/client";
 
 /**
  * Requires a real Postgres 15+ reachable at DATABASE_URL — see
@@ -19,19 +23,12 @@ test(
     const db = getKyselyDb();
 
     try {
-      await sql`
-        CREATE TABLE IF NOT EXISTS daily_usage_summary (
-          id SERIAL PRIMARY KEY,
-          provider TEXT NOT NULL,
-          model TEXT NOT NULL,
-          date TEXT NOT NULL,
-          total_requests INTEGER NOT NULL DEFAULT 0,
-          total_input_tokens INTEGER NOT NULL DEFAULT 0,
-          total_output_tokens INTEGER NOT NULL DEFAULT 0,
-          total_cost DOUBLE PRECISION NOT NULL DEFAULT 0.0,
-          created_at TEXT NOT NULL DEFAULT now()::text
-        )
-      `.execute(db);
+      // Table creation goes through the shared, advisory-lock-protected
+      // bootstrap rather than an ad hoc CREATE TABLE here — a second,
+      // unprotected DDL statement racing the lock-guarded bootstrap (which
+      // other test files in this same directory also call concurrently)
+      // can hit a duplicate-key error on Postgres's system catalog.
+      await ensurePostgresBootstrap();
       await sql`TRUNCATE TABLE daily_usage_summary`.execute(db);
 
       const thisMonth = new Date().toISOString().slice(0, 7); // YYYY-MM
@@ -64,7 +61,11 @@ test(
 
       assert.equal(await sumUsageTokensThisMonth(), 400);
     } finally {
-      await sql`DROP TABLE IF EXISTS daily_usage_summary`.execute(db);
+      // Leave the table in place — other integration test files in this
+      // directory run concurrently and may depend on it existing (it's
+      // part of the shared bootstrap, not owned by this test). Just clear
+      // the rows this test inserted.
+      await sql`TRUNCATE TABLE daily_usage_summary`.execute(db);
       await resetKyselyDb();
     }
   }
