@@ -15,6 +15,8 @@
  */
 
 import { getDbInstance } from "./core";
+import { resolveDbDriverConfig } from "./driverConfig";
+import { ensurePostgresBootstrap, getKyselyDb } from "./kysely/client";
 
 // ---------------------------------------------------------------------------
 // Queries
@@ -26,10 +28,25 @@ import { getDbInstance } from "./core";
  *
  * @param since - ISO-8601 timestamp lower bound, e.g. "2024-01-01T00:00:00.000Z".
  */
-export function exportProxyLogsSince(since: string): Record<string, unknown>[] {
+export async function exportProxyLogsSince(since: string): Promise<Record<string, unknown>[]> {
+  if (resolveDbDriverConfig().driver === "postgres") {
+    return exportProxyLogsSincePostgres(since);
+  }
+
   const db = getDbInstance();
   const stmt = db.prepare(
     "SELECT * FROM proxy_logs WHERE timestamp >= @since ORDER BY timestamp DESC"
   );
   return stmt.all({ since }) as Record<string, unknown>[];
+}
+
+async function exportProxyLogsSincePostgres(since: string): Promise<Record<string, unknown>[]> {
+  await ensurePostgresBootstrap();
+  const rows = await getKyselyDb()
+    .selectFrom("proxy_logs")
+    .selectAll()
+    .where("timestamp", ">=", since)
+    .orderBy("timestamp", "desc")
+    .execute();
+  return rows as Record<string, unknown>[];
 }
