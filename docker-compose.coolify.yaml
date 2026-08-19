@@ -88,14 +88,32 @@ services:
     expose:
       - "20128"
     volumes:
-      - omniroute-data:/app/data
+      # Host bind mount, NOT a Docker named volume. A crash-looping app
+      # leaves an `exited` container; Coolify's scheduled Docker cleanup
+      # (or a manual `docker system prune`) removes that container first,
+      # the named volume becomes dangling, and the next prune wipes the
+      # SQLite database. A bind mount is never touched by prune.
+      # Create it on the host before the first deploy:
+      #   mkdir -p /data/omniroute && chown -R 1000:1000 /data/omniroute
+      # (1000:1000 = the `node` user the runner image drops to, see
+      # Dockerfile `USER node`.)
+      # Override the host path with OMNIROUTE_HOST_DATA_DIR in Coolify.
+      - ${OMNIROUTE_HOST_DATA_DIR:-/data/omniroute}:/app/data
     healthcheck:
       test: ["CMD", "node", "healthcheck.mjs"]
       interval: 30s
       timeout: 5s
       retries: 3
-      start_period: 15s
+      # The app runs ~110 SQLite migrations plus an Arena ELO sync on
+      # boot. 15s was short enough that a cold start could be reported
+      # unhealthy while it was still legitimately migrating, which makes
+      # a slow boot indistinguishable from a real crash in Coolify's
+      # status. 90s covers a cold start with an empty database.
+      start_period: 90s
 
 volumes:
-  omniroute-data:
+  # `omniroute-data` intentionally removed: app state lives on a host
+  # bind mount (see `omniroute.volumes`) so `docker volume prune` can
+  # never delete the database. Redis here is a disposable cache/rate
+  # limiter, so a named volume is fine for it.
   redis-data:
