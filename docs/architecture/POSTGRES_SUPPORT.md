@@ -50,10 +50,15 @@ lifecycle coupling between "OmniRoute is up" and "Postgres is up." Dev and prod 
 the same pattern — point `DATABASE_URL` at whichever instance is appropriate for that
 environment.
 
-The `postgres` profile in [`docker-compose.yml`](../../docker-compose.yml) is a
-**fallback convenience only**, for someone who doesn't already have a Postgres
-instance available (quick local testing, a from-scratch VPS). It is not the primary
-or recommended path and is never required.
+[`docker-compose.coolify.yaml`](../../docker-compose.coolify.yaml) — the file used
+for this project's actual Coolify deployment — passes `DB_DRIVER`/`DATABASE_URL`
+through to the `omniroute` service as optional Coolify environment variables, so an
+operator can opt in from Coolify's env var UI without touching the compose file. It
+does **not** define a Postgres container: the instance itself is expected to already
+exist (Coolify makes it easy to run a separate Postgres resource on the same host/
+project if one isn't already available elsewhere). `docker-compose.yml` (local dev)
+and `docker-compose.prod.yml` intentionally do not reference Postgres at all — SQLite
+is the only backend either of those has ever needed.
 
 ## Configuration
 

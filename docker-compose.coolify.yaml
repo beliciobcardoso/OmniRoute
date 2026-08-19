@@ -85,6 +85,13 @@ services:
       - API_KEY_SECRET=${API_KEY_SECRET:?set API_KEY_SECRET in Coolify env vars}
       - OMNIROUTE_WS_BRIDGE_SECRET=${OMNIROUTE_WS_BRIDGE_SECRET:?set OMNIROUTE_WS_BRIDGE_SECRET in Coolify env vars}
       - INITIAL_PASSWORD=${INITIAL_PASSWORD:?set INITIAL_PASSWORD in Coolify env vars}
+      # ── Optional: PostgreSQL backend (opt-in, experimental) ──
+      # SQLite remains the default — leave both unset to keep it. To opt in,
+      # set DB_DRIVER=postgres and DATABASE_URL as Coolify env vars, pointing
+      # at an already-running Postgres instance (this compose file does not
+      # provision one). See docs/architecture/POSTGRES_SUPPORT.md.
+      - DB_DRIVER=${DB_DRIVER:-sqlite}
+      - DATABASE_URL=${DATABASE_URL:-}
     expose:
       - "20128"
     volumes:

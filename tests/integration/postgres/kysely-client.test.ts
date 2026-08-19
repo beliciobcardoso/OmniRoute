@@ -5,9 +5,10 @@ import { sql } from "kysely";
 import { getKyselyDb, resetKyselyDb } from "../../../src/lib/db/kysely/client";
 
 /**
- * Requires a real Postgres reachable at DATABASE_URL. Run locally with:
- *   docker compose --profile postgres up -d
- *   DB_DRIVER=postgres DATABASE_URL=postgres://omniroute:omniroute@localhost:5432/omniroute \
+ * Requires a real Postgres 15+ reachable at DATABASE_URL — this project doesn't
+ * provision one via docker-compose (see docs/architecture/POSTGRES_SUPPORT.md),
+ * so point it at any instance you already have. Run locally with e.g.:
+ *   DB_DRIVER=postgres DATABASE_URL=postgres://user:pass@localhost:5432/some_db \
  *     node --import tsx/esm --test tests/integration/postgres/kysely-client.test.ts
  * Wired into CI as the `test-postgres-adapter` job (postgres service container).
  */
