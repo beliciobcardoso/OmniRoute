@@ -221,6 +221,33 @@ services:
       - bifrost
 
   # ── Profile: cliproxyapi (CLIProxyAPI as sidecar) ─────────────────
+  # ── Profile: postgres (opt-in alternative storage backend) ────
+  # Off by default. SQLite remains the default and only backend for the
+  # Electron build. When DB_DRIVER=postgres and DATABASE_URL point here,
+  # OmniRoute's server-mode DB layer uses this instead of SQLite. Not a
+  # data migration path — starts from an empty database. See
+  # docs/architecture/POSTGRES_SUPPORT.md.
+  postgres:
+    image: postgres:16-alpine
+    container_name: omniroute-postgres
+    restart: unless-stopped
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    environment:
+      - POSTGRES_USER=${POSTGRES_USER:-omniroute}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:-omniroute}
+      - POSTGRES_DB=${POSTGRES_DB:-omniroute}
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-omniroute}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    profiles:
+      - postgres
+
   cliproxyapi:
     container_name: cliproxyapi
     image: ghcr.io/router-for-me/cliproxyapi:v6.9.7
@@ -251,3 +278,5 @@ volumes:
     name: omniroute-qdrant-data
   bifrost-data:
     name: omniroute-bifrost-data
+  postgres-data:
+    name: omniroute-postgres-data

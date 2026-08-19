@@ -354,6 +354,7 @@ For any non-trivial change, read the matching deep-dive first:
 | Release flow                                  | `docs/ops/RELEASE_CHECKLIST.md`                         |
 | Embedded services                             | `docs/frameworks/EMBEDDED-SERVICES.md`                  |
 | Quality gates (~48 scripts, allowlist policy) | `docs/architecture/QUALITY_GATES.md`                    |
+| PostgreSQL support (opt-in backend)           | `docs/architecture/POSTGRES_SUPPORT.md`                 |
 
 ---
 

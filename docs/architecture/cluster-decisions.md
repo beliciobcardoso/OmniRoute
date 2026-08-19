@@ -67,17 +67,31 @@ The two profiles here are **scale-out options for deployments that hit the SQLit
 
 The original issue thread floated a larger cluster rewrite. After auditing the actual workload shape, the following are **rejected** for the reasons given:
 
-| Component                            | Verdict  | Reason                                                                                                 |
-| ------------------------------------ | -------- | ------------------------------------------------------------------------------------------------------ |
-| **Dragonfly**                        | **DROP** | `redis:7-alpine` is already fine for the rate-limit workload at production scale; no ceiling to break. |
-| **NATS**                             | **DROP** | Each `omniroute` replica is a single Node.js process; no multi-process pub/sub workload exists.        |
-| **PostgreSQL**                       | **DROP** | SQLite + sqlite-vec + FTS5 cover all 3 use cases; 97 migrations + Electron packaging block migration.  |
-| **Neo4j**                            | **DROP** | Routing is a 5-table join; recursive CTE on SQLite is sufficient.                                      |
-| **MinIO**                            | **DROP** | No multi-MB blob workload; images/audio are passthrough proxies.                                       |
-| **pgvector / pg_ai / pg_textsearch** | **DROP** | Same SQLite-ceiling reason as PostgreSQL; pgvector ecosystem fragmented.                               |
-| **HAProxy / Envoy**                  | **DROP** | Caddy already does LB + TLS; both were explicitly rejected as Tier-1 routers (see `AGENTS.md`).        |
+| Component                                      | Verdict  | Reason                                                                                                              |
+| ---------------------------------------------- | -------- | ------------------------------------------------------------------------------------------------------------------- |
+| **Dragonfly**                                  | **DROP** | `redis:7-alpine` is already fine for the rate-limit workload at production scale; no ceiling to break.              |
+| **NATS**                                       | **DROP** | Each `omniroute` replica is a single Node.js process; no multi-process pub/sub workload exists.                     |
+| **PostgreSQL (as a required cluster sidecar)** | **DROP** | SQLite + sqlite-vec + FTS5 cover all 3 use cases for the default deployment; no ceiling to break for most installs. |
+| **Neo4j**                                      | **DROP** | Routing is a 5-table join; recursive CTE on SQLite is sufficient.                                                   |
+| **MinIO**                                      | **DROP** | No multi-MB blob workload; images/audio are passthrough proxies.                                                    |
+| **pgvector / pg_ai / pg_textsearch**           | **DROP** | Same SQLite-ceiling reason as PostgreSQL; pgvector ecosystem fragmented.                                            |
+| **HAProxy / Envoy**                            | **DROP** | Caddy already does LB + TLS; both were explicitly rejected as Tier-1 routers (see `AGENTS.md`).                     |
 
 If a future use case proves out one of these, this doc is the place to amend.
+
+**Update (2026-08-19):** the PostgreSQL row above only ever ruled out Postgres as a
+_required_ sidecar in this cluster's default 8-service shape — it was never a decision
+about whether OmniRoute's own DB layer could ever speak Postgres. Separately, we are
+now adding PostgreSQL as an **opt-in alternative storage backend** (not a sidecar,
+not a replacement for SQLite, not a required component of this compose stack) for
+self-hosted/server deployments that want a real external database instead of the
+default file-based SQLite. SQLite remains the default and only backend for the
+Electron desktop build. The "97 migrations + Electron packaging block migration" note
+was accurate for a full _migration_ (ripping SQLite out); it does not apply to
+_adding_ a second, optional backend behind a driver switch with no data-migration
+requirement (no production data exists yet). See
+[`docs/architecture/POSTGRES_SUPPORT.md`](./POSTGRES_SUPPORT.md) and
+`_tasks/superpowers/plans/2026-08-19-postgres-adapter.md` for the implementation plan.
 
 ## 4-week rollout (if approved)
 
