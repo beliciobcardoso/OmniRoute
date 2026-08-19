@@ -73,6 +73,7 @@ export const INTENTIONALLY_INTERNAL = new Set([
   "stats", // intentionally-internal: src/app/api/settings/database/refresh-stats/route.ts
   "tierConfig", // intentionally-internal: open-sse/services/tierResolver.ts (require() dinâmico)
   "webSessionDedup", // db-internal: importado só por db/providers.ts (webSessionCredentialKey/parseProviderSpecificData — helpers puros de dedup de credencial web-session split do providers.ts, #3368 PR6)
+  "driverConfig", // db-internal: resolve DB_DRIVER/DATABASE_URL para db/kysely/client.ts — infra do backend Postgres opt-in, não é módulo de domínio (docs/architecture/POSTGRES_SUPPORT.md)
 ]);
 
 // Alias para retrocompatibilidade com os testes existentes que importam KNOWN_UNEXPORTED.

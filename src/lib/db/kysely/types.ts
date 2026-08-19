@@ -45,8 +45,22 @@ export interface ApiKeysTable {
   created_at: string;
 }
 
+export interface DailyUsageSummaryTable {
+  id: Generated<number>;
+  provider: string;
+  model: string;
+  /** Format: YYYY-MM-DD */
+  date: string;
+  total_requests: Generated<number>;
+  total_input_tokens: Generated<number>;
+  total_output_tokens: Generated<number>;
+  total_cost: Generated<number>;
+  created_at: Generated<string>;
+}
+
 export interface Database {
   key_value: KeyValueTable;
   combos: CombosTable;
   api_keys: ApiKeysTable;
+  daily_usage_summary: DailyUsageSummaryTable;
 }
