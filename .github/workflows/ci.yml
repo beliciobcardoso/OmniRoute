@@ -1124,6 +1124,45 @@ jobs:
       # (tsx/esm = QW-b; o alinhamento de ESCOPO do integration com o npm script fica p/ follow-up)
       - run: node --import tsx/esm --import ./tests/_setup/isolateDataDir.ts --test --test-force-exit --test-concurrency=1 --test-shard=${{ matrix.shard }}/2 tests/integration/*.test.ts
 
+  test-postgres-adapter:
+    name: Postgres Adapter (opt-in backend)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    # needs: changes (not build) — no artifact consumed; see test-unit note.
+    needs: changes
+    if: ${{ github.event_name != 'pull_request' || (needs.changes.outputs.code == 'true' && github.event.pull_request.draft == false) }}
+    # Opt-in Postgres backend (docs/architecture/POSTGRES_SUPPORT.md). SQLite
+    # stays the default/only backend everywhere else in this workflow.
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: omniroute
+          POSTGRES_PASSWORD: omniroute
+          POSTGRES_DB: omniroute
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U omniroute"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    env:
+      JWT_SECRET: ci-test-secret-with-sufficient-length-for-validation
+      API_KEY_SECRET: ci-test-api-key-secret-long
+      DB_DRIVER: postgres
+      DATABASE_URL: postgres://omniroute:omniroute@localhost:5432/omniroute
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v6
+        with:
+          node-version: ${{ env.CI_NODE_VERSION }}
+          cache: npm
+      - uses: ./.github/actions/npm-ci-retry
+      - run: node --import tsx/esm --test tests/integration/postgres/*.test.ts
+
   test-security:
     name: Security Tests
     runs-on: ubuntu-latest
