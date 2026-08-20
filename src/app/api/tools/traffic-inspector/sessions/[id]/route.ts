@@ -24,14 +24,15 @@ export async function GET(_request: Request, { params }: Params): Promise<Respon
   const { id } = await params;
 
   try {
-    const session = getSession(id);
+    const session = await getSession(id);
     if (!session) {
       return new Response(JSON.stringify(buildErrorBody(404, "Session not found")), {
         status: 404,
         headers: { "content-type": "application/json" },
       });
     }
-    const requests = getSessionRequests(id).map((r) => {
+    const rawRequests = await getSessionRequests(id);
+    const requests = rawRequests.map((r) => {
       try {
         return JSON.parse(r.payload) as unknown;
       } catch {
@@ -69,7 +70,7 @@ export async function PATCH(request: Request, { params }: Params): Promise<Respo
     );
   }
 
-  const session = getSession(id);
+  const session = await getSession(id);
   if (!session) {
     return new Response(JSON.stringify(buildErrorBody(404, "Session not found")), {
       status: 404,
@@ -79,7 +80,7 @@ export async function PATCH(request: Request, { params }: Params): Promise<Respo
 
   try {
     if (parsed.data.action === "stop") {
-      stopSession(id);
+      await stopSession(id);
     } else if (parsed.data.action === "rename") {
       if (!parsed.data.name) {
         return new Response(
@@ -87,9 +88,9 @@ export async function PATCH(request: Request, { params }: Params): Promise<Respo
           { status: 400, headers: { "content-type": "application/json" } }
         );
       }
-      renameSession(id, parsed.data.name);
+      await renameSession(id, parsed.data.name);
     }
-    return Response.json(getSession(id));
+    return Response.json(await getSession(id));
   } catch (err) {
     const msg = sanitizeErrorMessage(err);
     return new Response(JSON.stringify(buildErrorBody(500, msg || "Failed to update session")), {
@@ -102,7 +103,7 @@ export async function PATCH(request: Request, { params }: Params): Promise<Respo
 export async function DELETE(_request: Request, { params }: Params): Promise<Response> {
   const { id } = await params;
 
-  const session = getSession(id);
+  const session = await getSession(id);
   if (!session) {
     return new Response(JSON.stringify(buildErrorBody(404, "Session not found")), {
       status: 404,
@@ -111,7 +112,7 @@ export async function DELETE(_request: Request, { params }: Params): Promise<Res
   }
 
   try {
-    deleteSession(id);
+    await deleteSession(id);
     return new Response(null, { status: 204 });
   } catch (err) {
     const msg = sanitizeErrorMessage(err);
