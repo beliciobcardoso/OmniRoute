@@ -77,7 +77,7 @@ export async function PUT(request: Request, { params }: RouteParams) {
     }
     const body = validation.data;
 
-    const existing = getMiddlewareHook(name);
+    const existing = await getMiddlewareHook(name);
     if (!existing) {
       return NextResponse.json({ error: "Hook not found" }, { status: 404 });
     }
@@ -123,7 +123,7 @@ export async function DELETE(request: Request, { params }: RouteParams) {
   try {
     const { name } = await params;
 
-    const existing = getMiddlewareHook(name);
+    const existing = await getMiddlewareHook(name);
     if (!existing) {
       return NextResponse.json({ error: "Hook not found" }, { status: 404 });
     }
