@@ -6,8 +6,14 @@
 
 import { getDbInstance } from "./core";
 import { logger } from "../../../open-sse/utils/logger.ts";
+import { resolveDbDriverConfig } from "./driverConfig";
+import { ensurePostgresBootstrap, getKyselyDb } from "./kysely/client";
 
 const log = logger("DB_PLUGINS");
+
+function isPostgres(): boolean {
+  return resolveDbDriverConfig().driver === "postgres";
+}
 
 // ── Types ──
 
@@ -69,7 +75,7 @@ function rowToPlugin(row: any): PluginRow {
     source: row.source,
     tags: row.tags,
     status: row.status,
-    enabled: row.enabled,
+    enabled: Number(row.enabled),
     manifest: row.manifest,
     config: row.config,
     configSchema: row.config_schema,
@@ -85,59 +91,115 @@ function rowToPlugin(row: any): PluginRow {
 
 // ── CRUD ──
 
-export function insertPlugin(input: PluginCreateInput): PluginRow {
-  const db = getDbInstance();
+export async function insertPlugin(input: PluginCreateInput): Promise<PluginRow> {
   const now = new Date().toISOString();
 
-  db.prepare(
-    `INSERT INTO plugins (
-      id, name, version, description, author, license, main, source, tags,
-      status, enabled, manifest, config, config_schema, hooks, permissions,
-      plugin_dir, installed_at, updated_at
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
-  ).run(
-    input.id,
-    input.name,
-    input.version,
-    input.description ?? null,
-    input.author ?? null,
-    input.license ?? "MIT",
-    input.main,
-    input.source ?? "local",
-    JSON.stringify(input.tags ?? []),
-    input.status ?? "installed",
-    input.enabled ? 1 : 0,
-    JSON.stringify(input.manifest),
-    JSON.stringify(input.config ?? {}),
-    JSON.stringify(input.configSchema ?? {}),
-    JSON.stringify(input.hooks ?? []),
-    JSON.stringify(input.permissions ?? []),
-    input.pluginDir,
-    now,
-    now
-  );
+  if (isPostgres()) {
+    await ensurePostgresBootstrap();
+    await getKyselyDb()
+      .insertInto("plugins")
+      .values({
+        id: input.id,
+        name: input.name,
+        version: input.version,
+        description: input.description ?? null,
+        author: input.author ?? null,
+        license: input.license ?? "MIT",
+        main: input.main,
+        source: input.source ?? "local",
+        tags: JSON.stringify(input.tags ?? []),
+        status: input.status ?? "installed",
+        enabled: input.enabled ? 1 : 0,
+        manifest: JSON.stringify(input.manifest),
+        config: JSON.stringify(input.config ?? {}),
+        config_schema: JSON.stringify(input.configSchema ?? {}),
+        hooks: JSON.stringify(input.hooks ?? []),
+        permissions: JSON.stringify(input.permissions ?? []),
+        plugin_dir: input.pluginDir,
+        installed_at: now,
+        updated_at: now,
+      })
+      .execute();
+  } else {
+    const db = getDbInstance();
+    db.prepare(
+      `INSERT INTO plugins (
+        id, name, version, description, author, license, main, source, tags,
+        status, enabled, manifest, config, config_schema, hooks, permissions,
+        plugin_dir, installed_at, updated_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+    ).run(
+      input.id,
+      input.name,
+      input.version,
+      input.description ?? null,
+      input.author ?? null,
+      input.license ?? "MIT",
+      input.main,
+      input.source ?? "local",
+      JSON.stringify(input.tags ?? []),
+      input.status ?? "installed",
+      input.enabled ? 1 : 0,
+      JSON.stringify(input.manifest),
+      JSON.stringify(input.config ?? {}),
+      JSON.stringify(input.configSchema ?? {}),
+      JSON.stringify(input.hooks ?? []),
+      JSON.stringify(input.permissions ?? []),
+      input.pluginDir,
+      now,
+      now
+    );
+  }
 
   log.info("plugin.inserted", { id: input.id, name: input.name });
-  const plugin = getPluginByName(input.name);
+  const plugin = await getPluginByName(input.name);
   if (!plugin) {
     throw new Error(`Failed to retrieve plugin '${input.name}' after insertion`);
   }
   return plugin;
 }
 
-export function getPluginById(id: string): PluginRow | null {
+export async function getPluginById(id: string): Promise<PluginRow | null> {
+  if (isPostgres()) {
+    await ensurePostgresBootstrap();
+    const row = await getKyselyDb()
+      .selectFrom("plugins")
+      .selectAll()
+      .where("id", "=", id)
+      .executeTakeFirst();
+    return row ? rowToPlugin(row) : null;
+  }
+
   const db = getDbInstance();
   const row = db.prepare("SELECT * FROM plugins WHERE id = ?").get(id);
   return row ? rowToPlugin(row) : null;
 }
 
-export function getPluginByName(name: string): PluginRow | null {
+export async function getPluginByName(name: string): Promise<PluginRow | null> {
+  if (isPostgres()) {
+    await ensurePostgresBootstrap();
+    const row = await getKyselyDb()
+      .selectFrom("plugins")
+      .selectAll()
+      .where("name", "=", name)
+      .executeTakeFirst();
+    return row ? rowToPlugin(row) : null;
+  }
+
   const db = getDbInstance();
   const row = db.prepare("SELECT * FROM plugins WHERE name = ?").get(name);
   return row ? rowToPlugin(row) : null;
 }
 
-export function listPlugins(status?: PluginRow["status"]): PluginRow[] {
+export async function listPlugins(status?: PluginRow["status"]): Promise<PluginRow[]> {
+  if (isPostgres()) {
+    await ensurePostgresBootstrap();
+    let query = getKyselyDb().selectFrom("plugins").selectAll();
+    if (status) query = query.where("status", "=", status);
+    const rows = await query.orderBy("name", "asc").execute();
+    return rows.map(rowToPlugin);
+  }
+
   const db = getDbInstance();
   const rows = status
     ? db.prepare("SELECT * FROM plugins WHERE status = ? ORDER BY name").all(status)
@@ -145,18 +207,42 @@ export function listPlugins(status?: PluginRow["status"]): PluginRow[] {
   return rows.map(rowToPlugin);
 }
 
-export function updatePluginStatus(
+export async function updatePluginStatus(
   name: string,
   status: PluginRow["status"],
   errorMessage?: string
-): boolean {
-  const db = getDbInstance();
+): Promise<boolean> {
   const now = new Date().toISOString();
+
+  if (isPostgres()) {
+    await ensurePostgresBootstrap();
+    // `activated_at` records the most-recent activation timestamp and is
+    // intentionally left untouched on deactivation (mirrors the SQLite
+    // COALESCE(?, activated_at) trick — omit the key instead of passing null).
+    // Callers should treat it as "last activated at", not "currently active since".
+    const patch: Record<string, unknown> = {
+      status,
+      enabled: status === "active" ? 1 : 0,
+      error_message: errorMessage ?? null,
+      updated_at: now,
+    };
+    if (status === "active") patch.activated_at = now;
+
+    const result = await getKyselyDb()
+      .updateTable("plugins")
+      .set(patch)
+      .where("name", "=", name)
+      .executeTakeFirst();
+    const changed = Number(result.numUpdatedRows) > 0;
+    if (changed) {
+      log.info("plugin.status_updated", { name, status });
+    }
+    return changed;
+  }
+
+  const db = getDbInstance();
   const activatedAt = status === "active" ? now : null;
 
-  // `activated_at` records the most-recent activation timestamp and is intentionally
-  // preserved on deactivation via COALESCE (activatedAt is null when status != "active").
-  // Callers should treat it as "last activated at", not "currently active since".
   const result = db
     .prepare(
       `UPDATE plugins SET status = ?, enabled = ?, error_message = ?,
@@ -171,10 +257,23 @@ export function updatePluginStatus(
   return result.changes > 0;
 }
 
-export function updatePluginConfig(name: string, config: Record<string, unknown>): boolean {
-  const db = getDbInstance();
+export async function updatePluginConfig(
+  name: string,
+  config: Record<string, unknown>
+): Promise<boolean> {
   const now = new Date().toISOString();
 
+  if (isPostgres()) {
+    await ensurePostgresBootstrap();
+    const result = await getKyselyDb()
+      .updateTable("plugins")
+      .set({ config: JSON.stringify(config), updated_at: now })
+      .where("name", "=", name)
+      .executeTakeFirst();
+    return Number(result.numUpdatedRows) > 0;
+  }
+
+  const db = getDbInstance();
   const result = db
     .prepare("UPDATE plugins SET config = ?, updated_at = ? WHERE name = ?")
     .run(JSON.stringify(config), now, name);
@@ -182,7 +281,20 @@ export function updatePluginConfig(name: string, config: Record<string, unknown>
   return result.changes > 0;
 }
 
-export function deletePlugin(name: string): boolean {
+export async function deletePlugin(name: string): Promise<boolean> {
+  if (isPostgres()) {
+    await ensurePostgresBootstrap();
+    const result = await getKyselyDb()
+      .deleteFrom("plugins")
+      .where("name", "=", name)
+      .executeTakeFirst();
+    const changed = Number(result.numDeletedRows) > 0;
+    if (changed) {
+      log.info("plugin.deleted", { name });
+    }
+    return changed;
+  }
+
   const db = getDbInstance();
   const result = db.prepare("DELETE FROM plugins WHERE name = ?").run(name);
   if (result.changes > 0) {
@@ -191,7 +303,17 @@ export function deletePlugin(name: string): boolean {
   return result.changes > 0;
 }
 
-export function pluginExists(name: string): boolean {
+export async function pluginExists(name: string): Promise<boolean> {
+  if (isPostgres()) {
+    await ensurePostgresBootstrap();
+    const row = await getKyselyDb()
+      .selectFrom("plugins")
+      .select("id")
+      .where("name", "=", name)
+      .executeTakeFirst();
+    return !!row;
+  }
+
   const db = getDbInstance();
   const row = db.prepare("SELECT 1 FROM plugins WHERE name = ?").get(name);
   return !!row;
@@ -218,13 +340,28 @@ export interface PluginAnalyticsSummary {
 /**
  * Record a single plugin execution in plugin_analytics.
  */
-export function recordPluginExecution(
+export async function recordPluginExecution(
   pluginName: string,
   hook: string,
   durationMs: number,
   success: boolean,
   errorMessage?: string
-): void {
+): Promise<void> {
+  if (isPostgres()) {
+    await ensurePostgresBootstrap();
+    await getKyselyDb()
+      .insertInto("plugin_analytics")
+      .values({
+        plugin_name: pluginName,
+        hook,
+        duration_ms: durationMs,
+        success: success ? 1 : 0,
+        error_message: errorMessage ?? null,
+      })
+      .execute();
+    return;
+  }
+
   const db = getDbInstance();
   db.prepare(
     `INSERT INTO plugin_analytics (plugin_name, hook, duration_ms, success, error_message)
@@ -235,7 +372,25 @@ export function recordPluginExecution(
 /**
  * Return execution rows for a given plugin (most recent first).
  */
-export function getPluginAnalytics(pluginName: string): PluginExecutionRow[] {
+export async function getPluginAnalytics(pluginName: string): Promise<PluginExecutionRow[]> {
+  if (isPostgres()) {
+    await ensurePostgresBootstrap();
+    const rows = await getKyselyDb()
+      .selectFrom("plugin_analytics")
+      .select(["plugin_name", "hook", "duration_ms", "success", "error_message", "created_at"])
+      .where("plugin_name", "=", pluginName)
+      .orderBy("created_at", "desc")
+      .execute();
+    return rows.map((r) => ({
+      pluginName: r.plugin_name,
+      hook: r.hook,
+      durationMs: Number(r.duration_ms),
+      success: Number(r.success) === 1,
+      errorMessage: r.error_message,
+      createdAt: r.created_at,
+    }));
+  }
+
   const db = getDbInstance();
   const rows = db
     .prepare(
@@ -258,7 +413,29 @@ export function getPluginAnalytics(pluginName: string): PluginExecutionRow[] {
 /**
  * Return aggregate stats for a given plugin.
  */
-export function getPluginAnalyticsSummary(pluginName: string): PluginAnalyticsSummary {
+export async function getPluginAnalyticsSummary(
+  pluginName: string
+): Promise<PluginAnalyticsSummary> {
+  if (isPostgres()) {
+    await ensurePostgresBootstrap();
+    const row = await getKyselyDb()
+      .selectFrom("plugin_analytics")
+      .select((eb) => [
+        eb.fn.countAll().as("total"),
+        eb.fn.sum(eb.case().when("success", "=", 1).then(1).else(0).end()).as("successes"),
+        eb.fn.sum(eb.case().when("success", "=", 0).then(1).else(0).end()).as("failures"),
+        eb.fn.avg("duration_ms").as("avg_duration"),
+      ])
+      .where("plugin_name", "=", pluginName)
+      .executeTakeFirst();
+    return {
+      totalCalls: Number(row?.total ?? 0),
+      successCount: Number(row?.successes ?? 0),
+      failureCount: Number(row?.failures ?? 0),
+      avgDurationMs: row?.avg_duration !== null ? Number(row?.avg_duration) : 0,
+    };
+  }
+
   const db = getDbInstance();
   const row = db
     .prepare(

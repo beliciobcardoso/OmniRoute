@@ -20,7 +20,11 @@ const { pluginManager } = await import("../../src/lib/plugins/manager.ts");
 // Scanner expects: sourceDir/<plugin-name>/plugin.json + index.js
 // Returns the sourceDir (parent) to pass to pluginManager.install()
 
-function writeTestPlugin(opts?: { name?: string; onRequest?: boolean; enabledByDefault?: boolean }) {
+function writeTestPlugin(opts?: {
+  name?: string;
+  onRequest?: boolean;
+  enabledByDefault?: boolean;
+}) {
   const name = opts?.name ?? "test-lifecycle-plugin";
   const onRequest = opts?.onRequest ?? true;
   const enabledByDefault = opts?.enabledByDefault ?? false;
@@ -65,7 +69,9 @@ const activeSourceDirs: string[] = [];
 
 function cleanupSourceDirs() {
   for (const dir of activeSourceDirs) {
-    try { fs.rmSync(dir, { recursive: true, force: true }); } catch {}
+    try {
+      fs.rmSync(dir, { recursive: true, force: true });
+    } catch {}
   }
   activeSourceDirs.length = 0;
 }
@@ -83,7 +89,9 @@ test.beforeEach(() => {
 test.after(() => {
   core.resetDbInstance();
   cleanupSourceDirs();
-  try { cleanupDir(TEST_DATA_DIR); } catch {}
+  try {
+    cleanupDir(TEST_DATA_DIR);
+  } catch {}
 });
 
 // ── Tests: Install ──
@@ -100,7 +108,7 @@ test("install: copies plugin and creates DB row", async () => {
   assert.equal(row.status, "installed");
 
   // Verify DB lookup works
-  const fromDb = dbPlugins.getPluginByName(name);
+  const fromDb = await dbPlugins.getPluginByName(name);
   assert.ok(fromDb, "plugin should be retrievable from DB");
   assert.equal(fromDb!.name, name);
   assert.equal(fromDb!.version, "1.0.0");
@@ -133,7 +141,7 @@ test("activate: transitions DB status to active", async () => {
   await pluginManager.install(sourceDir);
   await pluginManager.activate(name);
 
-  const row = dbPlugins.getPluginByName(name);
+  const row = await dbPlugins.getPluginByName(name);
   assert.ok(row, "plugin should exist in DB");
   assert.equal(row!.status, "active");
   assert.equal(row!.enabled, 1);
@@ -189,7 +197,7 @@ test("activate: is idempotent for already-active plugin", async () => {
   // Second activate should not throw
   await pluginManager.activate(name);
 
-  const row = dbPlugins.getPluginByName(name);
+  const row = await dbPlugins.getPluginByName(name);
   assert.equal(row!.status, "active");
 
   await pluginManager.uninstall(name);
@@ -209,7 +217,7 @@ test("deactivate: transitions DB status to inactive", async () => {
   await pluginManager.activate(name);
   await pluginManager.deactivate(name);
 
-  const row = dbPlugins.getPluginByName(name);
+  const row = await dbPlugins.getPluginByName(name);
   assert.ok(row, "plugin should still exist in DB after deactivation");
   assert.equal(row!.status, "inactive");
 
@@ -230,7 +238,11 @@ test("deactivate: unregisters all hooks for the plugin", async () => {
 
   // Hook should be gone
   const after = hooks.getHooks("onRequest");
-  assert.equal(after.find((r) => r.pluginName === name), undefined, "hook should be unregistered");
+  assert.equal(
+    after.find((r) => r.pluginName === name),
+    undefined,
+    "hook should be unregistered"
+  );
 
   await pluginManager.uninstall(name);
 });
@@ -265,11 +277,11 @@ test("uninstall: removes DB row", async () => {
   activeSourceDirs.push(sourceDir);
 
   await pluginManager.install(sourceDir);
-  assert.ok(dbPlugins.getPluginByName(name), "should exist before uninstall");
+  assert.ok(await dbPlugins.getPluginByName(name), "should exist before uninstall");
 
   await pluginManager.uninstall(name);
 
-  assert.equal(dbPlugins.getPluginByName(name), null, "should be removed from DB");
+  assert.equal(await dbPlugins.getPluginByName(name), null, "should be removed from DB");
 });
 
 test("uninstall: removes plugin directory from disk", async () => {
@@ -293,14 +305,17 @@ test("uninstall: deactivates before removing if active", async () => {
   await pluginManager.activate(name);
 
   // Verify active + hook registered
-  assert.equal(dbPlugins.getPluginByName(name)!.status, "active");
+  assert.equal((await dbPlugins.getPluginByName(name))!.status, "active");
   assert.ok(hooks.getHooks("onRequest").find((r) => r.pluginName === name));
 
   await pluginManager.uninstall(name);
 
   // Plugin should be fully gone
-  assert.equal(dbPlugins.getPluginByName(name), null);
-  assert.equal(hooks.getHooks("onRequest").find((r) => r.pluginName === name), undefined);
+  assert.equal(await dbPlugins.getPluginByName(name), null);
+  assert.equal(
+    hooks.getHooks("onRequest").find((r) => r.pluginName === name),
+    undefined
+  );
 });
 
 test("uninstall: throws for nonexistent plugin", async () => {
@@ -316,13 +331,16 @@ test("full lifecycle: install -> activate -> hook fires -> deactivate -> uninsta
   // 1. Install
   const row = await pluginManager.install(sourceDir);
   assert.equal(row.status, "installed");
-  assert.ok(dbPlugins.getPluginByName(name), "exists in DB after install");
+  assert.ok(await dbPlugins.getPluginByName(name), "exists in DB after install");
 
   // 2. Activate
   await pluginManager.activate(name);
-  const afterActivate = dbPlugins.getPluginByName(name);
+  const afterActivate = await dbPlugins.getPluginByName(name);
   assert.equal(afterActivate!.status, "active");
-  assert.ok(hooks.getHooks("onRequest").find((r) => r.pluginName === name), "hook registered");
+  assert.ok(
+    hooks.getHooks("onRequest").find((r) => r.pluginName === name),
+    "hook registered"
+  );
 
   // 3. Fire hook (use emitHookBlocking — child-process isolation means plugins cannot
   //    mutate the parent's in-memory payload object; check the returned merged result).
@@ -336,7 +354,7 @@ test("full lifecycle: install -> activate -> hook fires -> deactivate -> uninsta
 
   // 4. Deactivate
   await pluginManager.deactivate(name);
-  const afterDeactivate = dbPlugins.getPluginByName(name);
+  const afterDeactivate = await dbPlugins.getPluginByName(name);
   assert.equal(afterDeactivate!.status, "inactive");
   assert.equal(
     hooks.getHooks("onRequest").find((r) => r.pluginName === name),
@@ -346,7 +364,7 @@ test("full lifecycle: install -> activate -> hook fires -> deactivate -> uninsta
 
   // 5. Uninstall
   await pluginManager.uninstall(name);
-  assert.equal(dbPlugins.getPluginByName(name), null, "removed from DB");
+  assert.equal(await dbPlugins.getPluginByName(name), null, "removed from DB");
 });
 
 // ── Tests: Multi-plugin isolation ──
@@ -370,8 +388,14 @@ test("multiple plugins: hooks are isolated per plugin", async () => {
   await pluginManager.deactivate("multi-p1");
 
   const afterDeactivate = hooks.getHooks("onRequest");
-  assert.equal(afterDeactivate.find((r) => r.pluginName === "multi-p1"), undefined);
-  assert.ok(afterDeactivate.find((r) => r.pluginName === "multi-p2"), "p2 hook still registered");
+  assert.equal(
+    afterDeactivate.find((r) => r.pluginName === "multi-p1"),
+    undefined
+  );
+  assert.ok(
+    afterDeactivate.find((r) => r.pluginName === "multi-p2"),
+    "p2 hook still registered"
+  );
 
   // Cleanup
   await pluginManager.uninstall("multi-p1");

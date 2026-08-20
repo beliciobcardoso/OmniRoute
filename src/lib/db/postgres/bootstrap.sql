@@ -760,7 +760,7 @@ CREATE TABLE IF NOT EXISTS plugin_metrics (
 
 CREATE TABLE IF NOT EXISTS plugins (
   id TEXT PRIMARY KEY,
-  name TEXT NOT NULL,
+  name TEXT NOT NULL UNIQUE,
   version TEXT NOT NULL DEFAULT '1.0.0',
   description TEXT,
   author TEXT,

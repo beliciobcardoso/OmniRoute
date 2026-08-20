@@ -34,10 +34,7 @@ const managerSource = readFileSync(
   pathResolve(process.cwd(), "src/lib/plugins/manager.ts"),
   "utf-8"
 );
-const loaderSource = readFileSync(
-  pathResolve(process.cwd(), "src/lib/plugins/loader.ts"),
-  "utf-8"
-);
+const loaderSource = readFileSync(pathResolve(process.cwd(), "src/lib/plugins/loader.ts"), "utf-8");
 
 // ── Fixture helpers ───────────────────────────────────────────────────────────
 
@@ -74,7 +71,8 @@ function writePluginWithMain(opts: {
   );
 
   // Write the main file only for safe relative paths
-  const shouldWrite = opts.writeMainFile !== false && !opts.main.startsWith("..") && !path.isAbsolute(opts.main);
+  const shouldWrite =
+    opts.writeMainFile !== false && !opts.main.startsWith("..") && !path.isAbsolute(opts.main);
   if (shouldWrite) {
     const mainAbs = path.join(sourceDir, opts.main);
     fs.mkdirSync(path.dirname(mainAbs), { recursive: true });
@@ -280,7 +278,7 @@ test("upgrade rejects manifest.main with path traversal and leaves old install i
   );
 
   // Old v1 install should still be in DB (upgrade rolled back before deleting old dir)
-  const row = pluginManager.getPlugin("escape-upgrade");
+  const row = await pluginManager.getPlugin("escape-upgrade");
   assert.ok(row, "Old plugin record should still exist after failed upgrade");
   assert.equal(row.version, "1.0.0", "Old version should be preserved");
 
@@ -306,7 +304,8 @@ test("source: assertWithinPluginDir is called before rm in uninstall", () => {
   // Get the slice from uninstall through the next method
   const afterUninstall = managerSource.slice(uninstallIdx);
   const nextMethodIdx = afterUninstall.indexOf("\n  async ", 10);
-  const uninstallBody = nextMethodIdx !== -1 ? afterUninstall.slice(0, nextMethodIdx) : afterUninstall;
+  const uninstallBody =
+    nextMethodIdx !== -1 ? afterUninstall.slice(0, nextMethodIdx) : afterUninstall;
 
   const guardIdx = uninstallBody.indexOf("assertWithinPluginDir");
   const rmIdx = uninstallBody.indexOf("await rm(");
@@ -342,7 +341,9 @@ test("source: assertWithinPluginDir throws for path outside pluginDir", () => {
   // resolve("/tmp/evil") is not fine when root is "/plugins".
   // Since we can't easily import the unexported helper, verify it uses resolve + sep.
   assert.ok(
-    managerSource.includes('resolve(pluginRoot)') || managerSource.includes('resolve(this_pluginDir)') || managerSource.includes('resolve('),
+    managerSource.includes("resolve(pluginRoot)") ||
+      managerSource.includes("resolve(this_pluginDir)") ||
+      managerSource.includes("resolve("),
     "assertWithinPluginDir must call resolve()"
   );
   assert.ok(
@@ -472,7 +473,7 @@ test("install and uninstall work for a valid plugin (regression)", async () => {
   assert.equal(row.version, "1.0.0");
 
   await pluginManager.uninstall("valid-regression");
-  assert.equal(pluginManager.getPlugin("valid-regression"), null);
+  assert.equal(await pluginManager.getPlugin("valid-regression"), null);
 });
 
 test("upgrade works for a valid newer version (regression)", async () => {
