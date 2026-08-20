@@ -1,6 +1,8 @@
 import { getDbInstance } from "./core";
 import { getApiKeyContextSource } from "./apiKeyContextSources";
 import { encrypt, decrypt } from "./encryption";
+import { resolveDbDriverConfig } from "./driverConfig";
+import { ensurePostgresBootstrap, getKyselyDb } from "./kysely/client";
 
 const OBSIDIAN_NAMESPACE = "obsidian";
 const OBSIDIAN_TOKEN_KEY = "api_key";
@@ -9,14 +11,70 @@ type KeyValueRow = {
   value?: string;
 };
 
-export function getObsidianToken(): string | null {
+function isPostgres(): boolean {
+  return resolveDbDriverConfig().driver === "postgres";
+}
+
+/** Raw (still-JSON-encoded) key_value read, scoped to the obsidian namespace. */
+async function kvGet(key: string): Promise<string | null> {
+  if (isPostgres()) {
+    await ensurePostgresBootstrap();
+    const row = await getKyselyDb()
+      .selectFrom("key_value")
+      .select("value")
+      .where("namespace", "=", OBSIDIAN_NAMESPACE)
+      .where("key", "=", key)
+      .executeTakeFirst();
+    return typeof row?.value === "string" ? row.value : null;
+  }
+
+  const db = getDbInstance();
+  const row = db
+    .prepare("SELECT value FROM key_value WHERE namespace = ? AND key = ?")
+    .get(OBSIDIAN_NAMESPACE, key) as KeyValueRow | undefined;
+  return typeof row?.value === "string" ? row.value : null;
+}
+
+/** Raw (already-JSON-encoded) key_value upsert, scoped to the obsidian namespace. */
+async function kvSet(key: string, jsonValue: string): Promise<void> {
+  if (isPostgres()) {
+    await ensurePostgresBootstrap();
+    await getKyselyDb()
+      .insertInto("key_value")
+      .values({ namespace: OBSIDIAN_NAMESPACE, key, value: jsonValue })
+      .onConflict((oc) => oc.columns(["namespace", "key"]).doUpdateSet({ value: jsonValue }))
+      .execute();
+    return;
+  }
+
+  const db = getDbInstance();
+  db.prepare("INSERT OR REPLACE INTO key_value (namespace, key, value) VALUES (?, ?, ?)").run(
+    OBSIDIAN_NAMESPACE,
+    key,
+    jsonValue
+  );
+}
+
+async function kvClear(key: string): Promise<void> {
+  if (isPostgres()) {
+    await ensurePostgresBootstrap();
+    await getKyselyDb()
+      .deleteFrom("key_value")
+      .where("namespace", "=", OBSIDIAN_NAMESPACE)
+      .where("key", "=", key)
+      .execute();
+    return;
+  }
+
+  const db = getDbInstance();
+  db.prepare("DELETE FROM key_value WHERE namespace = ? AND key = ?").run(OBSIDIAN_NAMESPACE, key);
+}
+
+export async function getObsidianToken(): Promise<string | null> {
   try {
-    const db = getDbInstance();
-    const row = db
-      .prepare("SELECT value FROM key_value WHERE namespace = ? AND key = ?")
-      .get(OBSIDIAN_NAMESPACE, OBSIDIAN_TOKEN_KEY) as KeyValueRow | undefined;
-    if (typeof row?.value !== "string") return null;
-    const parsed = JSON.parse(row.value);
+    const value = await kvGet(OBSIDIAN_TOKEN_KEY);
+    if (value === null) return null;
+    const parsed = JSON.parse(value);
     if (typeof parsed !== "string" || parsed.length === 0) return null;
     // Graceful fallback: if decrypt fails (e.g. no key set) return as-is
     return decrypt(parsed) ?? parsed;
@@ -25,259 +83,197 @@ export function getObsidianToken(): string | null {
   }
 }
 
-export function setObsidianToken(token: string): void {
+export async function setObsidianToken(token: string): Promise<void> {
   try {
-    const db = getDbInstance();
     const encrypted = encrypt(token) ?? token;
-    db.prepare(
-      "INSERT OR REPLACE INTO key_value (namespace, key, value) VALUES (?, ?, ?)"
-    ).run(OBSIDIAN_NAMESPACE, OBSIDIAN_TOKEN_KEY, JSON.stringify(encrypted));
+    await kvSet(OBSIDIAN_TOKEN_KEY, JSON.stringify(encrypted));
   } catch {
     // Non-fatal — token still works in-memory if persistence fails.
   }
 }
 
-export function clearObsidianToken(): void {
+export async function clearObsidianToken(): Promise<void> {
   try {
-    const db = getDbInstance();
-    db.prepare("DELETE FROM key_value WHERE namespace = ? AND key = ?").run(
-      OBSIDIAN_NAMESPACE,
-      OBSIDIAN_TOKEN_KEY
-    );
+    await kvClear(OBSIDIAN_TOKEN_KEY);
   } catch {
     // Non-fatal.
   }
 }
 
-export function getObsidianBaseUrl(): string {
+export async function getObsidianBaseUrl(): Promise<string> {
   try {
-    const db = getDbInstance();
-    const row = db
-      .prepare("SELECT value FROM key_value WHERE namespace = ? AND key = ?")
-      .get(OBSIDIAN_NAMESPACE, "base_url") as KeyValueRow | undefined;
-    if (typeof row?.value === "string") {
-      const parsed = JSON.parse(row.value);
-      return typeof parsed === "string" && parsed.length > 0 ? parsed : "http://127.0.0.1:27123";
-    }
-    return "http://127.0.0.1:27123";
+    const value = await kvGet("base_url");
+    if (value === null) return "http://127.0.0.1:27123";
+    const parsed = JSON.parse(value);
+    return typeof parsed === "string" && parsed.length > 0 ? parsed : "http://127.0.0.1:27123";
   } catch {
     return "http://127.0.0.1:27123";
   }
 }
 
-export function setObsidianBaseUrl(url: string): void {
+export async function setObsidianBaseUrl(url: string): Promise<void> {
   try {
-    const db = getDbInstance();
-    db.prepare(
-      "INSERT OR REPLACE INTO key_value (namespace, key, value) VALUES (?, ?, ?)"
-    ).run(OBSIDIAN_NAMESPACE, "base_url", JSON.stringify(url));
+    await kvSet("base_url", JSON.stringify(url));
   } catch {
     // Non-fatal.
   }
 }
 
-export function clearObsidianBaseUrl(): void {
+export async function clearObsidianBaseUrl(): Promise<void> {
   try {
-    const db = getDbInstance();
-    db.prepare("DELETE FROM key_value WHERE namespace = ? AND key = ?").run(
-      OBSIDIAN_NAMESPACE,
-      "base_url"
-    );
+    await kvClear("base_url");
   } catch {
     // Non-fatal.
   }
 }
 
-export function getObsidianVaultPath(): string | null {
+export async function getObsidianVaultPath(): Promise<string | null> {
   try {
-    const db = getDbInstance();
-    const row = db
-      .prepare("SELECT value FROM key_value WHERE namespace = ? AND key = ?")
-      .get(OBSIDIAN_NAMESPACE, "vault_path") as KeyValueRow | undefined;
-    if (typeof row?.value === "string") {
-      const parsed = JSON.parse(row.value);
-      return typeof parsed === "string" && parsed.length > 0 ? parsed : null;
-    }
-    return null;
+    const value = await kvGet("vault_path");
+    if (value === null) return null;
+    const parsed = JSON.parse(value);
+    return typeof parsed === "string" && parsed.length > 0 ? parsed : null;
   } catch {
     return null;
   }
 }
 
-export function setObsidianVaultPath(vaultPath: string): void {
+export async function setObsidianVaultPath(vaultPath: string): Promise<void> {
   try {
-    const db = getDbInstance();
-    db.prepare(
-      "INSERT OR REPLACE INTO key_value (namespace, key, value) VALUES (?, ?, ?)"
-    ).run(OBSIDIAN_NAMESPACE, "vault_path", JSON.stringify(vaultPath));
+    await kvSet("vault_path", JSON.stringify(vaultPath));
   } catch {
     // Non-fatal.
   }
 }
 
-export function clearObsidianVaultPath(): void {
+export async function clearObsidianVaultPath(): Promise<void> {
   try {
-    const db = getDbInstance();
-    db.prepare("DELETE FROM key_value WHERE namespace = ? AND key = ?").run(
-      OBSIDIAN_NAMESPACE,
-      "vault_path"
-    );
+    await kvClear("vault_path");
   } catch {
     // Non-fatal.
   }
 }
 
-export function getWebdavUsername(): string | null {
+export async function getWebdavUsername(): Promise<string | null> {
   try {
-    const db = getDbInstance();
-    const row = db
-      .prepare("SELECT value FROM key_value WHERE namespace = ? AND key = ?")
-      .get(OBSIDIAN_NAMESPACE, "webdav_username") as KeyValueRow | undefined;
-    if (typeof row?.value === "string") {
-      const parsed = JSON.parse(row.value);
-      return typeof parsed === "string" && parsed.length > 0 ? parsed : null;
-    }
-    return null;
+    const value = await kvGet("webdav_username");
+    if (value === null) return null;
+    const parsed = JSON.parse(value);
+    return typeof parsed === "string" && parsed.length > 0 ? parsed : null;
   } catch {
     return null;
   }
 }
 
-export function setWebdavUsername(username: string): void {
+export async function setWebdavUsername(username: string): Promise<void> {
   try {
-    const db = getDbInstance();
-    db.prepare(
-      "INSERT OR REPLACE INTO key_value (namespace, key, value) VALUES (?, ?, ?)"
-    ).run(OBSIDIAN_NAMESPACE, "webdav_username", JSON.stringify(username));
+    await kvSet("webdav_username", JSON.stringify(username));
   } catch {
     // Non-fatal.
   }
 }
 
-export function clearWebdavUsername(): void {
+export async function clearWebdavUsername(): Promise<void> {
   try {
-    const db = getDbInstance();
-    db.prepare("DELETE FROM key_value WHERE namespace = ? AND key = ?").run(
-      OBSIDIAN_NAMESPACE,
-      "webdav_username"
-    );
+    await kvClear("webdav_username");
   } catch {
     // Non-fatal.
   }
 }
 
-export function getWebdavPassword(): string | null {
+export async function getWebdavPassword(): Promise<string | null> {
   try {
-    const db = getDbInstance();
-    const row = db
-      .prepare("SELECT value FROM key_value WHERE namespace = ? AND key = ?")
-      .get(OBSIDIAN_NAMESPACE, "webdav_password") as KeyValueRow | undefined;
-    if (typeof row?.value === "string") {
-      const parsed = JSON.parse(row.value);
-      if (typeof parsed !== "string" || parsed.length === 0) return null;
-      // Graceful fallback: if decrypt fails return as-is (plaintext backward compat)
-      return decrypt(parsed) ?? parsed;
-    }
-    return null;
+    const value = await kvGet("webdav_password");
+    if (value === null) return null;
+    const parsed = JSON.parse(value);
+    if (typeof parsed !== "string" || parsed.length === 0) return null;
+    // Graceful fallback: if decrypt fails return as-is (plaintext backward compat)
+    return decrypt(parsed) ?? parsed;
   } catch {
     return null;
   }
 }
 
-export function setWebdavPassword(password: string): void {
+export async function setWebdavPassword(password: string): Promise<void> {
   try {
-    const db = getDbInstance();
     const encrypted = encrypt(password) ?? password;
-    db.prepare(
-      "INSERT OR REPLACE INTO key_value (namespace, key, value) VALUES (?, ?, ?)"
-    ).run(OBSIDIAN_NAMESPACE, "webdav_password", JSON.stringify(encrypted));
+    await kvSet("webdav_password", JSON.stringify(encrypted));
   } catch {
     // Non-fatal.
   }
 }
 
-export function clearWebdavPassword(): void {
+export async function clearWebdavPassword(): Promise<void> {
   try {
-    const db = getDbInstance();
-    db.prepare("DELETE FROM key_value WHERE namespace = ? AND key = ?").run(
-      OBSIDIAN_NAMESPACE,
-      "webdav_password"
-    );
+    await kvClear("webdav_password");
   } catch {
     // Non-fatal.
   }
 }
 
-export function getWebdavEnabled(): boolean {
+export async function getWebdavEnabled(): Promise<boolean> {
   try {
-    const db = getDbInstance();
-    const row = db
-      .prepare("SELECT value FROM key_value WHERE namespace = ? AND key = ?")
-      .get(OBSIDIAN_NAMESPACE, "webdav_enabled") as KeyValueRow | undefined;
-    if (typeof row?.value === "string") {
-      return JSON.parse(row.value) === true;
-    }
-    return false;
+    const value = await kvGet("webdav_enabled");
+    return value !== null && JSON.parse(value) === true;
   } catch {
     return false;
   }
 }
 
-export function setWebdavEnabled(enabled: boolean): void {
+export async function setWebdavEnabled(enabled: boolean): Promise<void> {
   try {
-    const db = getDbInstance();
-    db.prepare(
-      "INSERT OR REPLACE INTO key_value (namespace, key, value) VALUES (?, ?, ?)"
-    ).run(OBSIDIAN_NAMESPACE, "webdav_enabled", JSON.stringify(enabled));
+    await kvSet("webdav_enabled", JSON.stringify(enabled));
   } catch {
     // Non-fatal.
   }
 }
 
-export function clearWebdavEnabled(): void {
+export async function clearWebdavEnabled(): Promise<void> {
   try {
-    const db = getDbInstance();
-    db.prepare("DELETE FROM key_value WHERE namespace = ? AND key = ?").run(
-      OBSIDIAN_NAMESPACE,
-      "webdav_enabled"
-    );
+    await kvClear("webdav_enabled");
   } catch {
     // Non-fatal.
   }
 }
 
-export function getObsidianConfig(): { token: string | null; connected: boolean; baseUrl: string; vaultPath: string | null } {
-  const token = getObsidianToken();
-  const baseUrl = getObsidianBaseUrl();
-  const vaultPath = getObsidianVaultPath();
+export async function getObsidianConfig(): Promise<{
+  token: string | null;
+  connected: boolean;
+  baseUrl: string;
+  vaultPath: string | null;
+}> {
+  const [token, baseUrl, vaultPath] = await Promise.all([
+    getObsidianToken(),
+    getObsidianBaseUrl(),
+    getObsidianVaultPath(),
+  ]);
   return { token, connected: token !== null && token.length > 0, baseUrl, vaultPath };
 }
 
-export function getObsidianConfigForApiKey(apiKeyId: string | null | undefined): {
+export async function getObsidianConfigForApiKey(apiKeyId: string | null | undefined): Promise<{
   token: string | null;
   baseUrl: string;
   vaultPath: string | null;
   source: "api_key" | "global";
-} {
+}> {
   if (apiKeyId) {
     try {
       const perKey = getApiKeyContextSource(apiKeyId, "obsidian");
       if (perKey && perKey.enabled && perKey.token) {
-        return {
-          token: perKey.token,
-          baseUrl: perKey.baseUrl || getObsidianBaseUrl(),
-          vaultPath: perKey.vaultPath || getObsidianVaultPath(),
-          source: "api_key",
-        };
+        const [baseUrl, vaultPath] = await Promise.all([
+          perKey.baseUrl ? Promise.resolve(perKey.baseUrl) : getObsidianBaseUrl(),
+          perKey.vaultPath ? Promise.resolve(perKey.vaultPath) : getObsidianVaultPath(),
+        ]);
+        return { token: perKey.token, baseUrl, vaultPath, source: "api_key" };
       }
     } catch {
       // Per-key config not available — fall through to global
     }
   }
-  return {
-    token: getObsidianToken(),
-    baseUrl: getObsidianBaseUrl(),
-    vaultPath: getObsidianVaultPath(),
-    source: "global",
-  };
+  const [token, baseUrl, vaultPath] = await Promise.all([
+    getObsidianToken(),
+    getObsidianBaseUrl(),
+    getObsidianVaultPath(),
+  ]);
+  return { token, baseUrl, vaultPath, source: "global" };
 }

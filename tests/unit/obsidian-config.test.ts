@@ -8,8 +8,14 @@ const TEST_DATA_DIR = fs.mkdtempSync(path.join(os.tmpdir(), "omni-obsidian-confi
 process.env.DATA_DIR = TEST_DATA_DIR;
 
 const coreDb = await import("../../src/lib/db/core.ts");
-const { getApiKeyContextSource, setApiKeyContextSource, deleteApiKeyContextSource, listApiKeyContextSources } = await import("../../src/lib/db/apiKeyContextSources.ts");
-const { getObsidianConfigForApiKey, setObsidianToken, setObsidianBaseUrl } = await import("../../src/lib/db/obsidian.ts");
+const {
+  getApiKeyContextSource,
+  setApiKeyContextSource,
+  deleteApiKeyContextSource,
+  listApiKeyContextSources,
+} = await import("../../src/lib/db/apiKeyContextSources.ts");
+const { getObsidianConfigForApiKey, setObsidianToken, setObsidianBaseUrl } =
+  await import("../../src/lib/db/obsidian.ts");
 
 async function resetStorage() {
   coreDb.resetDbInstance();
@@ -88,36 +94,36 @@ test("apiKeyContextSources: list returns all sources for a key", () => {
   setApiKeyContextSource("key-5", "notion", { token: "not", enabled: true });
   const results = listApiKeyContextSources("key-5");
   assert.equal(results.length, 2);
-  const types = results.map(r => r.sourceType).sort();
+  const types = results.map((r) => r.sourceType).sort();
   assert.deepEqual(types, ["notion", "obsidian"]);
 });
 
-test("getObsidianConfigForApiKey: falls back to global when no per-key config", () => {
-  setObsidianToken("global-token-123");
-  setObsidianBaseUrl("http://127.0.0.1:27123");
+test("getObsidianConfigForApiKey: falls back to global when no per-key config", async () => {
+  await setObsidianToken("global-token-123");
+  await setObsidianBaseUrl("http://127.0.0.1:27123");
 
-  const config = getObsidianConfigForApiKey("nonexistent-key");
+  const config = await getObsidianConfigForApiKey("nonexistent-key");
   assert.equal(config.source, "global");
   assert.equal(config.token, "global-token-123");
   assert.equal(config.baseUrl, "http://127.0.0.1:27123");
 });
 
-test("getObsidianConfigForApiKey: falls back to global for null/undefined keyId", () => {
-  setObsidianToken("global-token-456");
-  setObsidianBaseUrl("http://127.0.0.1:27123");
+test("getObsidianConfigForApiKey: falls back to global for null/undefined keyId", async () => {
+  await setObsidianToken("global-token-456");
+  await setObsidianBaseUrl("http://127.0.0.1:27123");
 
-  const c1 = getObsidianConfigForApiKey(null);
+  const c1 = await getObsidianConfigForApiKey(null);
   assert.equal(c1.source, "global");
   assert.equal(c1.token, "global-token-456");
 
-  const c2 = getObsidianConfigForApiKey(undefined);
+  const c2 = await getObsidianConfigForApiKey(undefined);
   assert.equal(c2.source, "global");
 });
 
-test("getObsidianConfigForApiKey: uses per-key config when available", () => {
+test("getObsidianConfigForApiKey: uses per-key config when available", async () => {
   createTestApiKey("key-perkey", "Per-Key Test");
-  setObsidianToken("global-token-789");
-  setObsidianBaseUrl("http://127.0.0.1:27123");
+  await setObsidianToken("global-token-789");
+  await setObsidianBaseUrl("http://127.0.0.1:27123");
 
   setApiKeyContextSource("key-perkey", "obsidian", {
     baseUrl: "http://10.0.0.1:27123",
@@ -126,40 +132,40 @@ test("getObsidianConfigForApiKey: uses per-key config when available", () => {
     enabled: true,
   });
 
-  const config = getObsidianConfigForApiKey("key-perkey");
+  const config = await getObsidianConfigForApiKey("key-perkey");
   assert.equal(config.source, "api_key");
   assert.equal(config.token, "per-key-token");
   assert.equal(config.baseUrl, "http://10.0.0.1:27123");
   assert.equal(config.vaultPath, "/custom/path");
 });
 
-test("getObsidianConfigForApiKey: per-key without baseUrl falls back to global baseUrl", () => {
+test("getObsidianConfigForApiKey: per-key without baseUrl falls back to global baseUrl", async () => {
   createTestApiKey("key-nobase", "No BaseUrl Test");
-  setObsidianToken("global-token-abc");
-  setObsidianBaseUrl("http://global:27123");
+  await setObsidianToken("global-token-abc");
+  await setObsidianBaseUrl("http://global:27123");
 
   setApiKeyContextSource("key-nobase", "obsidian", {
     token: "per-key-only",
     enabled: true,
   });
 
-  const config = getObsidianConfigForApiKey("key-nobase");
+  const config = await getObsidianConfigForApiKey("key-nobase");
   assert.equal(config.source, "api_key");
   assert.equal(config.token, "per-key-only");
   assert.equal(config.baseUrl, "http://global:27123");
 });
 
-test("getObsidianConfigForApiKey: disabled per-key falls back to global", () => {
+test("getObsidianConfigForApiKey: disabled per-key falls back to global", async () => {
   createTestApiKey("key-disabled", "Disabled Test");
-  setObsidianToken("global-token-def");
-  setObsidianBaseUrl("http://127.0.0.1:27123");
+  await setObsidianToken("global-token-def");
+  await setObsidianBaseUrl("http://127.0.0.1:27123");
 
   setApiKeyContextSource("key-disabled", "obsidian", {
     token: "disabled-token",
     enabled: false,
   });
 
-  const config = getObsidianConfigForApiKey("key-disabled");
+  const config = await getObsidianConfigForApiKey("key-disabled");
   assert.equal(config.source, "global");
   assert.equal(config.token, "global-token-def");
 });
