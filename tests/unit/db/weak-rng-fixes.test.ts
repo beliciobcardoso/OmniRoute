@@ -28,7 +28,7 @@ test("quotaGroups.makeId returns UUID without Math.random fallback", async () =>
   const core = await import("../../../src/lib/db/core.ts");
   core.resetDbInstance();
 
-  const group = createGroup("test-group");
+  const group = await createGroup("test-group");
   const uuidRegex = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
   assert.match(group.id, uuidRegex, `ID should be UUID format, got: ${group.id}`);
 });

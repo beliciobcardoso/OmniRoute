@@ -9,6 +9,8 @@
  */
 
 import { getDbInstance } from "./core";
+import { resolveDbDriverConfig } from "./driverConfig";
+import { ensurePostgresBootstrap, getKyselyDb } from "./kysely/client";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -56,6 +58,10 @@ function makeId(): string {
   return crypto.randomUUID();
 }
 
+function isPostgres(): boolean {
+  return resolveDbDriverConfig().driver === "postgres";
+}
+
 // ---------------------------------------------------------------------------
 // Public API
 // ---------------------------------------------------------------------------
@@ -64,9 +70,15 @@ function makeId(): string {
  * Create a new quota group with the given name.
  * Returns the newly created QuotaGroup row.
  */
-export function createGroup(name: string): QuotaGroup {
+export async function createGroup(name: string): Promise<QuotaGroup> {
   const id = makeId();
   const now = new Date().toISOString();
+
+  if (isPostgres()) {
+    await ensurePostgresBootstrap();
+    await getKyselyDb().insertInto("quota_groups").values({ id, name, created_at: now }).execute();
+    return { id, name, createdAt: now };
+  }
 
   getDb()
     .prepare("INSERT INTO quota_groups (id, name, created_at) VALUES (?, ?, ?)")
@@ -79,7 +91,17 @@ export function createGroup(name: string): QuotaGroup {
  * Get a single quota group by id.
  * Returns null if not found.
  */
-export function getGroup(id: string): QuotaGroup | null {
+export async function getGroup(id: string): Promise<QuotaGroup | null> {
+  if (isPostgres()) {
+    await ensurePostgresBootstrap();
+    const row = await getKyselyDb()
+      .selectFrom("quota_groups")
+      .select(["id", "name", "created_at"])
+      .where("id", "=", id)
+      .executeTakeFirst();
+    return row ? rowToGroup(row) : null;
+  }
+
   const row = getDb()
     .prepare<GroupRow>("SELECT id, name, created_at FROM quota_groups WHERE id = ?")
     .get(id);
@@ -90,7 +112,17 @@ export function getGroup(id: string): QuotaGroup | null {
 /**
  * Convenience helper — returns just the group name, or null if not found.
  */
-export function getGroupName(id: string): string | null {
+export async function getGroupName(id: string): Promise<string | null> {
+  if (isPostgres()) {
+    await ensurePostgresBootstrap();
+    const row = await getKyselyDb()
+      .selectFrom("quota_groups")
+      .select("name")
+      .where("id", "=", id)
+      .executeTakeFirst();
+    return row ? row.name : null;
+  }
+
   const row = getDb()
     .prepare<{ name: string }>("SELECT name FROM quota_groups WHERE id = ?")
     .get(id);
@@ -100,7 +132,17 @@ export function getGroupName(id: string): string | null {
 /**
  * List all quota groups, ordered by created_at ascending.
  */
-export function listGroups(): QuotaGroup[] {
+export async function listGroups(): Promise<QuotaGroup[]> {
+  if (isPostgres()) {
+    await ensurePostgresBootstrap();
+    const rows = await getKyselyDb()
+      .selectFrom("quota_groups")
+      .select(["id", "name", "created_at"])
+      .orderBy("created_at", "asc")
+      .execute();
+    return rows.map(rowToGroup);
+  }
+
   const rows = getDb()
     .prepare<GroupRow>("SELECT id, name, created_at FROM quota_groups ORDER BY created_at ASC")
     .all();
@@ -111,7 +153,17 @@ export function listGroups(): QuotaGroup[] {
  * Rename an existing group.
  * Returns true if the row was updated, false if the group was not found.
  */
-export function renameGroup(id: string, name: string): boolean {
+export async function renameGroup(id: string, name: string): Promise<boolean> {
+  if (isPostgres()) {
+    await ensurePostgresBootstrap();
+    const result = await getKyselyDb()
+      .updateTable("quota_groups")
+      .set({ name })
+      .where("id", "=", id)
+      .executeTakeFirst();
+    return Number(result.numUpdatedRows) > 0;
+  }
+
   const result = getDb().prepare("UPDATE quota_groups SET name = ? WHERE id = ?").run(name, id);
   return result.changes > 0;
 }
@@ -126,12 +178,27 @@ export function renameGroup(id: string, name: string): boolean {
  *
  * Returns true if a row was deleted, false if the group was not found.
  */
-export function deleteGroup(id: string): boolean {
+export async function deleteGroup(id: string): Promise<boolean> {
   // Protect the seed group.
   if (id === "group-demo") {
     throw new Error(
       "Cannot delete the protected seed group 'group-demo'. Reassign its pools to another group first."
     );
+  }
+
+  if (isPostgres()) {
+    await ensurePostgresBootstrap();
+    const db = getKyselyDb();
+    const refRow = await db
+      .selectFrom("quota_pools")
+      .select((eb) => eb.fn.countAll<number>().as("cnt"))
+      .where("group_id", "=", id)
+      .executeTakeFirst();
+    if (refRow && Number(refRow.cnt) > 0) {
+      throw new Error(`Group '${id}' has pools; reassign or delete them first.`);
+    }
+    const result = await db.deleteFrom("quota_groups").where("id", "=", id).executeTakeFirst();
+    return Number(result.numDeletedRows) > 0;
   }
 
   // Guard: refuse deletion when pools still reference this group.

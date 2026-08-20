@@ -73,7 +73,7 @@ test.after(async () => {
 
 test("resolveQuotaKeyScope: key in pool A sees ALL connections/providers of group G (pool A + pool B)", async () => {
   // Create group G
-  const groupG = groupsDb.createGroup("GroupG");
+  const groupG = await groupsDb.createGroup("GroupG");
 
   // Create connections for each pool
   const connA = await providersDb.createProviderConnection({
@@ -100,7 +100,10 @@ test("resolveQuotaKeyScope: key in pool A sees ALL connections/providers of grou
 
   // Must include both connections
   assert.ok(scope.connectionIds.includes(idA), "should include pool A connection");
-  assert.ok(scope.connectionIds.includes(idB), "should include pool B connection (group expansion)");
+  assert.ok(
+    scope.connectionIds.includes(idB),
+    "should include pool B connection (group expansion)"
+  );
   assert.equal(scope.connectionIds.length, 2, "exactly 2 connections");
 
   // Must include both providers
@@ -118,8 +121,8 @@ test("resolveQuotaKeyScope: key in pool A sees ALL connections/providers of grou
 
 test("resolveQuotaKeyScope: key in pool from group H does NOT see group G models", async () => {
   // Create two groups
-  const groupG = groupsDb.createGroup("GroupG2");
-  const groupH = groupsDb.createGroup("GroupH2");
+  const groupG = await groupsDb.createGroup("GroupG2");
+  const groupH = await groupsDb.createGroup("GroupH2");
 
   const connG = await providersDb.createProviderConnection({
     provider: "openrouter",
@@ -158,7 +161,7 @@ test("resolveQuotaKeyScope: key in pool from group H does NOT see group G models
 });
 
 test("resolveQuotaKeyScope: two pools in the same group expand once (deduplicated group slug)", async () => {
-  const groupG = groupsDb.createGroup("GroupGDedup");
+  const groupG = await groupsDb.createGroup("GroupGDedup");
 
   const connA = await providersDb.createProviderConnection({
     provider: "openrouter",
@@ -192,7 +195,7 @@ test("resolveQuotaKeyScope: two pools in the same group expand once (deduplicate
 });
 
 test("filterModelsToQuotaPools: keeps both providers' qtSd/<group>/... models from scope", async () => {
-  const groupG = groupsDb.createGroup("GroupGFilter");
+  const groupG = await groupsDb.createGroup("GroupGFilter");
   const groupSlug = quotaGroupSlug(groupG.name); // e.g. "groupgfilter"
 
   const models = [
@@ -207,12 +210,15 @@ test("filterModelsToQuotaPools: keeps both providers' qtSd/<group>/... models fr
   assert.equal(result.length, 2, "should return both providers' models for the group");
   assert.ok(result.some((m) => m.id === `qtSd/${groupSlug}/openrouter/gpt-5.5`));
   assert.ok(result.some((m) => m.id === `qtSd/${groupSlug}/baidu/ernie-4.5`));
-  assert.ok(!result.some((m) => m.id === `qtSd/otherg/openrouter/gpt-5.5`), "other group filtered out");
+  assert.ok(
+    !result.some((m) => m.id === `qtSd/otherg/openrouter/gpt-5.5`),
+    "other group filtered out"
+  );
   assert.ok(!result.some((m) => m.id === "gpt-5.5"), "non-quota model filtered out");
 });
 
 test("resolveQuotaKeyScope: orphan pool (no valid connections) — group slug excluded if no valid conn in group", async () => {
-  const groupG = groupsDb.createGroup("GroupGOrphan");
+  const groupG = await groupsDb.createGroup("GroupGOrphan");
 
   // Pool with a non-existent connection
   const orphanPool = poolsDb.createPool({
@@ -230,7 +236,7 @@ test("resolveQuotaKeyScope: orphan pool (no valid connections) — group slug ex
 });
 
 test("resolveQuotaKeyScope: orphan pool in group that also has a valid pool — group slug included", async () => {
-  const groupG = groupsDb.createGroup("GroupGPartial");
+  const groupG = await groupsDb.createGroup("GroupGPartial");
 
   // One valid connection pool
   const connValid = await providersDb.createProviderConnection({
@@ -240,7 +246,11 @@ test("resolveQuotaKeyScope: orphan pool in group that also has a valid pool — 
     apiKey: "sk-partial-valid",
   });
   const idValid = (connValid as Record<string, unknown>).id as string;
-  const validPool = poolsDb.createPool({ connectionId: idValid, name: "Valid Pool G", groupId: groupG.id });
+  const validPool = poolsDb.createPool({
+    connectionId: idValid,
+    name: "Valid Pool G",
+    groupId: groupG.id,
+  });
 
   // One orphan pool in the same group
   const orphanPool = poolsDb.createPool({
@@ -254,7 +264,10 @@ test("resolveQuotaKeyScope: orphan pool in group that also has a valid pool — 
 
   // The group has a valid connection (the validPool's connection) so group slug should be included
   const expectedSlug = quotaGroupSlug(groupG.name);
-  assert.ok(scope.poolSlugs.includes(expectedSlug), "group slug should be included since group has valid connection");
+  assert.ok(
+    scope.poolSlugs.includes(expectedSlug),
+    "group slug should be included since group has valid connection"
+  );
   assert.ok(scope.connectionIds.includes(idValid), "should include the valid pool's connection");
   assert.ok(scope.providers.includes("openrouter"), "should include openrouter from valid pool");
 

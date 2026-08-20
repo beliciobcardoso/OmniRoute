@@ -74,7 +74,7 @@ test.after(async () => {
 
 test("#4806 quota-exclusive key lists its qtSd/* virtual models in GET /v1/models", async () => {
   // Group "Times" → slug "times"; combos will be qtSd/times/glm/<model>.
-  const group = groupsDb.createGroup("Times");
+  const group = await groupsDb.createGroup("Times");
 
   const conn = await providersDb.createProviderConnection({
     provider: "glm",
@@ -123,7 +123,7 @@ test("#4806 quota-exclusive key lists its qtSd/* virtual models in GET /v1/model
 
 test("#4806 quota-exclusive key does NOT see qtSd/* of a group it is not allocated to", async () => {
   // Group A (glm) — the key's group.
-  const groupA = groupsDb.createGroup("Alpha");
+  const groupA = await groupsDb.createGroup("Alpha");
   const connA = await providersDb.createProviderConnection({
     provider: "glm",
     authType: "apikey",
@@ -138,7 +138,7 @@ test("#4806 quota-exclusive key does NOT see qtSd/* of a group it is not allocat
   await syncQuotaCombos(poolA.id);
 
   // Group B (codex) — a DIFFERENT group the key is NOT allocated to.
-  const groupB = groupsDb.createGroup("Beta");
+  const groupB = await groupsDb.createGroup("Beta");
   const connB = await providersDb.createProviderConnection({
     provider: "codex",
     authType: "apikey",

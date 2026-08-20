@@ -129,7 +129,7 @@ export async function resolveQuotaKeyScope(
     // Only expose the group slug when the group has at least one usable
     // connection — a fully-orphaned group has no qtSd/<groupSlug>/... models.
     if (groupHasValidConnection) {
-      const groupName = getGroupName(groupId) ?? groupId;
+      const groupName = (await getGroupName(groupId)) ?? groupId;
       groupSlugSet.add(quotaGroupSlug(groupName));
     }
   }
@@ -163,7 +163,7 @@ export async function reconcilePoolExclusivity(
   poolId: string,
   prevApiKeyIds: string[],
   nextApiKeyIds: string[],
-  exclusive: boolean,
+  exclusive: boolean
 ): Promise<void> {
   const affectedIds = new Set([...prevApiKeyIds, ...nextApiKeyIds]);
 
@@ -173,7 +173,7 @@ export async function reconcilePoolExclusivity(
       if (!keyRow) continue;
 
       const currentQuotas: string[] = Array.isArray(
-        (keyRow as Record<string, unknown>).allowedQuotas,
+        (keyRow as Record<string, unknown>).allowedQuotas
       )
         ? ((keyRow as Record<string, unknown>).allowedQuotas as string[])
         : [];

@@ -74,7 +74,7 @@ async function resolvePoolForSync(poolId: string): Promise<{
 
   // B4: resolve the group name for combo naming.
   // Fall back to pool.name when the group is missing (legacy / test isolation).
-  const groupName = getGroupName(pool.groupId) ?? pool.name;
+  const groupName = (await getGroupName(pool.groupId)) ?? pool.name;
 
   return {
     pool: {
