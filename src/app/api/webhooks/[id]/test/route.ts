@@ -132,7 +132,7 @@ export async function POST(_: Request, { params }: { params: Promise<{ id: strin
     const result = await testFetch(fetchUrl, payloadSent, extraHeaders);
 
     try {
-      insertDelivery({
+      await insertDelivery({
         webhookId: webhook.id,
         eventType: "test.ping",
         status: result.success ? "success" : "failed",

@@ -199,7 +199,7 @@ export async function dispatchEvent(event: WebhookEvent, data: Record<string, an
       const latencyMs = Date.now() - start;
 
       try {
-        insertDelivery({
+        await insertDelivery({
           webhookId: wh.id,
           eventType: event,
           status: result.success ? "success" : "failed",

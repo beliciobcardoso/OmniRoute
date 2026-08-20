@@ -26,9 +26,9 @@ test.after(() => {
   fs.rmSync(TEST_DIR, { recursive: true, force: true });
 });
 
-test("insertDelivery stores a row and getDeliveries returns it", () => {
+test("insertDelivery stores a row and getDeliveries returns it", async () => {
   const wh = webhooksDb.createWebhook({ url: "https://example.com/hook" });
-  deliveriesDb.insertDelivery({
+  await deliveriesDb.insertDelivery({
     webhookId: wh.id,
     eventType: "request.failed",
     status: "delivered",
@@ -36,7 +36,7 @@ test("insertDelivery stores a row and getDeliveries returns it", () => {
     latencyMs: 142,
     payloadSnapshot: JSON.stringify({ event: "request.failed" }),
   });
-  const rows = deliveriesDb.getDeliveries(wh.id, 10);
+  const rows = await deliveriesDb.getDeliveries(wh.id, 10);
   assert.equal(rows.length, 1);
   assert.equal(rows[0].event_type, "request.failed");
   assert.equal(rows[0].http_status, 200);
@@ -45,10 +45,10 @@ test("insertDelivery stores a row and getDeliveries returns it", () => {
   assert.equal("payload_snapshot" in rows[0], false);
 });
 
-test("rotation keeps only last 100 deliveries per webhook", () => {
+test("rotation keeps only last 100 deliveries per webhook", async () => {
   const wh = webhooksDb.createWebhook({ url: "https://example.com/hook" });
   for (let i = 0; i < 105; i++) {
-    deliveriesDb.insertDelivery({
+    await deliveriesDb.insertDelivery({
       webhookId: wh.id,
       eventType: "test.ping",
       status: "delivered",
@@ -56,14 +56,14 @@ test("rotation keeps only last 100 deliveries per webhook", () => {
       latencyMs: 10,
     });
   }
-  const rows = deliveriesDb.getDeliveries(wh.id, 200);
+  const rows = await deliveriesDb.getDeliveries(wh.id, 200);
   assert.equal(rows.length, 100);
 });
 
-test("getDeliveries respects limit parameter", () => {
+test("getDeliveries respects limit parameter", async () => {
   const wh = webhooksDb.createWebhook({ url: "https://example.com/hook" });
   for (let i = 0; i < 10; i++) {
-    deliveriesDb.insertDelivery({
+    await deliveriesDb.insertDelivery({
       webhookId: wh.id,
       eventType: "test.ping",
       status: "delivered",
@@ -71,13 +71,13 @@ test("getDeliveries respects limit parameter", () => {
       latencyMs: 10,
     });
   }
-  const rows = deliveriesDb.getDeliveries(wh.id, 5);
+  const rows = await deliveriesDb.getDeliveries(wh.id, 5);
   assert.equal(rows.length, 5);
 });
 
-test("CASCADE delete removes deliveries when webhook is deleted", () => {
+test("CASCADE delete removes deliveries when webhook is deleted", async () => {
   const wh = webhooksDb.createWebhook({ url: "https://example.com/hook" });
-  deliveriesDb.insertDelivery({
+  await deliveriesDb.insertDelivery({
     webhookId: wh.id,
     eventType: "test.ping",
     status: "delivered",
@@ -85,7 +85,7 @@ test("CASCADE delete removes deliveries when webhook is deleted", () => {
     latencyMs: 10,
   });
   webhooksDb.deleteWebhook(wh.id);
-  const rows = deliveriesDb.getDeliveries(wh.id, 10);
+  const rows = await deliveriesDb.getDeliveries(wh.id, 10);
   assert.equal(rows.length, 0);
 });
 

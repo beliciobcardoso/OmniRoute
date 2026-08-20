@@ -1,5 +1,7 @@
 import { getDbInstance } from "./core";
 import { sanitizeErrorMessage } from "@omniroute/open-sse/utils/error";
+import { resolveDbDriverConfig } from "./driverConfig";
+import { ensurePostgresBootstrap, getKyselyDb } from "./kysely/client";
 
 export interface WebhookDelivery {
   id: number;
@@ -19,7 +21,7 @@ export type WebhookDeliverySafe = Omit<WebhookDelivery, "payload_snapshot">;
 
 const MAX_DELIVERIES_PER_WEBHOOK = 100;
 
-export function insertDelivery(opts: {
+export async function insertDelivery(opts: {
   webhookId: string;
   eventType: string;
   status: string;
@@ -27,7 +29,16 @@ export function insertDelivery(opts: {
   latencyMs?: number | null;
   error?: string | null;
   payloadSnapshot?: string | null;
-}): void {
+}): Promise<void> {
+  // Sanitize the error before persistence so raw stack traces, hostnames or
+  // upstream-internal messages never enter the audit log. The audit log is
+  // read back via the deliveries API and rendered in the dashboard.
+  const sanitizedError = opts.error != null ? sanitizeErrorMessage(opts.error) || null : null;
+
+  if (resolveDbDriverConfig().driver === "postgres") {
+    return insertDeliveryPostgres(opts, sanitizedError);
+  }
+
   const db = getDbInstance();
   const insertStmt = db.prepare(
     `INSERT INTO webhook_deliveries
@@ -44,10 +55,6 @@ export function insertDelivery(opts: {
          LIMIT ?
        )`
   );
-  // Sanitize the error before persistence so raw stack traces, hostnames or
-  // upstream-internal messages never enter the audit log. The audit log is
-  // read back via the deliveries API and rendered in the dashboard.
-  const sanitizedError = opts.error != null ? sanitizeErrorMessage(opts.error) || null : null;
   db.transaction(() => {
     insertStmt.run(
       opts.webhookId,
@@ -62,8 +69,63 @@ export function insertDelivery(opts: {
   })();
 }
 
+async function insertDeliveryPostgres(
+  opts: {
+    webhookId: string;
+    eventType: string;
+    status: string;
+    httpStatus?: number | null;
+    latencyMs?: number | null;
+    payloadSnapshot?: string | null;
+  },
+  sanitizedError: string | null
+): Promise<void> {
+  await ensurePostgresBootstrap();
+  const db = getKyselyDb();
+
+  await db.transaction().execute(async (trx) => {
+    await trx
+      .insertInto("webhook_deliveries")
+      .values({
+        webhook_id: opts.webhookId,
+        event_type: opts.eventType,
+        status: opts.status,
+        http_status: opts.httpStatus ?? null,
+        latency_ms: opts.latencyMs ?? null,
+        error: sanitizedError,
+        payload_snapshot: opts.payloadSnapshot ?? null,
+      })
+      .execute();
+
+    await trx
+      .deleteFrom("webhook_deliveries")
+      .where("webhook_id", "=", opts.webhookId)
+      .where((eb) =>
+        eb(
+          "id",
+          "not in",
+          eb
+            .selectFrom("webhook_deliveries")
+            .select("id")
+            .where("webhook_id", "=", opts.webhookId)
+            .orderBy("created_at", "desc")
+            .orderBy("id", "desc")
+            .limit(MAX_DELIVERIES_PER_WEBHOOK)
+        )
+      )
+      .execute();
+  });
+}
+
 /** List recent deliveries excluding `payload_snapshot` (default — used by UI). */
-export function getDeliveries(webhookId: string, limit: number): WebhookDeliverySafe[] {
+export async function getDeliveries(
+  webhookId: string,
+  limit: number
+): Promise<WebhookDeliverySafe[]> {
+  if (resolveDbDriverConfig().driver === "postgres") {
+    return getDeliveriesPostgres(webhookId, limit);
+  }
+
   const db = getDbInstance();
   return db
     .prepare(
@@ -74,4 +136,36 @@ export function getDeliveries(webhookId: string, limit: number): WebhookDelivery
        LIMIT ?`
     )
     .all(webhookId, limit) as WebhookDeliverySafe[];
+}
+
+async function getDeliveriesPostgres(
+  webhookId: string,
+  limit: number
+): Promise<WebhookDeliverySafe[]> {
+  await ensurePostgresBootstrap();
+  const rows = await getKyselyDb()
+    .selectFrom("webhook_deliveries")
+    .select([
+      "id",
+      "webhook_id",
+      "event_type",
+      "status",
+      "http_status",
+      "latency_ms",
+      "error",
+      "created_at",
+    ])
+    .where("webhook_id", "=", webhookId)
+    .orderBy("created_at", "desc")
+    .orderBy("id", "desc")
+    .limit(limit)
+    .execute();
+  // node-postgres returns BIGINT columns (id, http_status, latency_ms) as
+  // strings, not numbers — coerce to match the SQLite path's types.
+  return rows.map((row) => ({
+    ...row,
+    id: Number(row.id),
+    http_status: row.http_status === null ? null : Number(row.http_status),
+    latency_ms: row.latency_ms === null ? null : Number(row.latency_ms),
+  })) as WebhookDeliverySafe[];
 }

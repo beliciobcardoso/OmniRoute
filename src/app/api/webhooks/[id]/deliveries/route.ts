@@ -23,7 +23,7 @@ export async function GET(request: Request, { params }: { params: Promise<{ id: 
     const limitParam = url.searchParams.get("limit");
     const limit = Math.min(Math.max(1, parseInt(limitParam ?? "20", 10) || 20), 100);
 
-    const deliveries = getDeliveries(id, limit);
+    const deliveries = await getDeliveries(id, limit);
     return NextResponse.json({ deliveries });
   } catch (error: any) {
     return NextResponse.json(
