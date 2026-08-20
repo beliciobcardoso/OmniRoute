@@ -33,7 +33,7 @@ export const AgentBridgeConfigSchema = z.object({
 export type AgentBridgeConfig = z.infer<typeof AgentBridgeConfigSchema>;
 
 /** Read the current operator-tunable AgentBridge state into a portable blob. */
-export function exportConfig(): AgentBridgeConfig {
+export async function exportConfig(): Promise<AgentBridgeConfig> {
   const customHosts = listCustomHosts().map((h) => ({
     host: h.host,
     kind: (h.kind as "llm" | "app" | "custom") ?? "custom",
@@ -42,7 +42,7 @@ export function exportConfig(): AgentBridgeConfig {
 
   const agentMappings: Record<string, Array<{ source: string; target: string }>> = {};
   for (const target of ALL_TARGETS) {
-    const rows = getMappingsForAgent(target.id);
+    const rows = await getMappingsForAgent(target.id);
     if (rows.length > 0) {
       agentMappings[target.id] = rows.map((r) => ({
         source: r.source_model,
@@ -67,7 +67,7 @@ export interface ImportResult {
 
 /** Apply a validated config to the DB. Bypass + mappings replace wholesale;
  * custom hosts are added idempotently (INSERT OR IGNORE). */
-export function importConfig(config: AgentBridgeConfig): ImportResult {
+export async function importConfig(config: AgentBridgeConfig): Promise<ImportResult> {
   replaceUserBypassPatterns(config.bypassPatterns);
 
   for (const h of config.customHosts) {
@@ -75,7 +75,7 @@ export function importConfig(config: AgentBridgeConfig): ImportResult {
   }
 
   for (const [agentId, mappings] of Object.entries(config.agentMappings)) {
-    setMappings(agentId, mappings);
+    await setMappings(agentId, mappings);
   }
 
   return {
