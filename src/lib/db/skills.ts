@@ -6,6 +6,12 @@
  */
 
 import { getDbInstance } from "./core";
+import { resolveDbDriverConfig } from "./driverConfig";
+import { ensurePostgresBootstrap, getKyselyDb } from "./kysely/client";
+
+function isPostgres(): boolean {
+  return resolveDbDriverConfig().driver === "postgres";
+}
 
 // ──────────────── Allowed patch columns ────────────────
 //
@@ -37,7 +43,32 @@ export interface SkillPatch {
  *
  * @returns number of rows changed (0 if skill not found, 1 if updated).
  */
-export function updateSkill(id: string, patch: SkillPatch): number {
+export async function updateSkill(id: string, patch: SkillPatch): Promise<number> {
+  if (isPostgres()) {
+    await ensurePostgresBootstrap();
+
+    const setValues: Record<string, unknown> = {};
+    for (const [key, value] of Object.entries(patch)) {
+      if (!UPDATABLE_COLUMNS.has(key)) continue; // allowlist guard
+      // `enabled` is BIGINT in Postgres — coerce booleans to 0/1.
+      setValues[key] = key === "enabled" ? (value ? 1 : 0) : value;
+    }
+
+    if (Object.keys(setValues).length === 0) {
+      // Nothing to update (all keys were filtered out).
+      return 0;
+    }
+
+    setValues.updated_at = new Date().toISOString();
+
+    const result = await getKyselyDb()
+      .updateTable("skills")
+      .set(setValues)
+      .where("id", "=", id)
+      .executeTakeFirst();
+    return Number(result.numUpdatedRows);
+  }
+
   const db = getDbInstance();
 
   const setClauses: string[] = [];
@@ -57,6 +88,8 @@ export function updateSkill(id: string, patch: SkillPatch): number {
   setClauses.push("updated_at = datetime('now')");
   params.push(id);
 
-  const result = db.prepare(`UPDATE skills SET ${setClauses.join(", ")} WHERE id = ?`).run(...params);
+  const result = db
+    .prepare(`UPDATE skills SET ${setClauses.join(", ")} WHERE id = ?`)
+    .run(...params);
   return (result as { changes: number }).changes;
 }
