@@ -592,7 +592,7 @@ export interface HourlyUsageSummaryTable {
 
 export interface InspectorCustomHostsTable {
   host: string;
-  enabled: Generated<number>;
+  enabled: Generated<SqliteBoolean>;
   label: string | null;
   kind: Generated<string>;
   added_at: Generated<string>;
