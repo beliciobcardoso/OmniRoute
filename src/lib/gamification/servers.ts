@@ -29,7 +29,7 @@ export async function connectServer(
     .toString("hex");
 
   const { connectServer: dbConnect } = await import("../db/gamification");
-  dbConnect(id, name, url, apiKeyHash);
+  await dbConnect(id, name, url, apiKeyHash);
 
   return { id, name, url, status: "connected", lastSyncAt: null, errorMessage: null };
 }
@@ -39,7 +39,7 @@ export async function connectServer(
  */
 export async function disconnectServer(serverId: string): Promise<void> {
   const { disconnectServer: dbDisconnect } = await import("../db/gamification");
-  dbDisconnect(serverId);
+  await dbDisconnect(serverId);
 }
 
 /**
@@ -47,7 +47,7 @@ export async function disconnectServer(serverId: string): Promise<void> {
  */
 export async function listServers(): Promise<ServerConnection[]> {
   const { listServers: dbList } = await import("../db/gamification");
-  return dbList() as ServerConnection[];
+  return (await dbList()) as ServerConnection[];
 }
 
 /**
@@ -162,8 +162,7 @@ export async function healthCheck(
   const db = (await import("../db/core")).getDbInstance();
 
   const server = db.prepare("SELECT url FROM community_servers WHERE id = ?").get(serverId) as
-    | { url: string }
-    | undefined;
+    { url: string } | undefined;
 
   if (!server) return { healthy: false, latencyMs: 0 };
 

@@ -409,8 +409,8 @@ export async function evaluateBadges(
   // Import DB functions dynamically to avoid circular deps
   const { getBadgeDefinitions, unlockBadge, getBadges } = await import("../db/gamification");
 
-  const definitions = getBadgeDefinitions();
-  const earned = getBadges(apiKeyId);
+  const definitions = await getBadgeDefinitions();
+  const earned = await getBadges(apiKeyId);
   const earnedIds = new Set(earned.map((b) => b.badgeId));
   const newlyUnlocked: string[] = [];
 
@@ -502,7 +502,7 @@ export async function evaluateBadges(
     }
 
     if (unlocked) {
-      unlockBadge(apiKeyId, def.id);
+      await unlockBadge(apiKeyId, def.id);
       newlyUnlocked.push(def.id);
     }
   }

@@ -24,7 +24,7 @@ export async function updateScore(
   points: number
 ): Promise<void> {
   const { updateScore: dbUpdateScore } = await import("../db/gamification");
-  dbUpdateScore(apiKeyId, scope, points);
+  await dbUpdateScore(apiKeyId, scope, points);
 }
 
 /**
@@ -60,5 +60,5 @@ export async function getNeighbors(
  */
 export async function rotateScope(scope: "weekly" | "monthly"): Promise<void> {
   const { rotateLeaderboardScope } = await import("../db/gamification");
-  rotateLeaderboardScope(scope);
+  await rotateLeaderboardScope(scope);
 }

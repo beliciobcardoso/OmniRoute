@@ -40,7 +40,7 @@ export async function createInvite(
   const id = crypto.randomUUID();
 
   const { createInviteToken } = await import("../db/gamification");
-  createInviteToken(id, code, tokenHash, createdByApiKeyId, serverUrl, maxUses);
+  await createInviteToken(id, code, tokenHash, createdByApiKeyId, serverUrl, maxUses);
 
   return { code, token };
 }
@@ -54,7 +54,7 @@ export async function redeemInvite(
 ): Promise<{ success: boolean; serverUrl?: string; error?: string }> {
   const { getInviteByCode, redeemInvite: dbRedeem } = await import("../db/gamification");
 
-  const invite = getInviteByCode(code);
+  const invite = await getInviteByCode(code);
   if (!invite) {
     return { success: false, error: "Invalid invite code" };
   }
@@ -75,7 +75,7 @@ export async function redeemInvite(
     return { success: false, error: "Cannot redeem your own invite" };
   }
 
-  const redeemed = dbRedeem(code, usedByApiKeyId);
+  const redeemed = await dbRedeem(code, usedByApiKeyId);
   if (!redeemed) {
     return { success: false, error: "Failed to redeem invite" };
   }
@@ -122,6 +122,6 @@ export async function listInvites(apiKeyId: string) {
  */
 export async function revokeInvite(inviteId: string): Promise<boolean> {
   const { revokeInvite: dbRevoke } = await import("../db/gamification");
-  dbRevoke(inviteId);
+  await dbRevoke(inviteId);
   return true;
 }
