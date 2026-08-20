@@ -3,7 +3,11 @@ import assert from "node:assert/strict";
 import { sql } from "kysely";
 
 import { exportProxyLogsSince } from "../../../src/lib/db/proxyLogs";
-import { getKyselyDb, resetKyselyDb } from "../../../src/lib/db/kysely/client";
+import {
+  ensurePostgresBootstrap,
+  getKyselyDb,
+  resetKyselyDb,
+} from "../../../src/lib/db/kysely/client";
 
 /**
  * Requires a real Postgres 15+ reachable at DATABASE_URL — see
@@ -19,27 +23,12 @@ test(
     const db = getKyselyDb();
 
     try {
-      await sql`
-        CREATE TABLE IF NOT EXISTS proxy_logs (
-          id TEXT PRIMARY KEY,
-          timestamp TEXT NOT NULL,
-          status TEXT,
-          proxy_type TEXT,
-          proxy_host TEXT,
-          proxy_port BIGINT,
-          level TEXT,
-          level_id TEXT,
-          provider TEXT,
-          target_url TEXT,
-          public_ip TEXT,
-          latency_ms BIGINT DEFAULT 0,
-          error TEXT,
-          connection_id TEXT,
-          combo_id TEXT,
-          account TEXT,
-          tls_fingerprint BIGINT DEFAULT 0
-        )
-      `.execute(db);
+      // Table creation goes through the shared, advisory-lock-protected
+      // bootstrap rather than an ad hoc CREATE TABLE here — a second,
+      // unprotected DDL statement racing the lock-guarded bootstrap (which
+      // other test files in this same directory also call concurrently)
+      // can hit a duplicate-key error on Postgres's system catalog.
+      await ensurePostgresBootstrap();
       await sql`TRUNCATE TABLE proxy_logs`.execute(db);
 
       await db
@@ -88,7 +77,9 @@ test(
       const empty = await exportProxyLogsSince(future);
       assert.deepEqual(empty, []);
     } finally {
-      await sql`DROP TABLE IF EXISTS proxy_logs`.execute(db);
+      // Leave the table in place — other integration test files run
+      // concurrently and may depend on it existing (shared bootstrap).
+      await sql`TRUNCATE TABLE proxy_logs`.execute(db);
       await resetKyselyDb();
     }
   }

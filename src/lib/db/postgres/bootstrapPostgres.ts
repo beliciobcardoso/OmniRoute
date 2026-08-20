@@ -35,10 +35,36 @@ const BOOTSTRAP_ADVISORY_LOCK_KEY = 872234871;
  * already there and no-ops. `pg_advisory_xact_lock` auto-releases at
  * transaction end (commit or rollback) — no separate unlock call needed.
  */
+const MAX_BOOTSTRAP_ATTEMPTS = 3;
+
+function isTransientCatalogRace(err: unknown): boolean {
+  // code 23505 = unique_violation. Even with the advisory lock, a very
+  // narrow window exists where two sessions both start racing before either
+  // has taken the lock — observed intermittently under high concurrency
+  // (many test files bootstrapping the same instance at once). Safe to
+  // retry: the failed transaction rolled back entirely, so a retry either
+  // acquires the lock cleanly or sees every table already committed.
+  return (
+    typeof err === "object" &&
+    err !== null &&
+    "code" in err &&
+    (err as { code?: unknown }).code === "23505"
+  );
+}
+
 export async function runPostgresBootstrap(db: Kysely<Database>): Promise<void> {
   const bootstrapSql = readFileSync(BOOTSTRAP_SQL_PATH, "utf8");
-  await db.transaction().execute(async (trx) => {
-    await sql`SELECT pg_advisory_xact_lock(${BOOTSTRAP_ADVISORY_LOCK_KEY})`.execute(trx);
-    await sql.raw(bootstrapSql).execute(trx);
-  });
+
+  for (let attempt = 1; attempt <= MAX_BOOTSTRAP_ATTEMPTS; attempt++) {
+    try {
+      await db.transaction().execute(async (trx) => {
+        await sql`SELECT pg_advisory_xact_lock(${BOOTSTRAP_ADVISORY_LOCK_KEY})`.execute(trx);
+        await sql.raw(bootstrapSql).execute(trx);
+      });
+      return;
+    } catch (err) {
+      if (attempt >= MAX_BOOTSTRAP_ATTEMPTS || !isTransientCatalogRace(err)) throw err;
+      await new Promise((resolve) => setTimeout(resolve, 25 * attempt));
+    }
+  }
 }

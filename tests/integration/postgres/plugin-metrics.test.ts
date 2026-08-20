@@ -7,7 +7,11 @@ import {
   getPluginMetrics,
   clearPluginMetrics,
 } from "../../../src/lib/db/pluginMetrics";
-import { getKyselyDb, resetKyselyDb } from "../../../src/lib/db/kysely/client";
+import {
+  ensurePostgresBootstrap,
+  getKyselyDb,
+  resetKyselyDb,
+} from "../../../src/lib/db/kysely/client";
 
 /**
  * Requires a real Postgres 15+ reachable at DATABASE_URL — see
@@ -23,17 +27,12 @@ test(
     const db = getKyselyDb();
 
     try {
-      await sql`
-        CREATE TABLE IF NOT EXISTS plugin_metrics (
-          plugin_name TEXT NOT NULL,
-          event TEXT NOT NULL,
-          calls BIGINT NOT NULL DEFAULT 0,
-          errors BIGINT NOT NULL DEFAULT 0,
-          total_duration_ms DOUBLE PRECISION NOT NULL DEFAULT 0,
-          last_called_at TEXT,
-          PRIMARY KEY (plugin_name, event)
-        )
-      `.execute(db);
+      // Table creation goes through the shared, advisory-lock-protected
+      // bootstrap rather than an ad hoc CREATE TABLE here — a second,
+      // unprotected DDL statement racing the lock-guarded bootstrap (which
+      // other test files in this same directory also call concurrently)
+      // can hit a duplicate-key error on Postgres's system catalog.
+      await ensurePostgresBootstrap();
       await sql`TRUNCATE TABLE plugin_metrics`.execute(db);
 
       await recordPluginMetric("test-plugin", "onRequest", 5.2, false);
@@ -60,7 +59,9 @@ test(
       assert.equal(remaining.length, 1);
       assert.equal(remaining[0].pluginName, "other-plugin");
     } finally {
-      await sql`DROP TABLE IF EXISTS plugin_metrics`.execute(db);
+      // Leave the table in place — other integration test files run
+      // concurrently and may depend on it existing (shared bootstrap).
+      await sql`TRUNCATE TABLE plugin_metrics`.execute(db);
       await resetKyselyDb();
     }
   }
