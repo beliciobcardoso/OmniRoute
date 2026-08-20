@@ -42,14 +42,14 @@ export async function GET(request: Request, { params }: RouteParams) {
     const includeLogs = url.searchParams.get("logs") === "true";
     const logLimit = parseInt(url.searchParams.get("logLimit") || "20", 10);
 
-    const hook = getMiddlewareHook(name);
+    const hook = await getMiddlewareHook(name);
     if (!hook) {
       return NextResponse.json({ error: "Hook not found" }, { status: 404 });
     }
 
     const result: Record<string, unknown> = { hook };
     if (includeLogs) {
-      result.logs = getHookLogs(name, logLimit);
+      result.logs = await getHookLogs(name, logLimit);
     }
 
     return NextResponse.json(result);
@@ -91,7 +91,7 @@ export async function PUT(request: Request, { params }: RouteParams) {
     if (body.code !== undefined) updates.code = body.code;
 
     // Persist to DB
-    const saved = updateMiddlewareHook(name, updates);
+    const saved = await updateMiddlewareHook(name, updates);
     if (!saved) {
       return NextResponse.json({ error: "Failed to update hook" }, { status: 500 });
     }
@@ -106,7 +106,10 @@ export async function PUT(request: Request, { params }: RouteParams) {
     return NextResponse.json({ hook: saved });
   } catch (error: any) {
     console.error("[API] PUT /api/middleware/hooks/[name] error:", error);
-    return NextResponse.json({ error: sanitizeErrorMessage(error) || "Failed to update hook" }, { status: 500 });
+    return NextResponse.json(
+      { error: sanitizeErrorMessage(error) || "Failed to update hook" },
+      { status: 500 }
+    );
   }
 }
 
@@ -126,7 +129,7 @@ export async function DELETE(request: Request, { params }: RouteParams) {
     }
 
     // Remove from DB
-    const deleted = deleteMiddlewareHook(name);
+    const deleted = await deleteMiddlewareHook(name);
     if (!deleted) {
       return NextResponse.json({ error: "Failed to delete hook" }, { status: 500 });
     }
