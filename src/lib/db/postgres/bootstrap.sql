@@ -1215,7 +1215,7 @@ CREATE TABLE IF NOT EXISTS token_ledger (
 
 CREATE TABLE IF NOT EXISTS upstream_proxy_config (
   id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
-  provider_id TEXT NOT NULL,
+  provider_id TEXT NOT NULL UNIQUE,
   mode TEXT NOT NULL DEFAULT 'native',
   cliproxyapi_model_mapping TEXT,
   native_priority BIGINT NOT NULL DEFAULT 1,

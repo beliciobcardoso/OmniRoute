@@ -1,5 +1,7 @@
 /** Upstream proxy config persistence for upstream_proxy_config table. */
 import { getDbInstance } from "./core";
+import { resolveDbDriverConfig } from "./driverConfig";
+import { ensurePostgresBootstrap, getKyselyDb } from "./kysely/client";
 
 interface UpstreamProxyConfig {
   id: number;
@@ -25,6 +27,10 @@ interface UpstreamProxyRow {
   family: unknown;
   created_at: unknown;
   updated_at: unknown;
+}
+
+function isPostgres(): boolean {
+  return resolveDbDriverConfig().driver === "postgres";
 }
 
 function toRecord(value: unknown): Record<string, unknown> {
@@ -86,13 +92,13 @@ function rowToConfig(record: Record<string, unknown>): UpstreamProxyConfig {
     }
   }
   return {
-    id: record.id as number,
+    id: Number(record.id),
     providerId: record.provider_id as string,
     mode: record.mode as string,
     cliproxyapiModelMapping: mapping,
-    nativePriority: record.native_priority as number,
-    cliproxyapiPriority: record.cliproxyapi_priority as number,
-    enabled: record.enabled === 1 || record.enabled === true,
+    nativePriority: Number(record.native_priority),
+    cliproxyapiPriority: Number(record.cliproxyapi_priority),
+    enabled: Number(record.enabled) === 1 || record.enabled === true,
     family: typeof record.family === "string" ? record.family : "auto",
     createdAt: record.created_at as string,
     updatedAt: record.updated_at as string,
@@ -100,6 +106,16 @@ function rowToConfig(record: Record<string, unknown>): UpstreamProxyConfig {
 }
 
 export async function getUpstreamProxyConfigs() {
+  if (isPostgres()) {
+    await ensurePostgresBootstrap();
+    const rows = await getKyselyDb()
+      .selectFrom("upstream_proxy_config")
+      .selectAll()
+      .orderBy("provider_id", "asc")
+      .execute();
+    return rows.map((row) => rowToConfig(toRecord(row)));
+  }
+
   const db = getDbInstance();
   const rows = db
     .prepare("SELECT * FROM upstream_proxy_config ORDER BY provider_id")
@@ -108,6 +124,17 @@ export async function getUpstreamProxyConfigs() {
 }
 
 export async function getUpstreamProxyConfig(providerId: string) {
+  if (isPostgres()) {
+    await ensurePostgresBootstrap();
+    const row = await getKyselyDb()
+      .selectFrom("upstream_proxy_config")
+      .selectAll()
+      .where("provider_id", "=", providerId)
+      .executeTakeFirst();
+    if (!row) return null;
+    return rowToConfig(toRecord(row));
+  }
+
   const db = getDbInstance();
   const row = db
     .prepare("SELECT * FROM upstream_proxy_config WHERE provider_id = ?")
@@ -125,7 +152,6 @@ export async function upsertUpstreamProxyConfig(data: {
   enabled?: boolean;
   family?: string;
 }) {
-  const db = getDbInstance();
   const mode = data.mode ?? "native";
   const cliproxyapiModelMapping =
     data.cliproxyapiModelMapping !== undefined
@@ -136,6 +162,38 @@ export async function upsertUpstreamProxyConfig(data: {
   const enabled = data.enabled !== false ? 1 : 0;
   const family = data.family ?? "auto";
 
+  if (isPostgres()) {
+    await ensurePostgresBootstrap();
+    const now = new Date().toISOString();
+    await getKyselyDb()
+      .insertInto("upstream_proxy_config")
+      .values({
+        provider_id: data.providerId,
+        mode,
+        cliproxyapi_model_mapping: cliproxyapiModelMapping,
+        native_priority: nativePriority,
+        cliproxyapi_priority: cliproxyapiPriority,
+        enabled,
+        family,
+        created_at: now,
+        updated_at: now,
+      })
+      .onConflict((oc) =>
+        oc.column("provider_id").doUpdateSet({
+          mode,
+          cliproxyapi_model_mapping: cliproxyapiModelMapping,
+          native_priority: nativePriority,
+          cliproxyapi_priority: cliproxyapiPriority,
+          enabled,
+          family,
+          updated_at: now,
+        })
+      )
+      .execute();
+    return getUpstreamProxyConfig(data.providerId);
+  }
+
+  const db = getDbInstance();
   db.prepare(
     `INSERT INTO upstream_proxy_config
      (provider_id, mode, cliproxyapi_model_mapping, native_priority, cliproxyapi_priority, enabled, family, created_at, updated_at)
@@ -165,12 +223,38 @@ export async function updateUpstreamProxyConfig(
   providerId: string,
   updates: Record<string, unknown>
 ) {
-  const db = getDbInstance();
   const current = await getUpstreamProxyConfig(providerId);
   if (!current) {
     throw new Error(`Provider ${providerId} not found`);
   }
 
+  if (isPostgres()) {
+    await ensurePostgresBootstrap();
+    const patch: Record<string, unknown> = { updated_at: new Date().toISOString() };
+    if (updates.mode !== undefined) patch.mode = updates.mode;
+    if (updates.cliproxyapiModelMapping !== undefined) {
+      patch.cliproxyapi_model_mapping =
+        updates.cliproxyapiModelMapping === null
+          ? null
+          : JSON.stringify(updates.cliproxyapiModelMapping);
+    }
+    if (updates.nativePriority !== undefined) patch.native_priority = updates.nativePriority;
+    if (updates.cliproxyapiPriority !== undefined) {
+      patch.cliproxyapi_priority = updates.cliproxyapiPriority;
+    }
+    if (updates.enabled !== undefined) patch.enabled = updates.enabled === true ? 1 : 0;
+    if (updates.family !== undefined) patch.family = updates.family;
+
+    await getKyselyDb()
+      .updateTable("upstream_proxy_config")
+      .set(patch)
+      .where("provider_id", "=", providerId)
+      .execute();
+
+    return getUpstreamProxyConfig(providerId);
+  }
+
+  const db = getDbInstance();
   const sets: string[] = ["updated_at = datetime('now')"];
   const params: unknown[] = [];
 
@@ -212,6 +296,15 @@ export async function updateUpstreamProxyConfig(
 }
 
 export async function deleteUpstreamProxyConfig(providerId: string) {
+  if (isPostgres()) {
+    await ensurePostgresBootstrap();
+    const result = await getKyselyDb()
+      .deleteFrom("upstream_proxy_config")
+      .where("provider_id", "=", providerId)
+      .executeTakeFirst();
+    return Number(result.numDeletedRows) > 0;
+  }
+
   const db = getDbInstance();
   const result = db
     .prepare("DELETE FROM upstream_proxy_config WHERE provider_id = ?")
@@ -220,6 +313,18 @@ export async function deleteUpstreamProxyConfig(providerId: string) {
 }
 
 export async function getProvidersByMode(mode: string) {
+  if (isPostgres()) {
+    await ensurePostgresBootstrap();
+    const rows = await getKyselyDb()
+      .selectFrom("upstream_proxy_config")
+      .selectAll()
+      .where("mode", "=", mode)
+      .where("enabled", "=", 1)
+      .orderBy("provider_id", "asc")
+      .execute();
+    return rows.map((row) => rowToConfig(toRecord(row)));
+  }
+
   const db = getDbInstance();
   const rows = db
     .prepare(
