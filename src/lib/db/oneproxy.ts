@@ -1,6 +1,13 @@
 import { randomUUID } from "crypto";
+import { sql } from "kysely";
 import { getDbInstance } from "./core";
 import { backupDbFile } from "./backup";
+import { resolveDbDriverConfig } from "./driverConfig";
+import { ensurePostgresBootstrap, getKyselyDb } from "./kysely/client";
+
+function isPostgres(): boolean {
+  return resolveDbDriverConfig().driver === "postgres";
+}
 
 type JsonRecord = Record<string, unknown>;
 
@@ -62,10 +69,11 @@ function mapProxyRow(row: unknown): OneproxyProxyRecord {
     notes: typeof r.notes === "string" ? r.notes : null,
     status: typeof r.status === "string" ? r.status : "active",
     source: typeof r.source === "string" ? r.source : "oneproxy",
-    qualityScore: typeof r.quality_score === "number" ? r.quality_score : null,
-    latencyMs: typeof r.latency_ms === "number" ? r.latency_ms : null,
+    qualityScore:
+      r.quality_score !== null && r.quality_score !== undefined ? Number(r.quality_score) : null,
+    latencyMs: r.latency_ms !== null && r.latency_ms !== undefined ? Number(r.latency_ms) : null,
     anonymity: typeof r.anonymity === "string" ? r.anonymity : null,
-    googleAccess: r.google_access === 1 || r.google_access === true,
+    googleAccess: Number(r.google_access) === 1 || r.google_access === true,
     lastValidated: typeof r.last_validated === "string" ? r.last_validated : null,
     countryCode: typeof r.country_code === "string" ? r.country_code : null,
     createdAt: typeof r.created_at === "string" ? r.created_at : "",
@@ -92,6 +100,22 @@ export async function listOneproxyProxies(options?: {
   minQuality?: number;
   limit?: number;
 }): Promise<OneproxyProxyRecord[]> {
+  if (isPostgres()) {
+    await ensurePostgresBootstrap();
+    let query = getKyselyDb()
+      .selectFrom("proxy_registry")
+      .selectAll()
+      .where("source", "=", "oneproxy")
+      .where("status", "=", "active");
+    if (options?.protocol) query = query.where("type", "=", options.protocol);
+    if (options?.countryCode) query = query.where("country_code", "=", options.countryCode);
+    if (options?.minQuality != null) query = query.where("quality_score", ">=", options.minQuality);
+    query = query.orderBy("quality_score", "desc").orderBy("last_validated", "desc");
+    if (options?.limit) query = query.limit(options.limit);
+    const rows = await query.execute();
+    return rows.map(mapProxyRow);
+  }
+
   const db = getDbInstance();
 
   let sql = "SELECT * FROM proxy_registry WHERE source = 'oneproxy' AND status = 'active'";
@@ -122,6 +146,53 @@ export async function listOneproxyProxies(options?: {
 }
 
 export async function getOneproxyStats(): Promise<OneproxyStats> {
+  if (isPostgres()) {
+    await ensurePostgresBootstrap();
+    const kdb = getKyselyDb();
+    const statsRow = await kdb
+      .selectFrom("proxy_registry")
+      .select((eb) => [
+        eb.fn.countAll().as("total"),
+        eb.fn.sum(eb.case().when("status", "=", "active").then(1).else(0).end()).as("active"),
+        eb.fn.avg("quality_score").as("avg_quality"),
+        eb.fn.max("last_validated").as("last_validated"),
+      ])
+      .where("source", "=", "oneproxy")
+      .executeTakeFirst();
+
+    const stats = mapStatsRow(statsRow);
+
+    const byProtocol = await kdb
+      .selectFrom("proxy_registry")
+      .select((eb) => ["type as protocol", eb.fn.countAll().as("count")])
+      .where("source", "=", "oneproxy")
+      .groupBy("type")
+      .orderBy("count", "desc")
+      .execute();
+
+    const byCountry = await kdb
+      .selectFrom("proxy_registry")
+      .select((eb) => ["country_code as countryCode", eb.fn.countAll().as("count")])
+      .where("source", "=", "oneproxy")
+      .where("country_code", "is not", null)
+      .groupBy("country_code")
+      .orderBy("count", "desc")
+      .limit(20)
+      .execute();
+
+    return {
+      ...stats,
+      byProtocol: byProtocol.map((r) => ({
+        protocol: String((r as JsonRecord).protocol || "unknown"),
+        count: Number((r as JsonRecord).count) || 0,
+      })),
+      byCountry: byCountry.map((r) => ({
+        countryCode: String((r as JsonRecord).countryCode || "unknown"),
+        count: Number((r as JsonRecord).count) || 0,
+      })),
+    };
+  }
+
   const db = getDbInstance();
 
   const statsRow = db
@@ -165,10 +236,67 @@ export async function getOneproxyStats(): Promise<OneproxyStats> {
 export async function upsertOneproxyProxy(
   input: OneproxyUpsertInput
 ): Promise<{ proxy: OneproxyProxyRecord | null; action: "created" | "updated" }> {
-  const db = getDbInstance();
   const now = new Date().toISOString();
-
   const name = `${input.protocol?.toUpperCase() || "HTTP"} - ${input.countryCode || "Unknown"} - ${input.ip}`;
+
+  if (isPostgres()) {
+    await ensurePostgresBootstrap();
+    const kdb = getKyselyDb();
+    const existingRow = await kdb
+      .selectFrom("proxy_registry")
+      .select("id")
+      .where("host", "=", input.ip)
+      .where("port", "=", input.port)
+      .where("source", "=", "oneproxy")
+      .executeTakeFirst();
+
+    if (existingRow?.id) {
+      await kdb
+        .updateTable("proxy_registry")
+        .set({
+          status: "active",
+          quality_score: input.qualityScore ?? null,
+          latency_ms: input.latencyMs ?? null,
+          anonymity: input.anonymity ?? null,
+          google_access: input.googleAccess ? 1 : 0,
+          last_validated: input.lastValidated ?? now,
+          country_code: input.countryCode ?? null,
+          updated_at: now,
+        })
+        .where("id", "=", existingRow.id)
+        .execute();
+      const proxy = await getOneproxyProxyById(existingRow.id);
+      return { proxy, action: "updated" };
+    }
+
+    const id = randomUUID();
+    await kdb
+      .insertInto("proxy_registry")
+      .values({
+        id,
+        name,
+        type: input.protocol || "http",
+        host: input.ip,
+        port: input.port,
+        region: input.countryCode ?? null,
+        notes: null,
+        status: "active",
+        source: "oneproxy",
+        quality_score: input.qualityScore ?? null,
+        latency_ms: input.latencyMs ?? null,
+        anonymity: input.anonymity ?? null,
+        google_access: input.googleAccess ? 1 : 0,
+        last_validated: input.lastValidated ?? now,
+        country_code: input.countryCode ?? null,
+        created_at: now,
+        updated_at: now,
+      })
+      .execute();
+    const proxy = await getOneproxyProxyById(id);
+    return { proxy, action: "created" };
+  }
+
+  const db = getDbInstance();
 
   const existing = db
     .prepare("SELECT id FROM proxy_registry WHERE host = ? AND port = ? AND source = 'oneproxy'")
@@ -228,6 +356,18 @@ export async function upsertOneproxyProxy(
 }
 
 export async function getOneproxyProxyById(id: string): Promise<OneproxyProxyRecord | null> {
+  if (isPostgres()) {
+    await ensurePostgresBootstrap();
+    const row = await getKyselyDb()
+      .selectFrom("proxy_registry")
+      .selectAll()
+      .where("id", "=", id)
+      .where("source", "=", "oneproxy")
+      .executeTakeFirst();
+    if (!row) return null;
+    return mapProxyRow(row);
+  }
+
   const db = getDbInstance();
   const row = db
     .prepare("SELECT * FROM proxy_registry WHERE id = ? AND source = 'oneproxy'")
@@ -237,6 +377,17 @@ export async function getOneproxyProxyById(id: string): Promise<OneproxyProxyRec
 }
 
 export async function deleteOneproxyProxy(id: string): Promise<boolean> {
+  if (isPostgres()) {
+    await ensurePostgresBootstrap();
+    const result = await getKyselyDb()
+      .deleteFrom("proxy_registry")
+      .where("id", "=", id)
+      .where("source", "=", "oneproxy")
+      .executeTakeFirst();
+    backupDbFile("pre-write");
+    return Number(result.numDeletedRows) > 0;
+  }
+
   const db = getDbInstance();
   const result = db
     .prepare("DELETE FROM proxy_registry WHERE id = ? AND source = 'oneproxy'")
@@ -246,6 +397,16 @@ export async function deleteOneproxyProxy(id: string): Promise<boolean> {
 }
 
 export async function clearAllOneproxyProxies(): Promise<number> {
+  if (isPostgres()) {
+    await ensurePostgresBootstrap();
+    const result = await getKyselyDb()
+      .deleteFrom("proxy_registry")
+      .where("source", "=", "oneproxy")
+      .executeTakeFirst();
+    backupDbFile("pre-write");
+    return Number(result.numDeletedRows);
+  }
+
   const db = getDbInstance();
   const result = db.prepare("DELETE FROM proxy_registry WHERE source = 'oneproxy'").run();
   backupDbFile("pre-write");
@@ -255,29 +416,88 @@ export async function clearAllOneproxyProxies(): Promise<number> {
 export async function getOneproxyProxyForRotation(options?: {
   strategy?: "random" | "quality" | "sequential";
 }): Promise<OneproxyProxyRecord | null> {
-  const db = getDbInstance();
   const strategy = options?.strategy || "quality";
 
-  let sql = "SELECT * FROM proxy_registry WHERE source = 'oneproxy' AND status = 'active'";
+  if (isPostgres()) {
+    await ensurePostgresBootstrap();
+    let query = getKyselyDb()
+      .selectFrom("proxy_registry")
+      .selectAll()
+      .where("source", "=", "oneproxy")
+      .where("status", "=", "active");
+
+    switch (strategy) {
+      case "quality":
+        query = query.orderBy("quality_score", "desc").orderBy("latency_ms", "asc");
+        break;
+      case "random":
+        query = query.orderBy(sql`RANDOM()`);
+        break;
+      case "sequential":
+        query = query.orderBy("last_validated", "asc");
+        break;
+    }
+
+    const row = await query.limit(1).executeTakeFirst();
+    if (!row) return null;
+    return mapProxyRow(row);
+  }
+
+  const db = getDbInstance();
+
+  let sqlStr = "SELECT * FROM proxy_registry WHERE source = 'oneproxy' AND status = 'active'";
 
   switch (strategy) {
     case "quality":
-      sql += " ORDER BY quality_score DESC, latency_ms ASC LIMIT 1";
+      sqlStr += " ORDER BY quality_score DESC, latency_ms ASC LIMIT 1";
       break;
     case "random":
-      sql += " ORDER BY RANDOM() LIMIT 1";
+      sqlStr += " ORDER BY RANDOM() LIMIT 1";
       break;
     case "sequential":
-      sql += " ORDER BY last_validated ASC LIMIT 1";
+      sqlStr += " ORDER BY last_validated ASC LIMIT 1";
       break;
   }
 
-  const row = db.prepare(sql).get();
+  const row = db.prepare(sqlStr).get();
   if (!row) return null;
   return mapProxyRow(row);
 }
 
 export async function markOneproxyProxyFailed(host: string, port: number): Promise<boolean> {
+  if (isPostgres()) {
+    await ensurePostgresBootstrap();
+    const kdb = getKyselyDb();
+    const existing = await kdb
+      .selectFrom("proxy_registry")
+      .select("quality_score")
+      .where("host", "=", host)
+      .where("port", "=", port)
+      .where("source", "=", "oneproxy")
+      .executeTakeFirst();
+    if (!existing) return false;
+
+    const currentQuality = existing.quality_score !== null ? Number(existing.quality_score) : 50;
+    const newQuality = Math.max(0, currentQuality - 10);
+    const patch: Record<string, unknown> = {
+      quality_score: newQuality,
+      updated_at: new Date().toISOString(),
+    };
+    // Matches the SQLite CASE clause: the inactivation threshold is checked
+    // against the pre-decrement quality score, not the post-decrement one.
+    if (currentQuality <= 10) patch.status = "inactive";
+
+    const result = await kdb
+      .updateTable("proxy_registry")
+      .set(patch)
+      .where("host", "=", host)
+      .where("port", "=", port)
+      .where("source", "=", "oneproxy")
+      .executeTakeFirst();
+    backupDbFile("pre-write");
+    return Number(result.numUpdatedRows) > 0;
+  }
+
   const db = getDbInstance();
   const result = db
     .prepare(
