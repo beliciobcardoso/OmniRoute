@@ -53,7 +53,7 @@ export async function exportConfig(): Promise<AgentBridgeConfig> {
 
   return {
     version: 1,
-    bypassPatterns: getUserBypassPatterns(),
+    bypassPatterns: await getUserBypassPatterns(),
     customHosts,
     agentMappings,
   };
@@ -68,7 +68,7 @@ export interface ImportResult {
 /** Apply a validated config to the DB. Bypass + mappings replace wholesale;
  * custom hosts are added idempotently (INSERT OR IGNORE). */
 export async function importConfig(config: AgentBridgeConfig): Promise<ImportResult> {
-  replaceUserBypassPatterns(config.bypassPatterns);
+  await replaceUserBypassPatterns(config.bypassPatterns);
 
   for (const h of config.customHosts) {
     addCustomHost(h.host, h.kind, h.label ?? undefined);
