@@ -113,7 +113,8 @@ CREATE TABLE IF NOT EXISTS api_key_token_limits (
   reset_time TEXT,
   enabled BIGINT NOT NULL DEFAULT 1,
   created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-  updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+  updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  UNIQUE (api_key_id, scope_type, scope_value)
 );
 
 CREATE TABLE IF NOT EXISTS api_keys (

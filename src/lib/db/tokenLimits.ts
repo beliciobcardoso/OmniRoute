@@ -12,8 +12,15 @@
  */
 
 import { randomUUID } from "crypto";
+import { sql } from "kysely";
 import { getDbInstance } from "./core";
+import { resolveDbDriverConfig } from "./driverConfig.ts";
+import { ensurePostgresBootstrap, getKyselyDb } from "./kysely/client.ts";
 import { getBudgetWindow, type BudgetResetInterval } from "@/domain/costRules";
+
+function isPostgres(): boolean {
+  return resolveDbDriverConfig().driver === "postgres";
+}
 
 export type TokenLimitScopeType = "model" | "provider" | "global";
 
@@ -136,9 +143,7 @@ function rowToTokenLimit(row: unknown): TokenLimit {
  * Insert or update a token limit. Upsert key is (api_key_id, scope_type, scope_value).
  * Returns the persisted row.
  */
-export function upsertTokenLimit(input: UpsertTokenLimitInput): TokenLimit {
-  ensureSchema();
-  const db = getDbInstance();
+export async function upsertTokenLimit(input: UpsertTokenLimitInput): Promise<TokenLimit> {
   const scopeType = normalizeScopeType(input.scopeType);
   const scopeValue = scopeType === "global" ? "" : (input.scopeValue ?? "").trim();
   const resetInterval = normalizeResetInterval(input.resetInterval);
@@ -148,6 +153,43 @@ export function upsertTokenLimit(input: UpsertTokenLimitInput): TokenLimit {
   const tokenLimit = Math.floor(toNumber(input.tokenLimit));
   const id = input.id && input.id.trim() ? input.id.trim() : randomUUID();
 
+  if (isPostgres()) {
+    await ensurePostgresBootstrap();
+    await getKyselyDb()
+      .insertInto("api_key_token_limits")
+      .values({
+        id,
+        api_key_id: input.apiKeyId,
+        scope_type: scopeType,
+        scope_value: scopeValue,
+        token_limit: tokenLimit,
+        reset_interval: resetInterval,
+        reset_time: resetTime,
+        enabled,
+      })
+      .onConflict((oc) =>
+        oc.columns(["api_key_id", "scope_type", "scope_value"]).doUpdateSet((eb) => ({
+          token_limit: eb.ref("excluded.token_limit"),
+          reset_interval: eb.ref("excluded.reset_interval"),
+          reset_time: eb.ref("excluded.reset_time"),
+          enabled: eb.ref("excluded.enabled"),
+          updated_at: sql`now()`,
+        }))
+      )
+      .execute();
+
+    const pgRow = await getKyselyDb()
+      .selectFrom("api_key_token_limits")
+      .selectAll()
+      .where("api_key_id", "=", input.apiKeyId)
+      .where("scope_type", "=", scopeType)
+      .where("scope_value", "=", scopeValue)
+      .executeTakeFirst();
+    return rowToTokenLimit(pgRow);
+  }
+
+  ensureSchema();
+  const db = getDbInstance();
   db.prepare(
     `INSERT INTO api_key_token_limits
        (id, api_key_id, scope_type, scope_value, token_limit, reset_interval, reset_time, enabled, created_at, updated_at)
@@ -158,7 +200,16 @@ export function upsertTokenLimit(input: UpsertTokenLimitInput): TokenLimit {
                    reset_time     = excluded.reset_time,
                    enabled        = excluded.enabled,
                    updated_at     = datetime('now')`
-  ).run({ id, apiKeyId: input.apiKeyId, scopeType, scopeValue, tokenLimit, resetInterval, resetTime, enabled });
+  ).run({
+    id,
+    apiKeyId: input.apiKeyId,
+    scopeType,
+    scopeValue,
+    tokenLimit,
+    resetInterval,
+    resetTime,
+    enabled,
+  });
 
   const row = db
     .prepare(
@@ -169,7 +220,19 @@ export function upsertTokenLimit(input: UpsertTokenLimitInput): TokenLimit {
 }
 
 /** List all token limits for an API key (ordered most-specific first: model, provider, global). */
-export function listTokenLimits(apiKeyId: string): TokenLimit[] {
+export async function listTokenLimits(apiKeyId: string): Promise<TokenLimit[]> {
+  if (isPostgres()) {
+    await ensurePostgresBootstrap();
+    const rows = await getKyselyDb()
+      .selectFrom("api_key_token_limits")
+      .selectAll()
+      .where("api_key_id", "=", apiKeyId)
+      .orderBy(sql`CASE scope_type WHEN 'model' THEN 0 WHEN 'provider' THEN 1 ELSE 2 END`)
+      .orderBy("scope_value")
+      .execute();
+    return rows.map(rowToTokenLimit);
+  }
+
   ensureSchema();
   const db = getDbInstance();
   return db
@@ -187,11 +250,29 @@ export function listTokenLimits(apiKeyId: string): TokenLimit[] {
  * (scope_value === model), the provider-scoped row (scope_value === provider),
  * and the global row. Used by the enforcement read.
  */
-export function getTokenLimitsForRequest(
+export async function getTokenLimitsForRequest(
   apiKeyId: string,
   provider: string,
   model: string
-): TokenLimit[] {
+): Promise<TokenLimit[]> {
+  if (isPostgres()) {
+    await ensurePostgresBootstrap();
+    const rows = await getKyselyDb()
+      .selectFrom("api_key_token_limits")
+      .selectAll()
+      .where("api_key_id", "=", apiKeyId)
+      .where("enabled", "=", 1)
+      .where((eb) =>
+        eb.or([
+          eb("scope_type", "=", "global"),
+          eb.and([eb("scope_type", "=", "model"), eb("scope_value", "=", model || "")]),
+          eb.and([eb("scope_type", "=", "provider"), eb("scope_value", "=", provider || "")]),
+        ])
+      )
+      .execute();
+    return rows.map(rowToTokenLimit);
+  }
+
   ensureSchema();
   const db = getDbInstance();
   return db
@@ -210,7 +291,22 @@ export function getTokenLimitsForRequest(
 }
 
 /** Delete a token limit by id (counters + reset logs cascade in app code below). */
-export function deleteTokenLimit(id: string): boolean {
+export async function deleteTokenLimit(id: string): Promise<boolean> {
+  if (isPostgres()) {
+    await ensurePostgresBootstrap();
+    return getKyselyDb()
+      .transaction()
+      .execute(async (trx) => {
+        await trx.deleteFrom("api_key_token_counters").where("limit_id", "=", id).execute();
+        await trx.deleteFrom("api_key_token_limit_reset_logs").where("limit_id", "=", id).execute();
+        const result = await trx
+          .deleteFrom("api_key_token_limits")
+          .where("id", "=", id)
+          .executeTakeFirst();
+        return Number(result.numDeletedRows) > 0;
+      });
+  }
+
   ensureSchema();
   const db = getDbInstance();
   // FK pragma is OFF in this build; delete dependents explicitly.
@@ -242,10 +338,22 @@ export function resetWindowIfElapsed(limit: TokenLimit, now = Date.now()): Token
  * Read-only point-read of the current window's usage for a limit.
  * Returns 0 if no counter row exists yet (cold window). DB-authoritative.
  */
-export function getWindowUsage(limit: TokenLimit, now = Date.now()): number {
+export async function getWindowUsage(limit: TokenLimit, now = Date.now()): Promise<number> {
+  const { windowStart } = resetWindowIfElapsed(limit, now);
+
+  if (isPostgres()) {
+    await ensurePostgresBootstrap();
+    const row = await getKyselyDb()
+      .selectFrom("api_key_token_counters")
+      .select("tokens_used")
+      .where("limit_id", "=", limit.id)
+      .where("window_start", "=", windowStart)
+      .executeTakeFirst();
+    return toNumber(row?.tokens_used);
+  }
+
   ensureSchema();
   const db = getDbInstance();
-  const { windowStart } = resetWindowIfElapsed(limit, now);
   const row = db
     .prepare(
       "SELECT tokens_used FROM api_key_token_counters WHERE limit_id = ? AND window_start = ?"
@@ -259,14 +367,35 @@ export function getWindowUsage(limit: TokenLimit, now = Date.now()): number {
  * the new running total. Uses UPSERT (no read-then-write) so concurrent
  * increments under WAL cannot lose updates.
  */
-export function incrementWindowTokens(
+export async function incrementWindowTokens(
   limitId: string,
   windowStart: string,
   tokens: number
-): number {
+): Promise<number> {
+  const delta = Math.max(0, Math.floor(toNumber(tokens)));
+
+  if (isPostgres()) {
+    await ensurePostgresBootstrap();
+    const row = await getKyselyDb()
+      .insertInto("api_key_token_counters")
+      .values({ limit_id: limitId, window_start: windowStart, tokens_used: delta })
+      .onConflict((oc) =>
+        oc.columns(["limit_id", "window_start"]).doUpdateSet((eb) => ({
+          tokens_used: eb(
+            "api_key_token_counters.tokens_used",
+            "+",
+            eb.ref("excluded.tokens_used")
+          ),
+          updated_at: sql`now()`,
+        }))
+      )
+      .returning("tokens_used")
+      .executeTakeFirst();
+    return toNumber(row?.tokens_used);
+  }
+
   ensureSchema();
   const db = getDbInstance();
-  const delta = Math.max(0, Math.floor(toNumber(tokens)));
   const row = db
     .prepare(
       `INSERT INTO api_key_token_counters (limit_id, window_start, tokens_used, updated_at)
@@ -281,15 +410,31 @@ export function incrementWindowTokens(
 }
 
 /** Append a window-reset audit log row. */
-export function logTokenLimitReset(
+export async function logTokenLimitReset(
   limitId: string,
   prevTokens: number,
   windowStart: string
-): void {
+): Promise<void> {
+  const clampedPrevTokens = Math.max(0, Math.floor(toNumber(prevTokens)));
+
+  if (isPostgres()) {
+    await ensurePostgresBootstrap();
+    await getKyselyDb()
+      .insertInto("api_key_token_limit_reset_logs")
+      .values({
+        limit_id: limitId,
+        reset_at: sql`now()`,
+        prev_tokens: clampedPrevTokens,
+        window_start: windowStart,
+      })
+      .execute();
+    return;
+  }
+
   ensureSchema();
   const db = getDbInstance();
   db.prepare(
     `INSERT INTO api_key_token_limit_reset_logs (limit_id, reset_at, prev_tokens, window_start)
      VALUES (?, datetime('now'), ?, ?)`
-  ).run(limitId, Math.max(0, Math.floor(toNumber(prevTokens))), windowStart);
+  ).run(limitId, clampedPrevTokens, windowStart);
 }
