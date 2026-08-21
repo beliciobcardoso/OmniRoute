@@ -34,10 +34,21 @@ function isPostgres(): boolean {
 let pgCache: Record<string, string> | null = null;
 let pgCacheLoadedAt = 0;
 let pgCacheLoadInFlight: Promise<void> | null = null;
+// Monotonic write counter — used (instead of Date.now(), which only has
+// millisecond resolution) to detect whether a local write raced against an
+// in-flight background refresh. Two Date.now() calls a few synchronous
+// statements apart can return the identical millisecond, which made an
+// earlier version of this guard silently misfire.
+let pgCacheEpoch = 0;
 const PG_CACHE_TTL_MS = 30_000;
 
 function refreshPgCacheInBackground(): void {
   if (pgCacheLoadInFlight) return;
+  // Guard against a race where this refresh was queued BEFORE a local write
+  // (setFeatureFlagOverride/remove/clear) but resolves AFTER it: without
+  // this check, applying `next` here would silently clobber the newer
+  // optimistic value with the stale pre-write snapshot this query read.
+  const epochAtStart = pgCacheEpoch;
   pgCacheLoadInFlight = (async () => {
     try {
       await ensurePostgresBootstrap();
@@ -50,8 +61,10 @@ function refreshPgCacheInBackground(): void {
       for (const row of rows) {
         next[row.key] = row.value;
       }
-      pgCache = next;
-      pgCacheLoadedAt = Date.now();
+      if (pgCacheEpoch === epochAtStart) {
+        pgCache = next;
+        pgCacheLoadedAt = Date.now();
+      }
     } catch (err) {
       // Leave the previous cache (or null) in place — every reader falls
       // back to process.env / the definition default regardless.
@@ -160,6 +173,7 @@ export function setFeatureFlagOverride(key: string, value: string): void {
     // sees the new value, then persist to Postgres in the background.
     pgCache = { ...(pgCache ?? {}), [key]: value };
     pgCacheLoadedAt = Date.now();
+    pgCacheEpoch++;
     void persistPgOverride(key, value);
     return;
   }
@@ -178,12 +192,11 @@ export function setFeatureFlagOverride(key: string, value: string): void {
  */
 export function removeFeatureFlagOverride(key: string): void {
   if (isPostgres()) {
-    if (pgCache) {
-      const next = { ...pgCache };
-      delete next[key];
-      pgCache = next;
-      pgCacheLoadedAt = Date.now();
-    }
+    const next = { ...(pgCache ?? {}) };
+    delete next[key];
+    pgCache = next;
+    pgCacheLoadedAt = Date.now();
+    pgCacheEpoch++;
     void deletePgOverride(key);
     return;
   }
@@ -199,6 +212,7 @@ export function clearAllFeatureFlagOverrides(): void {
   if (isPostgres()) {
     pgCache = {};
     pgCacheLoadedAt = Date.now();
+    pgCacheEpoch++;
     void deletePgOverride();
     return;
   }
