@@ -4,11 +4,108 @@ import { DEFAULT_DATABASE_SETTINGS, type DatabaseSettings } from "@/types/databa
 
 import { backupDbFile } from "./backup";
 import { DATA_DIR, SQLITE_FILE, applyDatabaseOptimizationSettings, getDbInstance } from "./core";
+import { resolveDbDriverConfig } from "./driverConfig.ts";
+import { ensurePostgresBootstrap, getKyselyDb } from "./kysely/client.ts";
 import { invalidateDbCache } from "./readCache";
 import { getDatabaseStats } from "./stats";
 import { getState as getVacuumSchedulerState, refreshVacuumScheduler } from "./vacuumScheduler";
+import { logger } from "../../../open-sse/utils/logger.ts";
 
+const log = logger("DB_DATABASE_SETTINGS");
 const DATABASE_SETTINGS_NAMESPACE = "databaseSettings";
+const SETTINGS_NAMESPACE = "settings";
+const PG_NAMESPACES = [SETTINGS_NAMESPACE, DATABASE_SETTINGS_NAMESPACE];
+
+function isPostgres(): boolean {
+  return resolveDbDriverConfig().driver === "postgres";
+}
+
+/**
+ * In-memory cache of the Postgres-backed key_value rows for the "settings"
+ * and "databaseSettings" namespaces.
+ *
+ * getUserDatabaseSettings()/getDatabaseSettings() MUST stay synchronous —
+ * they're read from ~20 call sites across dashboard routes and hot-path
+ * modules (paramFilters.ts, interceptionRules.ts) that cannot become async
+ * without a much larger ripple. Settings changes are rare, operator-triggered
+ * admin actions, so a short staleness window plus a best-effort,
+ * fire-and-forget Postgres write on update is an accepted trade-off (same
+ * pattern as featureFlags.ts/cliToolState.ts).
+ */
+let pgCache: Record<string, Record<string, string>> | null = null;
+let pgCacheLoadedAt = 0;
+let pgCacheLoadInFlight: Promise<void> | null = null;
+// Monotonic write counter — see featureFlags.ts for why Date.now() alone is
+// not a reliable staleness guard against a background refresh racing a write.
+let pgCacheEpoch = 0;
+const PG_CACHE_TTL_MS = 30_000;
+
+function refreshPgCacheInBackground(): void {
+  if (pgCacheLoadInFlight) return;
+  const epochAtStart = pgCacheEpoch;
+  pgCacheLoadInFlight = (async () => {
+    try {
+      await ensurePostgresBootstrap();
+      const rows = await getKyselyDb()
+        .selectFrom("key_value")
+        .select(["namespace", "key", "value"])
+        .where("namespace", "in", PG_NAMESPACES)
+        .execute();
+      const next: Record<string, Record<string, string>> = {};
+      for (const ns of PG_NAMESPACES) next[ns] = {};
+      for (const row of rows) {
+        (next[row.namespace] ??= {})[row.key] = row.value;
+      }
+      if (pgCacheEpoch === epochAtStart) {
+        pgCache = next;
+        pgCacheLoadedAt = Date.now();
+      }
+    } catch (err) {
+      log.warn("database_settings.pg_cache_refresh_failed", {
+        error: err instanceof Error ? err.message : String(err),
+      });
+    } finally {
+      pgCacheLoadInFlight = null;
+    }
+  })();
+}
+
+function getPgNamespace(namespace: string): Record<string, string> {
+  if (pgCache === null || Date.now() - pgCacheLoadedAt > PG_CACHE_TTL_MS) {
+    refreshPgCacheInBackground();
+  }
+  return pgCache?.[namespace] ?? {};
+}
+
+function persistPgRows(rows: Array<{ namespace: string; key: string; value: string }>): void {
+  if (rows.length === 0) return;
+
+  pgCache = pgCache ?? {};
+  for (const row of rows) {
+    (pgCache[row.namespace] ??= {})[row.key] = row.value;
+  }
+  pgCacheLoadedAt = Date.now();
+  pgCacheEpoch++;
+
+  void (async () => {
+    try {
+      await ensurePostgresBootstrap();
+      await getKyselyDb()
+        .insertInto("key_value")
+        .values(rows)
+        .onConflict((oc) =>
+          oc
+            .columns(["namespace", "key"])
+            .doUpdateSet((eb) => ({ value: eb.ref("excluded.value") }))
+        )
+        .execute();
+    } catch (err) {
+      log.warn("database_settings.pg_persist_failed", {
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
+  })();
+}
 
 export type UserDatabaseSettings = Omit<DatabaseSettings, "location" | "stats">;
 type DatabaseSettingsSection = keyof UserDatabaseSettings;
@@ -105,6 +202,15 @@ function normalizeOptimizationSettings(settings: UserDatabaseSettings) {
 }
 
 function readNamespace(namespace: string): Record<string, unknown> {
+  if (isPostgres()) {
+    const raw = getPgNamespace(namespace);
+    const values: Record<string, unknown> = {};
+    for (const [key, value] of Object.entries(raw)) {
+      values[key] = parseStoredValue(value);
+    }
+    return values;
+  }
+
   const db = getDbInstance();
   const rows = db
     .prepare("SELECT key, value FROM key_value WHERE namespace = ?")
@@ -177,7 +283,7 @@ function mergeDatabaseSettingsNamespace(
 }
 
 function getWalSizeBytes(): number {
-  if (!SQLITE_FILE) return 0;
+  if (isPostgres() || !SQLITE_FILE) return 0;
 
   try {
     const walPath = `${SQLITE_FILE}-wal`;
@@ -188,6 +294,8 @@ function getWalSizeBytes(): number {
 }
 
 function getSchemaVersion(): number {
+  if (isPostgres()) return 0;
+
   const db = getDbInstance();
 
   try {
@@ -201,6 +309,8 @@ function getSchemaVersion(): number {
 }
 
 function getFreelistCount(): number {
+  if (isPostgres()) return 0;
+
   try {
     return getDbInstance().pragma("freelist_count", { simple: true }) as number;
   } catch {
@@ -209,6 +319,8 @@ function getFreelistCount(): number {
 }
 
 function getIntegrityCheck(): "ok" | "error" | null {
+  if (isPostgres()) return null;
+
   try {
     const result = getDbInstance().pragma("quick_check", { simple: true }) as string;
     return result === "ok" ? "ok" : "error";
@@ -235,13 +347,16 @@ export function getUserDatabaseSettings(): UserDatabaseSettings {
 }
 
 export function getDatabaseSettings(): DatabaseSettings {
-  const dbStats = getDatabaseStats();
+  // The SQLite pragma/WAL/freelist diagnostics below have no direct Postgres
+  // equivalent — under DB_DRIVER=postgres they report stub/N-A values rather
+  // than the coexisting SQLite file's (unrelated) stats.
+  const dbStats = isPostgres() ? { totalSize: 0, pageCount: 0 } : getDatabaseStats();
   const vacuumState = getVacuumSchedulerState();
 
   return {
     ...getUserDatabaseSettings(),
     location: {
-      databasePath: SQLITE_FILE ?? ":memory:",
+      databasePath: isPostgres() ? "postgres" : (SQLITE_FILE ?? ":memory:"),
       dataDir: DATA_DIR,
       walSizeBytes: getWalSizeBytes(),
       schemaVersion: getSchemaVersion(),
@@ -271,34 +386,57 @@ export function updateDatabaseSettings(
   }
   normalizeOptimizationSettings(nextSettings);
 
-  const db = getDbInstance();
-  const insert = db.prepare(
-    "INSERT OR REPLACE INTO key_value (namespace, key, value) VALUES (?, ?, ?)"
-  );
-  const settingsInsert = db.prepare(
-    "INSERT OR REPLACE INTO key_value (namespace, key, value) VALUES ('settings', ?, ?)"
-  );
-
   const requestedLogs = updates.logs as Partial<UserDatabaseSettings["logs"]> | undefined;
   const pipelineEnabled = requestedLogs?.callLogPipelineEnabled;
   const detailedEnabled = requestedLogs?.detailedLogsEnabled;
 
-  const tx = db.transaction(() => {
+  if (isPostgres()) {
+    const rows: Array<{ namespace: string; key: string; value: string }> = [];
     for (const section of DATABASE_SETTINGS_SECTIONS) {
       const sectionValues = nextSettings[section] as Record<string, unknown>;
-
       for (const [key, value] of Object.entries(sectionValues)) {
-        insert.run(DATABASE_SETTINGS_NAMESPACE, `${section}.${key}`, JSON.stringify(value));
+        rows.push({
+          namespace: DATABASE_SETTINGS_NAMESPACE,
+          key: `${section}.${key}`,
+          value: JSON.stringify(value),
+        });
       }
     }
-
     if (pipelineEnabled !== undefined) {
-      settingsInsert.run("call_log_pipeline_enabled", JSON.stringify(Boolean(pipelineEnabled)));
+      rows.push({
+        namespace: SETTINGS_NAMESPACE,
+        key: "call_log_pipeline_enabled",
+        value: JSON.stringify(Boolean(pipelineEnabled)),
+      });
     }
-  });
-  tx();
+    persistPgRows(rows);
+  } else {
+    const db = getDbInstance();
+    const insert = db.prepare(
+      "INSERT OR REPLACE INTO key_value (namespace, key, value) VALUES (?, ?, ?)"
+    );
+    const settingsInsert = db.prepare(
+      "INSERT OR REPLACE INTO key_value (namespace, key, value) VALUES ('settings', ?, ?)"
+    );
 
-  backupDbFile("pre-write");
+    const tx = db.transaction(() => {
+      for (const section of DATABASE_SETTINGS_SECTIONS) {
+        const sectionValues = nextSettings[section] as Record<string, unknown>;
+
+        for (const [key, value] of Object.entries(sectionValues)) {
+          insert.run(DATABASE_SETTINGS_NAMESPACE, `${section}.${key}`, JSON.stringify(value));
+        }
+      }
+
+      if (pipelineEnabled !== undefined) {
+        settingsInsert.run("call_log_pipeline_enabled", JSON.stringify(Boolean(pipelineEnabled)));
+      }
+    });
+    tx();
+
+    backupDbFile("pre-write");
+  }
+
   invalidateDbCache("settings");
   if (optimizationUpdated) {
     applyDatabaseOptimizationSettings(nextSettings.optimization);
