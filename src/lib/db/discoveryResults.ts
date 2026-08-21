@@ -10,13 +10,14 @@
  */
 
 import { getDbInstance } from "./core";
+import { resolveDbDriverConfig } from "./driverConfig";
+import { ensurePostgresBootstrap, getKyselyDb } from "./kysely/client";
 
-export type DiscoveryMethod =
-  | "free_tier"
-  | "web_cookie"
-  | "auto_register"
-  | "trial"
-  | "public_api";
+function isPostgres(): boolean {
+  return resolveDbDriverConfig().driver === "postgres";
+}
+
+export type DiscoveryMethod = "free_tier" | "web_cookie" | "auto_register" | "trial" | "public_api";
 export type DiscoveryAuthType = "none" | "cookie" | "api_key" | "oauth";
 export type DiscoveryRiskLevel = "none" | "low" | "medium" | "high" | "critical";
 export type DiscoveryStatus = "pending" | "testing" | "verified" | "rejected";
@@ -64,14 +65,15 @@ function rowToResult(row: DiscoveryRow): DiscoveryResult {
     }
   }
   return {
-    id: row.id,
+    id: Number(row.id),
     providerId: row.provider_id,
     method: row.method as DiscoveryMethod,
     endpoint: row.endpoint,
     authType: (row.auth_type as DiscoveryAuthType) ?? "none",
     models,
     rateLimit: row.rate_limit,
-    feasibility: row.feasibility ?? 0,
+    feasibility:
+      row.feasibility !== null && row.feasibility !== undefined ? Number(row.feasibility) : 0,
     riskLevel: (row.risk_level as DiscoveryRiskLevel) ?? "none",
     status: row.status as DiscoveryStatus,
     notes: row.notes,
@@ -86,9 +88,55 @@ function rowToResult(row: DiscoveryRow): DiscoveryResult {
  * re-discovering the same endpoint updates the existing row rather than
  * duplicating it. Returns the persisted row (with its id).
  */
-export function upsertDiscoveryResult(result: DiscoveryResult): DiscoveryResult {
-  const db = getDbInstance();
+export async function upsertDiscoveryResult(result: DiscoveryResult): Promise<DiscoveryResult> {
   const models = result.models ? JSON.stringify(result.models) : null;
+
+  if (isPostgres()) {
+    await ensurePostgresBootstrap();
+    const kdb = getKyselyDb();
+    const values = {
+      provider_id: result.providerId,
+      method: result.method,
+      endpoint: result.endpoint ?? null,
+      auth_type: result.authType,
+      models,
+      rate_limit: result.rateLimit ?? null,
+      feasibility: result.feasibility,
+      risk_level: result.riskLevel,
+      status: result.status,
+      notes: result.notes ?? null,
+    };
+    await kdb
+      .insertInto("discovery_results")
+      .values(values)
+      .onConflict((oc) =>
+        oc.columns(["provider_id", "method", "endpoint"]).doUpdateSet({
+          auth_type: values.auth_type,
+          models: values.models,
+          rate_limit: values.rate_limit,
+          feasibility: values.feasibility,
+          risk_level: values.risk_level,
+          status: values.status,
+          notes: values.notes,
+        })
+      )
+      .execute();
+
+    let query = kdb
+      .selectFrom("discovery_results")
+      .selectAll()
+      .where("provider_id", "=", result.providerId)
+      .where("method", "=", result.method);
+    query =
+      result.endpoint == null
+        ? query.where("endpoint", "is", null)
+        : query.where("endpoint", "=", result.endpoint);
+    const row = await query.executeTakeFirst();
+    // The row was just written, so it must exist.
+    return rowToResult(row! as unknown as DiscoveryRow);
+  }
+
+  const db = getDbInstance();
   db.prepare(
     `INSERT INTO discovery_results
        (provider_id, method, endpoint, auth_type, models, rate_limit, feasibility, risk_level, status, notes)
@@ -128,7 +176,15 @@ export function upsertDiscoveryResult(result: DiscoveryResult): DiscoveryResult 
  * List discovery results, optionally filtered to a single provider. Newest
  * findings first.
  */
-export function getDiscoveryResults(providerId?: string): DiscoveryResult[] {
+export async function getDiscoveryResults(providerId?: string): Promise<DiscoveryResult[]> {
+  if (isPostgres()) {
+    await ensurePostgresBootstrap();
+    let query = getKyselyDb().selectFrom("discovery_results").selectAll();
+    if (providerId) query = query.where("provider_id", "=", providerId);
+    const rows = await query.orderBy("discovered_at", "desc").orderBy("id", "desc").execute();
+    return rows.map((r) => rowToResult(r as unknown as DiscoveryRow));
+  }
+
   const db = getDbInstance();
   const rows = providerId
     ? (db
@@ -142,11 +198,20 @@ export function getDiscoveryResults(providerId?: string): DiscoveryResult[] {
   return rows.map(rowToResult);
 }
 
-export function getDiscoveryResultById(id: number): DiscoveryResult | null {
+export async function getDiscoveryResultById(id: number): Promise<DiscoveryResult | null> {
+  if (isPostgres()) {
+    await ensurePostgresBootstrap();
+    const row = await getKyselyDb()
+      .selectFrom("discovery_results")
+      .selectAll()
+      .where("id", "=", id)
+      .executeTakeFirst();
+    return row ? rowToResult(row as unknown as DiscoveryRow) : null;
+  }
+
   const db = getDbInstance();
   const row = db.prepare("SELECT * FROM discovery_results WHERE id = ?").get(id) as
-    | DiscoveryRow
-    | undefined;
+    DiscoveryRow | undefined;
   return row ? rowToResult(row) : null;
 }
 
@@ -154,7 +219,18 @@ export function getDiscoveryResultById(id: number): DiscoveryResult | null {
  * Mark a finding as verified, stamping `verified_at`. Returns the updated row,
  * or null if no row with that id exists.
  */
-export function markVerified(id: number): DiscoveryResult | null {
+export async function markVerified(id: number): Promise<DiscoveryResult | null> {
+  if (isPostgres()) {
+    await ensurePostgresBootstrap();
+    const result = await getKyselyDb()
+      .updateTable("discovery_results")
+      .set({ status: "verified", verified_at: new Date().toISOString() })
+      .where("id", "=", id)
+      .executeTakeFirst();
+    if (Number(result.numUpdatedRows) === 0) return null;
+    return getDiscoveryResultById(id);
+  }
+
   const db = getDbInstance();
   const info = db
     .prepare(
@@ -169,7 +245,16 @@ export function markVerified(id: number): DiscoveryResult | null {
  * Delete a finding. Returns true if a row was removed, false if the id was not
  * found.
  */
-export function deleteDiscoveryResult(id: number): boolean {
+export async function deleteDiscoveryResult(id: number): Promise<boolean> {
+  if (isPostgres()) {
+    await ensurePostgresBootstrap();
+    const result = await getKyselyDb()
+      .deleteFrom("discovery_results")
+      .where("id", "=", id)
+      .executeTakeFirst();
+    return Number(result.numDeletedRows) > 0;
+  }
+
   const db = getDbInstance();
   const info = db.prepare("DELETE FROM discovery_results WHERE id = ?").run(id);
   return info.changes > 0;

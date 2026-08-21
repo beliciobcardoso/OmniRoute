@@ -410,7 +410,8 @@ CREATE TABLE IF NOT EXISTS discovery_results (
   status TEXT DEFAULT 'pending',
   notes TEXT,
   discovered_at TEXT DEFAULT CURRENT_TIMESTAMP,
-  verified_at TEXT
+  verified_at TEXT,
+  UNIQUE (provider_id, method, endpoint)
 );
 
 CREATE TABLE IF NOT EXISTS domain_budget_reset_logs (
