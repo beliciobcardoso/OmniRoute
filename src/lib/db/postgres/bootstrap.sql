@@ -1266,7 +1266,7 @@ CREATE TABLE IF NOT EXISTS user_levels (
 
 CREATE TABLE IF NOT EXISTS version_manager (
   id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
-  tool TEXT NOT NULL,
+  tool TEXT NOT NULL UNIQUE,
   current_version TEXT,
   installed_version TEXT,
   pinned_version TEXT,

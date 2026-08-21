@@ -1,6 +1,27 @@
 /** Version manager tool state persistence. */
 
+import { sql } from "kysely";
 import { getDbInstance } from "./core";
+import { resolveDbDriverConfig } from "./driverConfig.ts";
+import { ensurePostgresBootstrap, getKyselyDb } from "./kysely/client.ts";
+
+function isPostgres(): boolean {
+  return resolveDbDriverConfig().driver === "postgres";
+}
+
+/**
+ * node-postgres returns BIGINT columns (id/pid/port) as strings — coerce them
+ * back to numbers before handing the row to rowToVersionManager, which
+ * otherwise treats a non-number as null/default.
+ */
+function pgNormalizeRow(row: Record<string, unknown>): VersionManagerRow {
+  return {
+    ...row,
+    id: row.id === null || row.id === undefined ? row.id : Number(row.id),
+    pid: row.pid === null || row.pid === undefined ? row.pid : Number(row.pid),
+    port: row.port === null || row.port === undefined ? row.port : Number(row.port),
+  };
+}
 
 interface VersionManagerRow {
   id?: unknown;
@@ -162,16 +183,32 @@ function rowToVersionManager(row: VersionManagerRow): VersionManagerTool {
 }
 
 export async function getVersionManagerStatus(): Promise<VersionManagerTool[]> {
+  if (isPostgres()) {
+    await ensurePostgresBootstrap();
+    const rows = await getKyselyDb().selectFrom("version_manager").selectAll().execute();
+    return rows.map((row) => rowToVersionManager(pgNormalizeRow(row)));
+  }
+
   const db = getDbInstance();
   const rows = db.prepare("SELECT * FROM version_manager").all() as VersionManagerRow[];
   return rows.map(rowToVersionManager);
 }
 
 export async function getVersionManagerTool(tool: string): Promise<VersionManagerTool | null> {
+  if (isPostgres()) {
+    await ensurePostgresBootstrap();
+    const row = await getKyselyDb()
+      .selectFrom("version_manager")
+      .selectAll()
+      .where("tool", "=", tool)
+      .executeTakeFirst();
+    if (!row) return null;
+    return rowToVersionManager(pgNormalizeRow(row));
+  }
+
   const db = getDbInstance();
   const row = db.prepare("SELECT * FROM version_manager WHERE tool = ?").get(tool) as
-    | VersionManagerRow
-    | undefined;
+    VersionManagerRow | undefined;
   if (!row) return null;
   return rowToVersionManager(row);
 }
@@ -193,6 +230,53 @@ export async function upsertVersionManagerTool(data: {
   configOverrides?: Record<string, unknown> | null;
   errorMessage?: string | null;
 }): Promise<VersionManagerTool> {
+  if (isPostgres()) {
+    await ensurePostgresBootstrap();
+    const values = {
+      tool: data.tool,
+      current_version: data.currentVersion ?? null,
+      installed_version: data.installedVersion ?? null,
+      pinned_version: data.pinnedVersion ?? null,
+      binary_path: data.binaryPath ?? null,
+      status: data.status ?? "not_installed",
+      pid: data.pid ?? null,
+      port: data.port ?? 8317,
+      api_key: data.apiKey ?? null,
+      management_key: data.managementKey ?? null,
+      auto_update: data.autoUpdate !== undefined ? (data.autoUpdate ? 1 : 0) : 1,
+      auto_start: data.autoStart !== undefined ? (data.autoStart ? 1 : 0) : 0,
+      health_status: data.healthStatus ?? "unknown",
+      config_overrides: stringifyConfigOverrides(data.configOverrides ?? null),
+      error_message: data.errorMessage ?? null,
+    };
+    await getKyselyDb()
+      .insertInto("version_manager")
+      .values(values)
+      .onConflict((oc) =>
+        oc.column("tool").doUpdateSet({
+          current_version: values.current_version,
+          installed_version: values.installed_version,
+          pinned_version: values.pinned_version,
+          binary_path: values.binary_path,
+          status: values.status,
+          pid: values.pid,
+          port: values.port,
+          api_key: values.api_key,
+          management_key: values.management_key,
+          auto_update: values.auto_update,
+          auto_start: values.auto_start,
+          health_status: values.health_status,
+          config_overrides: values.config_overrides,
+          error_message: values.error_message,
+          updated_at: sql`now()`,
+        })
+      )
+      .execute();
+    const pgResult = await getVersionManagerTool(data.tool);
+    if (!pgResult) throw new Error("Failed to retrieve inserted version manager tool");
+    return pgResult;
+  }
+
   const db = getDbInstance();
   db.prepare(
     `
@@ -244,7 +328,6 @@ export async function updateVersionManagerTool(
   tool: string,
   updates: Record<string, unknown>
 ): Promise<VersionManagerTool | null> {
-  const db = getDbInstance();
   const existing = await getVersionManagerTool(tool);
   if (!existing) return null;
 
@@ -268,6 +351,32 @@ export async function updateVersionManagerTool(
     "lastSyncAt",
   ]);
 
+  if (isPostgres()) {
+    await ensurePostgresBootstrap();
+    const set: Record<string, unknown> = { updated_at: sql`now()` };
+
+    for (const [key, value] of Object.entries(updates)) {
+      if (!ALLOWED_COLUMNS.has(key)) continue;
+      const dbKey = key.replace(/([A-Z])/g, "_$1").toLowerCase();
+
+      if (key === "configOverrides") {
+        set.config_overrides = stringifyConfigOverrides(value as Record<string, unknown> | null);
+      } else if (key === "autoUpdate" || key === "autoStart" || key === "providerExpose") {
+        set[dbKey] = value === true ? 1 : 0;
+      } else {
+        set[dbKey] = value;
+      }
+    }
+
+    await getKyselyDb()
+      .updateTable("version_manager")
+      .set(set as any)
+      .where("tool", "=", tool)
+      .execute();
+    return getVersionManagerTool(tool);
+  }
+
+  const db = getDbInstance();
   const sets: string[] = ["updated_at = datetime('now')"];
   const params: Record<string, unknown> = { tool };
 
@@ -294,12 +403,31 @@ export async function updateVersionManagerTool(
 }
 
 export async function deleteVersionManagerTool(tool: string): Promise<boolean> {
+  if (isPostgres()) {
+    await ensurePostgresBootstrap();
+    const result = await getKyselyDb()
+      .deleteFrom("version_manager")
+      .where("tool", "=", tool)
+      .executeTakeFirst();
+    return Number(result.numDeletedRows) > 0;
+  }
+
   const db = getDbInstance();
   const result = db.prepare("DELETE FROM version_manager WHERE tool = ?").run(tool);
   return result.changes > 0;
 }
 
 export async function updateToolHealth(tool: string, healthStatus: string): Promise<boolean> {
+  if (isPostgres()) {
+    await ensurePostgresBootstrap();
+    const result = await getKyselyDb()
+      .updateTable("version_manager")
+      .set({ health_status: healthStatus, last_health_check: sql`now()` })
+      .where("tool", "=", tool)
+      .executeTakeFirst();
+    return Number(result.numUpdatedRows) > 0;
+  }
+
   const db = getDbInstance();
   const result = db
     .prepare(
@@ -314,6 +442,16 @@ export async function updateToolVersion(
   field: "current_version" | "installed_version",
   version: string
 ): Promise<boolean> {
+  if (isPostgres()) {
+    await ensurePostgresBootstrap();
+    const result = await getKyselyDb()
+      .updateTable("version_manager")
+      .set({ [field]: version, updated_at: sql`now()` })
+      .where("tool", "=", tool)
+      .executeTakeFirst();
+    return Number(result.numUpdatedRows) > 0;
+  }
+
   const db = getDbInstance();
   const result = db
     .prepare(`UPDATE version_manager SET ${field} = ?, updated_at = datetime('now') WHERE tool = ?`)
@@ -327,6 +465,22 @@ export async function setToolStatus(
   pid?: number,
   errorMessage?: string
 ): Promise<boolean> {
+  if (isPostgres()) {
+    await ensurePostgresBootstrap();
+    const set: Record<string, unknown> = {
+      status,
+      error_message: errorMessage ?? null,
+      updated_at: sql`now()`,
+    };
+    if (pid !== undefined) set.pid = pid;
+    const result = await getKyselyDb()
+      .updateTable("version_manager")
+      .set(set as any)
+      .where("tool", "=", tool)
+      .executeTakeFirst();
+    return Number(result.numUpdatedRows) > 0;
+  }
+
   const db = getDbInstance();
   const result = db
     .prepare(
