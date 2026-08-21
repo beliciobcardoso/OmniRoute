@@ -1315,7 +1315,7 @@ CREATE TABLE IF NOT EXISTS webhooks (
   last_status BIGINT,
   failure_count BIGINT DEFAULT 0,
   kind TEXT NOT NULL DEFAULT 'custom',
-  metadata_encrypted BYTEA
+  metadata_encrypted TEXT
 );
 
 CREATE TABLE IF NOT EXISTS xp_audit_log (

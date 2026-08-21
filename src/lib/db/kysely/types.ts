@@ -1323,7 +1323,7 @@ export interface WebhooksTable {
   last_status: number | null;
   failure_count: Generated<number | null>;
   kind: Generated<string>;
-  metadata_encrypted: Buffer | null;
+  metadata_encrypted: string | null;
 }
 
 export interface XpAuditLogTable {
