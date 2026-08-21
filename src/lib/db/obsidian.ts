@@ -258,7 +258,7 @@ export async function getObsidianConfigForApiKey(apiKeyId: string | null | undef
 }> {
   if (apiKeyId) {
     try {
-      const perKey = getApiKeyContextSource(apiKeyId, "obsidian");
+      const perKey = await getApiKeyContextSource(apiKeyId, "obsidian");
       if (perKey && perKey.enabled && perKey.token) {
         const [baseUrl, vaultPath] = await Promise.all([
           perKey.baseUrl ? Promise.resolve(perKey.baseUrl) : getObsidianBaseUrl(),
