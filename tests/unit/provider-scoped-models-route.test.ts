@@ -126,7 +126,9 @@ test("provider models route accepts provider alias in path", async () => {
 });
 
 test("provider models route supports service provider 9router", async () => {
-  serviceModelsDb.saveServiceModels("9router", [{ id: "gpt-4o-mini", name: "Local9R Test", available: true }]);
+  await serviceModelsDb.saveServiceModels("9router", [
+    { id: "gpt-4o-mini", name: "Local9R Test", available: true },
+  ]);
 
   const response = await providerModelsRoute.GET(
     new Request("http://localhost/api/v1/providers/9router/models"),
@@ -140,11 +142,16 @@ test("provider models route supports service provider 9router", async () => {
 
   assert.equal(response.status, 200);
   assert.ok(ids.includes("gpt-4o-mini"));
-  assert.equal(ids.some((id: string) => id.includes("/")), false);
+  assert.equal(
+    ids.some((id: string) => id.includes("/")),
+    false
+  );
 });
 
 test("provider models route supports service provider cliproxyapi", async () => {
-  serviceModelsDb.saveServiceModels("cliproxyapi", [{ id: "llama-3", name: "Clip Test", available: true }]);
+  await serviceModelsDb.saveServiceModels("cliproxyapi", [
+    { id: "llama-3", name: "Clip Test", available: true },
+  ]);
 
   const response = await providerModelsRoute.GET(
     new Request("http://localhost/api/v1/providers/cliproxyapi/models"),
@@ -158,7 +165,10 @@ test("provider models route supports service provider cliproxyapi", async () => 
 
   assert.equal(response.status, 200);
   assert.ok(ids.includes("llama-3"));
-  assert.equal(ids.some((id: string) => id.includes("/")), false);
+  assert.equal(
+    ids.some((id: string) => id.includes("/")),
+    false
+  );
 });
 
 test("provider models route returns 400 for unknown provider", async () => {

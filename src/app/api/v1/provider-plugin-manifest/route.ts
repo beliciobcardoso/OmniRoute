@@ -18,9 +18,8 @@ const SERVICE_BACKEND_EXPOSURE_REQUIRED = new Set(SERVICE_BACKEND_PLUGIN_IDS);
 const SERVICE_BACKEND_PLUGIN_ID_SET = new Set<string>(SERVICE_BACKEND_PLUGIN_IDS);
 
 function createServiceManifestTemplate(providerId: string): ProviderPluginManifestEntry | null {
-  const entry = SERVICE_BACKEND_MANIFEST_TEMPLATE[
-    providerId as keyof typeof SERVICE_BACKEND_MANIFEST_TEMPLATE
-  ];
+  const entry =
+    SERVICE_BACKEND_MANIFEST_TEMPLATE[providerId as keyof typeof SERVICE_BACKEND_MANIFEST_TEMPLATE];
   if (!entry) return null;
 
   return {
@@ -77,8 +76,11 @@ function toProviderPluginModel(tool: string, model: ServiceModel): ProviderPlugi
   };
 }
 
-function pickServiceModels(tool: string, reader: (toolName: string) => ServiceModel[]): ProviderPluginModel[] {
-  const models = reader(tool).filter(isValidServiceModelEntry);
+async function pickServiceModels(
+  tool: string,
+  reader: (toolName: string) => ServiceModel[] | Promise<ServiceModel[]>
+): Promise<ProviderPluginModel[]> {
+  const models = (await reader(tool)).filter(isValidServiceModelEntry);
 
   const unique = new Map<string, ProviderPluginModel>();
   for (const model of models) {
@@ -106,7 +108,7 @@ function shouldInjectBackendPluginModels(provider: ProviderPluginManifestEntry) 
 
 export async function injectServiceModelsIntoManifest(
   manifest: ProviderPluginManifest,
-  reader: (toolName: string) => ServiceModel[] = getServiceModels,
+  reader: (toolName: string) => ServiceModel[] | Promise<ServiceModel[]> = getServiceModels,
   exposeReader?: (toolName: string) => Promise<boolean> | boolean
 ): Promise<ProviderPluginManifest> {
   const providers: ProviderPluginManifestEntry[] = [...manifest.providers];
@@ -128,7 +130,7 @@ export async function injectServiceModelsIntoManifest(
           : await shouldExposeServiceModels(provider.id);
         if (!shouldExpose) return provider;
 
-        const models = pickServiceModels(provider.id, reader);
+        const models = await pickServiceModels(provider.id, reader);
         if (models.length === 0) return provider;
 
         const mergedModels = [...provider.models];
@@ -144,7 +146,7 @@ export async function injectServiceModelsIntoManifest(
       } catch {
         return provider;
       }
-    }),
+    })
   );
 
   return {
@@ -164,7 +166,10 @@ export async function OPTIONS() {
 }
 
 export async function GET() {
-  return new Response(JSON.stringify(await injectServiceModelsIntoManifest(generateProviderPluginManifest())), {
-    headers: SERVICE_MODEL_CACHE_HEADERS,
-  });
+  return new Response(
+    JSON.stringify(await injectServiceModelsIntoManifest(generateProviderPluginManifest())),
+    {
+      headers: SERVICE_MODEL_CACHE_HEADERS,
+    }
+  );
 }
