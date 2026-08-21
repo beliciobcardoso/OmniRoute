@@ -1,6 +1,13 @@
 import { v4 as uuidv4 } from "uuid";
 import { getDbInstance, rowToCamel } from "./core";
 import { backupDbFile } from "./backup";
+import { resolveDbDriverConfig } from "./driverConfig.ts";
+import { ensurePostgresBootstrap, getKyselyDb } from "./kysely/client.ts";
+import { sql } from "kysely";
+
+function isPostgres(): boolean {
+  return resolveDbDriverConfig().driver === "postgres";
+}
 
 type JsonRecord = Record<string, unknown>;
 
@@ -69,6 +76,19 @@ function ensureSyncTokensTable(db: DbLike) {
 }
 
 export async function listSyncTokens() {
+  if (isPostgres()) {
+    await ensurePostgresBootstrap();
+    const rows = await getKyselyDb()
+      .selectFrom("sync_tokens")
+      .selectAll()
+      .orderBy("created_at", "desc")
+      .orderBy(sql`lower(name)`, "asc")
+      .execute();
+    return rows
+      .map((row) => toSyncTokenRecord(row))
+      .filter((row): row is SyncTokenRecord => row !== null);
+  }
+
   const db = getDbInstance() as unknown as DbLike;
   ensureSyncTokensTable(db);
   const rows = db
@@ -83,6 +103,16 @@ export async function listSyncTokens() {
 }
 
 export async function getSyncTokenById(id: string) {
+  if (isPostgres()) {
+    await ensurePostgresBootstrap();
+    const row = await getKyselyDb()
+      .selectFrom("sync_tokens")
+      .selectAll()
+      .where("id", "=", id)
+      .executeTakeFirst();
+    return toSyncTokenRecord(row);
+  }
+
   const db = getDbInstance() as unknown as DbLike;
   ensureSyncTokensTable(db);
   const row = db.prepare("SELECT * FROM sync_tokens WHERE id = ?").get(id);
@@ -90,6 +120,16 @@ export async function getSyncTokenById(id: string) {
 }
 
 export async function getSyncTokenByHash(tokenHash: string) {
+  if (isPostgres()) {
+    await ensurePostgresBootstrap();
+    const row = await getKyselyDb()
+      .selectFrom("sync_tokens")
+      .selectAll()
+      .where("token_hash", "=", tokenHash)
+      .executeTakeFirst();
+    return toSyncTokenRecord(row);
+  }
+
   const db = getDbInstance() as unknown as DbLike;
   ensureSyncTokensTable(db);
   const row = db.prepare("SELECT * FROM sync_tokens WHERE token_hash = ?").get(tokenHash);
@@ -101,9 +141,6 @@ export async function createSyncTokenRecord(data: {
   tokenHash: string;
   syncApiKeyId?: string | null;
 }) {
-  const db = getDbInstance() as unknown as DbLike;
-  ensureSyncTokensTable(db);
-
   const now = new Date().toISOString();
   const record: SyncTokenRecord = {
     id: uuidv4(),
@@ -115,6 +152,28 @@ export async function createSyncTokenRecord(data: {
     createdAt: now,
     updatedAt: now,
   };
+
+  if (isPostgres()) {
+    await ensurePostgresBootstrap();
+    await getKyselyDb()
+      .insertInto("sync_tokens")
+      .values({
+        id: record.id,
+        name: record.name,
+        token_hash: record.tokenHash,
+        sync_api_key_id: record.syncApiKeyId,
+        revoked_at: record.revokedAt,
+        last_used_at: record.lastUsedAt,
+        created_at: record.createdAt,
+        updated_at: record.updatedAt,
+      })
+      .execute();
+    backupDbFile("pre-write");
+    return record;
+  }
+
+  const db = getDbInstance() as unknown as DbLike;
+  ensureSyncTokensTable(db);
 
   db.prepare(
     `INSERT INTO sync_tokens (
@@ -136,14 +195,25 @@ export async function createSyncTokenRecord(data: {
 }
 
 export async function revokeSyncToken(id: string) {
-  const db = getDbInstance() as unknown as DbLike;
-  ensureSyncTokensTable(db);
-
   const existing = await getSyncTokenById(id);
   if (!existing) return null;
   if (existing.revokedAt) return existing;
 
   const now = new Date().toISOString();
+
+  if (isPostgres()) {
+    await ensurePostgresBootstrap();
+    await getKyselyDb()
+      .updateTable("sync_tokens")
+      .set({ revoked_at: now, updated_at: now })
+      .where("id", "=", id)
+      .execute();
+    backupDbFile("pre-write");
+    return await getSyncTokenById(id);
+  }
+
+  const db = getDbInstance() as unknown as DbLike;
+  ensureSyncTokensTable(db);
   db.prepare("UPDATE sync_tokens SET revoked_at = ?, updated_at = ? WHERE id = ?").run(
     now,
     now,
@@ -154,6 +224,16 @@ export async function revokeSyncToken(id: string) {
 }
 
 export async function touchSyncTokenLastUsed(id: string, usedAt = new Date().toISOString()) {
+  if (isPostgres()) {
+    await ensurePostgresBootstrap();
+    const result = await getKyselyDb()
+      .updateTable("sync_tokens")
+      .set({ last_used_at: usedAt, updated_at: usedAt })
+      .where("id", "=", id)
+      .executeTakeFirst();
+    return Number(result.numUpdatedRows || 0) > 0;
+  }
+
   const db = getDbInstance() as unknown as DbLike;
   ensureSyncTokensTable(db);
   const result = db
