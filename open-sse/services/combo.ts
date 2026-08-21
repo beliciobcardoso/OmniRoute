@@ -1210,7 +1210,7 @@ export async function handleComboChat({
         body.messages as Array<{ role?: string; content?: unknown }>
       );
   orderedTargets = _sticky.targets;
-  orderedTargets = orderTargetsByEvalScores(orderedTargets, config.evalRouting, log);
+  orderedTargets = await orderTargetsByEvalScores(orderedTargets, config.evalRouting, log);
   orderedTargets = filterTargetsByRequestCompatibility(orderedTargets, body, log);
   orderedTargets = applyContextRequirements(orderedTargets, config.contextRequirements, log);
 
@@ -2507,7 +2507,11 @@ async function handleRoundRobinCombo({
     clampComboDepth(config.maxComboDepth)
   );
   const tagFilteredTargets = await applyRequestTagRouting(orderedTargets, body, log);
-  const evalRankedTargets = orderTargetsByEvalScores(tagFilteredTargets, config.evalRouting, log);
+  const evalRankedTargets = await orderTargetsByEvalScores(
+    tagFilteredTargets,
+    config.evalRouting,
+    log
+  );
   const filteredTargets = filterTargetsByRequestCompatibility(
     evalRankedTargets,
     body,

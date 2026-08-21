@@ -65,7 +65,7 @@ export async function POST(request: Request) {
     const { suiteId, outputs, target, compareTarget, apiKeyId } = validation.data;
 
     if (outputs && Object.keys(outputs).length > 0) {
-      const result = runSuite(suiteId, outputs);
+      const result = await runSuite(suiteId, outputs);
       return NextResponse.json(result);
     }
 
@@ -98,13 +98,18 @@ export async function POST(request: Request) {
           )
         : null;
 
+    const [recentRuns, historyScorecard] = await Promise.all([
+      listEvalRuns({ limit: 20 }),
+      getEvalScorecard({ limit: 50 }),
+    ]);
+
     return NextResponse.json({
       suiteId,
       runGroupId,
       runs,
       scorecard,
-      recentRuns: listEvalRuns({ limit: 20 }),
-      historyScorecard: getEvalScorecard({ limit: 50 }),
+      recentRuns,
+      historyScorecard,
     });
   } catch (error: unknown) {
     return NextResponse.json({ error: sanitizeErrorMessage(error) }, { status: 500 });

@@ -1,5 +1,11 @@
 import { randomUUID } from "node:crypto";
 import { getDbInstance, rowToCamel } from "./core";
+import { resolveDbDriverConfig } from "./driverConfig.ts";
+import { ensurePostgresBootstrap, getKyselyDb } from "./kysely/client.ts";
+
+function isPostgres(): boolean {
+  return resolveDbDriverConfig().driver === "postgres";
+}
 
 export type EvalTargetType = "suite-default" | "model" | "combo";
 export type EvalCaseStrategy = "contains" | "exact" | "regex" | "custom";
@@ -425,7 +431,7 @@ function toEvalSuiteRecord(row: unknown, cases: EvalCaseRecord[]): EvalSuiteReco
   };
 }
 
-export function saveEvalRun(input: {
+export async function saveEvalRun(input: {
   runGroupId?: string | null;
   suiteId: string;
   suiteName: string;
@@ -436,8 +442,7 @@ export function saveEvalRun(input: {
   results: Array<Record<string, unknown>>;
   outputs?: Record<string, string>;
   createdAt?: string;
-}): PersistedEvalRun {
-  const db = getDbInstance() as unknown as DbLike;
+}): Promise<PersistedEvalRun> {
   const createdAt = input.createdAt || new Date().toISOString();
   const id = randomUUID();
   const targetId =
@@ -448,6 +453,52 @@ export function saveEvalRun(input: {
     ? Math.max(0, Math.round(Number(input.avgLatencyMs)))
     : 0;
 
+  if (isPostgres()) {
+    await ensurePostgresBootstrap();
+    await getKyselyDb()
+      .insertInto("eval_runs")
+      .values({
+        id,
+        run_group_id: input.runGroupId || null,
+        suite_id: input.suiteId,
+        suite_name: input.suiteName,
+        target_type: input.target.type,
+        target_id: targetId,
+        target_label: input.target.label,
+        api_key_id: input.apiKeyId || null,
+        pass_rate: input.summary.passRate,
+        total: input.summary.total,
+        passed: input.summary.passed,
+        failed: input.summary.failed,
+        avg_latency_ms: avgLatencyMs,
+        summary_json: JSON.stringify(input.summary),
+        results_json: JSON.stringify(input.results || []),
+        outputs_json: JSON.stringify(input.outputs || {}),
+        created_at: createdAt,
+      })
+      .execute();
+
+    return {
+      id,
+      runGroupId: input.runGroupId || null,
+      suiteId: input.suiteId,
+      suiteName: input.suiteName,
+      target: {
+        type: input.target.type,
+        id: targetId,
+        key: serializeEvalTargetKey(input.target.type, targetId),
+        label: input.target.label,
+      },
+      apiKeyId: input.apiKeyId || null,
+      avgLatencyMs,
+      summary: input.summary,
+      results: input.results || [],
+      outputs: input.outputs || {},
+      createdAt,
+    };
+  }
+
+  const db = getDbInstance() as unknown as DbLike;
   db.prepare(
     `INSERT INTO eval_runs
       (id, run_group_id, suite_id, suite_name, target_type, target_id, target_label, api_key_id,
@@ -493,13 +544,28 @@ export function saveEvalRun(input: {
   };
 }
 
-export function listEvalRuns(
+export async function listEvalRuns(
   options: {
     suiteId?: string;
     runGroupId?: string;
     limit?: number;
   } = {}
-): PersistedEvalRun[] {
+): Promise<PersistedEvalRun[]> {
+  const limit = Number.isFinite(Number(options.limit))
+    ? Math.min(200, Math.max(1, Math.floor(Number(options.limit))))
+    : 20;
+
+  if (isPostgres()) {
+    await ensurePostgresBootstrap();
+    let query = getKyselyDb().selectFrom("eval_runs").selectAll();
+    if (options.suiteId) query = query.where("suite_id", "=", options.suiteId);
+    if (options.runGroupId) query = query.where("run_group_id", "=", options.runGroupId);
+    const rows = await query.orderBy("created_at", "desc").limit(limit).execute();
+    return rows
+      .map((row) => toPersistedEvalRun(row))
+      .filter((row): row is PersistedEvalRun => row !== null);
+  }
+
   const db = getDbInstance() as unknown as DbLike;
   const conditions: string[] = [];
   const params: unknown[] = [];
@@ -514,9 +580,6 @@ export function listEvalRuns(
     params.push(options.runGroupId);
   }
 
-  const limit = Number.isFinite(Number(options.limit))
-    ? Math.min(200, Math.max(1, Math.floor(Number(options.limit))))
-    : 20;
   params.push(limit);
 
   const sql = `SELECT *
@@ -530,7 +593,9 @@ export function listEvalRuns(
     .filter((row): row is PersistedEvalRun => row !== null);
 }
 
-export function listModelEvalRunsForRouting(options: EvalRoutingRunQuery): PersistedEvalRun[] {
+export async function listModelEvalRunsForRouting(
+  options: EvalRoutingRunQuery
+): Promise<PersistedEvalRun[]> {
   const targetIds = [...new Set(options.targetIds.map((id) => id.trim()).filter(Boolean))].slice(
     0,
     200
@@ -540,6 +605,32 @@ export function listModelEvalRunsForRouting(options: EvalRoutingRunQuery): Persi
   const suiteIds = Array.isArray(options.suiteIds)
     ? [...new Set(options.suiteIds.map((id) => id.trim()).filter(Boolean))].slice(0, 50)
     : [];
+
+  const maxAgeHours = Number(options.maxAgeHours);
+  const createdAfter =
+    Number.isFinite(maxAgeHours) && maxAgeHours > 0
+      ? new Date(Date.now() - maxAgeHours * 60 * 60 * 1000).toISOString()
+      : null;
+
+  const limit = Number.isFinite(Number(options.limit))
+    ? Math.min(1000, Math.max(1, Math.floor(Number(options.limit))))
+    : Math.min(1000, Math.max(50, targetIds.length * Math.max(3, suiteIds.length || 5) * 2));
+
+  if (isPostgres()) {
+    await ensurePostgresBootstrap();
+    let query = getKyselyDb()
+      .selectFrom("eval_runs")
+      .selectAll()
+      .where("target_type", "=", "model")
+      .where("target_id", "in", targetIds);
+    if (suiteIds.length > 0) query = query.where("suite_id", "in", suiteIds);
+    if (createdAfter !== null) query = query.where("created_at", ">=", createdAfter);
+    const rows = await query.orderBy("created_at", "desc").limit(limit).execute();
+    return rows
+      .map((row) => toPersistedEvalRun(row))
+      .filter((row): row is PersistedEvalRun => row !== null);
+  }
+
   const db = getDbInstance() as unknown as DbLike;
   const conditions: string[] = ["target_type = 'model'"];
   const params: unknown[] = [];
@@ -552,15 +643,11 @@ export function listModelEvalRunsForRouting(options: EvalRoutingRunQuery): Persi
     params.push(...suiteIds);
   }
 
-  const maxAgeHours = Number(options.maxAgeHours);
-  if (Number.isFinite(maxAgeHours) && maxAgeHours > 0) {
+  if (createdAfter !== null) {
     conditions.push("created_at >= ?");
-    params.push(new Date(Date.now() - maxAgeHours * 60 * 60 * 1000).toISOString());
+    params.push(createdAfter);
   }
 
-  const limit = Number.isFinite(Number(options.limit))
-    ? Math.min(1000, Math.max(1, Math.floor(Number(options.limit))))
-    : Math.min(1000, Math.max(50, targetIds.length * Math.max(3, suiteIds.length || 5) * 2));
   params.push(limit);
 
   const rows = db
@@ -578,13 +665,13 @@ export function listModelEvalRunsForRouting(options: EvalRoutingRunQuery): Persi
     .filter((row): row is PersistedEvalRun => row !== null);
 }
 
-export function getEvalScorecard(
+export async function getEvalScorecard(
   options: {
     suiteId?: string;
     limit?: number;
   } = {}
 ) {
-  const runs = listEvalRuns({ suiteId: options.suiteId, limit: options.limit || 50 });
+  const runs = await listEvalRuns({ suiteId: options.suiteId, limit: options.limit || 50 });
   if (runs.length === 0) return null;
 
   const latestByScope = new Map<string, PersistedEvalRun>();
@@ -605,17 +692,39 @@ export function getEvalScorecard(
   );
 }
 
-export function listCustomEvalSuites(): EvalSuiteRecord[] {
-  const db = getDbInstance() as unknown as DbLike;
-  ensureEvalSuiteTables(db);
-  const suiteRows = db
-    .prepare("SELECT * FROM eval_suites ORDER BY updated_at DESC, created_at DESC")
-    .all();
-  const caseRows = db
-    .prepare(
-      "SELECT * FROM eval_cases ORDER BY suite_id ASC, sort_order ASC, created_at ASC, id ASC"
-    )
-    .all();
+export async function listCustomEvalSuites(): Promise<EvalSuiteRecord[]> {
+  let suiteRows: unknown[];
+  let caseRows: unknown[];
+
+  if (isPostgres()) {
+    await ensurePostgresBootstrap();
+    const kdb = getKyselyDb();
+    suiteRows = await kdb
+      .selectFrom("eval_suites")
+      .selectAll()
+      .orderBy("updated_at", "desc")
+      .orderBy("created_at", "desc")
+      .execute();
+    caseRows = await kdb
+      .selectFrom("eval_cases")
+      .selectAll()
+      .orderBy("suite_id", "asc")
+      .orderBy("sort_order", "asc")
+      .orderBy("created_at", "asc")
+      .orderBy("id", "asc")
+      .execute();
+  } else {
+    const db = getDbInstance() as unknown as DbLike;
+    ensureEvalSuiteTables(db);
+    suiteRows = db
+      .prepare("SELECT * FROM eval_suites ORDER BY updated_at DESC, created_at DESC")
+      .all();
+    caseRows = db
+      .prepare(
+        "SELECT * FROM eval_cases ORDER BY suite_id ASC, sort_order ASC, created_at ASC, id ASC"
+      )
+      .all();
+  }
 
   const casesBySuite = new Map<string, EvalCaseRecord[]>();
   for (const row of caseRows) {
@@ -635,13 +744,14 @@ export function listCustomEvalSuites(): EvalSuiteRecord[] {
     .filter((suite): suite is EvalSuiteRecord => suite !== null);
 }
 
-export function getCustomEvalSuite(suiteId: string): EvalSuiteRecord | null {
+export async function getCustomEvalSuite(suiteId: string): Promise<EvalSuiteRecord | null> {
   const normalizedSuiteId = suiteId.trim();
   if (!normalizedSuiteId) return null;
-  return listCustomEvalSuites().find((suite) => suite.id === normalizedSuiteId) || null;
+  const suites = await listCustomEvalSuites();
+  return suites.find((suite) => suite.id === normalizedSuiteId) || null;
 }
 
-export function saveCustomEvalSuite(input: {
+export async function saveCustomEvalSuite(input: {
   id?: string;
   name: string;
   description?: string;
@@ -659,9 +769,7 @@ export function saveCustomEvalSuite(input: {
     };
     tags?: string[];
   }>;
-}): EvalSuiteRecord {
-  const db = getDbInstance() as unknown as DbLike;
-  ensureEvalSuiteTables(db);
+}): Promise<EvalSuiteRecord> {
   const now = new Date().toISOString();
   const suiteId =
     typeof input.id === "string" && input.id.trim().length > 0 ? input.id.trim() : randomUUID();
@@ -678,6 +786,91 @@ export function saveCustomEvalSuite(input: {
   if (!Array.isArray(input.cases) || input.cases.length === 0) {
     throw new Error("At least one eval case is required");
   }
+
+  const preparedCases = input.cases.map((rawCase, index) => {
+    const caseId =
+      typeof rawCase.id === "string" && rawCase.id.trim().length > 0
+        ? rawCase.id.trim()
+        : randomUUID();
+    const caseName = rawCase.name.trim();
+    const model =
+      typeof rawCase.model === "string" && rawCase.model.trim().length > 0
+        ? rawCase.model.trim()
+        : null;
+    const sanitizedInput = sanitizeEvalCaseInput(rawCase.input);
+    const sanitizedExpected = sanitizeEvalExpected(rawCase.expected);
+    const tags = Array.isArray(rawCase.tags)
+      ? rawCase.tags.map((tag) => tag.trim()).filter((tag) => tag.length > 0)
+      : [];
+
+    if (!caseName) {
+      throw new Error(`Case ${index + 1} is missing a name`);
+    }
+
+    if (sanitizedInput.messages.length === 0) {
+      throw new Error(`Case ${index + 1} must include at least one message`);
+    }
+
+    if (
+      (sanitizedExpected.strategy === "contains" ||
+        sanitizedExpected.strategy === "exact" ||
+        sanitizedExpected.strategy === "regex") &&
+      !sanitizedExpected.value
+    ) {
+      throw new Error(`Case ${index + 1} must include an expected value`);
+    }
+
+    return { caseId, index, caseName, model, sanitizedInput, sanitizedExpected, tags };
+  });
+
+  if (isPostgres()) {
+    await ensurePostgresBootstrap();
+    await getKyselyDb()
+      .transaction()
+      .execute(async (trx) => {
+        await trx
+          .insertInto("eval_suites")
+          .values({ id: suiteId, name, description, created_at: now, updated_at: now })
+          .onConflict((oc) =>
+            oc.column("id").doUpdateSet({
+              name,
+              description,
+              updated_at: now,
+            })
+          )
+          .execute();
+
+        await trx.deleteFrom("eval_cases").where("suite_id", "=", suiteId).execute();
+
+        for (const c of preparedCases) {
+          await trx
+            .insertInto("eval_cases")
+            .values({
+              id: c.caseId,
+              suite_id: suiteId,
+              sort_order: c.index,
+              name: c.caseName,
+              model: c.model,
+              input_json: JSON.stringify(c.sanitizedInput),
+              expected_strategy: c.sanitizedExpected.strategy,
+              expected_value: c.sanitizedExpected.value || null,
+              tags_json: JSON.stringify(c.tags),
+              created_at: now,
+              updated_at: now,
+            })
+            .execute();
+        }
+      });
+
+    const saved = await getCustomEvalSuite(suiteId);
+    if (!saved) {
+      throw new Error("Failed to persist eval suite");
+    }
+    return saved;
+  }
+
+  const db = getDbInstance() as unknown as DbLike;
+  ensureEvalSuiteTables(db);
 
   db.prepare("BEGIN").run();
   try {
@@ -759,7 +952,7 @@ export function saveCustomEvalSuite(input: {
     throw error;
   }
 
-  const saved = getCustomEvalSuite(suiteId);
+  const saved = await getCustomEvalSuite(suiteId);
   if (!saved) {
     throw new Error("Failed to persist eval suite");
   }
@@ -767,11 +960,26 @@ export function saveCustomEvalSuite(input: {
   return saved;
 }
 
-export function deleteCustomEvalSuite(suiteId: string): boolean {
-  const db = getDbInstance() as unknown as DbLike;
-  ensureEvalSuiteTables(db);
+export async function deleteCustomEvalSuite(suiteId: string): Promise<boolean> {
   const normalizedSuiteId = suiteId.trim();
   if (!normalizedSuiteId) return false;
+
+  if (isPostgres()) {
+    await ensurePostgresBootstrap();
+    return getKyselyDb()
+      .transaction()
+      .execute(async (trx) => {
+        await trx.deleteFrom("eval_cases").where("suite_id", "=", normalizedSuiteId).execute();
+        const result = await trx
+          .deleteFrom("eval_suites")
+          .where("id", "=", normalizedSuiteId)
+          .executeTakeFirst();
+        return Number(result.numDeletedRows) > 0;
+      });
+  }
+
+  const db = getDbInstance() as unknown as DbLike;
+  ensureEvalSuiteTables(db);
 
   db.prepare("BEGIN").run();
   try {

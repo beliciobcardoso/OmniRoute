@@ -41,7 +41,7 @@ test.after(() => {
 
 test("evals GET returns suites, target options, api key metadata, and persisted history", async () => {
   const apiKey = await localDb.createApiKey("Dashboard Key", "machine-test");
-  const customSuite = localDb.saveCustomEvalSuite({
+  const customSuite = await localDb.saveCustomEvalSuite({
     name: "Support Regression",
     description: "Checks support answers",
     cases: [
@@ -59,7 +59,7 @@ test("evals GET returns suites, target options, api key metadata, and persisted 
       },
     ],
   });
-  localDb.saveEvalRun({
+  await localDb.saveEvalRun({
     suiteId: "golden-set",
     suiteName: "Golden Set",
     target: { type: "combo", id: "cost-optimized", label: "Combo: cost-optimized" },
@@ -96,7 +96,7 @@ test("evals GET returns suites, target options, api key metadata, and persisted 
 });
 
 test("evals GET exposes stored runs and aggregated pass rate inline", async () => {
-  localDb.saveEvalRun({
+  await localDb.saveEvalRun({
     suiteId: "golden-set",
     suiteName: "Golden Set",
     target: { type: "model", id: "gpt-4o", label: "Model: gpt-4o" },

@@ -69,8 +69,8 @@ export function registerSuite(suite: any) {
  * @param {string} suiteId
  * @returns {EvalSuite | null}
  */
-export function getSuite(suiteId: string) {
-  return suites.get(suiteId) || getCustomEvalSuite(suiteId) || null;
+export async function getSuite(suiteId: string) {
+  return suites.get(suiteId) || (await getCustomEvalSuite(suiteId)) || null;
 }
 
 /**
@@ -78,7 +78,7 @@ export function getSuite(suiteId: string) {
  *
  * @returns {Array<{ id: string, name: string, caseCount: number }>}
  */
-export function listSuites() {
+export async function listSuites() {
   const builtInSuites = Array.from(suites.values()).map((s) => ({
     id: s.id,
     name: s.name,
@@ -95,7 +95,7 @@ export function listSuites() {
     })),
   }));
 
-  const customSuites = listCustomEvalSuites().map((suite) => ({
+  const customSuites = (await listCustomEvalSuites()).map((suite) => ({
     id: suite.id,
     name: suite.name,
     description: suite.description || "",
@@ -209,12 +209,12 @@ export function evaluateCase(evalCase: any, actualOutput: string) {
  * @param {Record<string, { durationMs?: number, error?: string }>} [caseMetrics]
  * @returns {{ suiteId: string, suiteName: string, results: EvalResult[], summary: { total: number, passed: number, failed: number, passRate: number } }}
  */
-export function runSuite(
+export async function runSuite(
   suiteId: string,
   outputs: Record<string, string>,
   caseMetrics: Record<string, { durationMs?: number; error?: string }> = {}
 ) {
-  const suite = getSuite(suiteId);
+  const suite = await getSuite(suiteId);
   if (!suite) {
     throw new Error(`Suite not found: ${suiteId}`);
   }
