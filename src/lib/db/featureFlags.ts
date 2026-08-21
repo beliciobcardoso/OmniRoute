@@ -8,13 +8,107 @@
 
 import { FEATURE_FLAG_DEFINITIONS } from "@/shared/constants/featureFlagDefinitions";
 import { getDbInstance } from "./core";
+import { resolveDbDriverConfig } from "./driverConfig";
+import { ensurePostgresBootstrap, getKyselyDb } from "./kysely/client";
+import { logger } from "../../../open-sse/utils/logger.ts";
 
+const log = logger("DB_FEATURE_FLAGS");
 const NAMESPACE = "feature_flags";
+
+function isPostgres(): boolean {
+  return resolveDbDriverConfig().driver === "postgres";
+}
+
+/**
+ * In-memory cache of Postgres-backed overrides.
+ *
+ * getFeatureFlagOverride()/getFeatureFlagOverrides() MUST stay synchronous —
+ * their caller chain (src/shared/utils/featureFlags.ts::isFeatureFlagEnabled)
+ * is invoked synchronously from hot-path security/guardrail code (PII
+ * masking, auth checks) that cannot become async. Overrides are rare,
+ * operator-triggered admin actions, so a short staleness window across
+ * multiple server instances — and a best-effort, fire-and-forget write to
+ * Postgres on set/remove/clear — is an accepted trade-off (see the operator
+ * decision recorded in the Postgres-adapter plan doc).
+ */
+let pgCache: Record<string, string> | null = null;
+let pgCacheLoadedAt = 0;
+let pgCacheLoadInFlight: Promise<void> | null = null;
+const PG_CACHE_TTL_MS = 30_000;
+
+function refreshPgCacheInBackground(): void {
+  if (pgCacheLoadInFlight) return;
+  pgCacheLoadInFlight = (async () => {
+    try {
+      await ensurePostgresBootstrap();
+      const rows = await getKyselyDb()
+        .selectFrom("key_value")
+        .select(["key", "value"])
+        .where("namespace", "=", NAMESPACE)
+        .execute();
+      const next: Record<string, string> = {};
+      for (const row of rows) {
+        next[row.key] = row.value;
+      }
+      pgCache = next;
+      pgCacheLoadedAt = Date.now();
+    } catch (err) {
+      // Leave the previous cache (or null) in place — every reader falls
+      // back to process.env / the definition default regardless.
+      log.warn("feature_flags.pg_cache_refresh_failed", {
+        error: err instanceof Error ? err.message : String(err),
+      });
+    } finally {
+      pgCacheLoadInFlight = null;
+    }
+  })();
+}
+
+function getPgCache(): Record<string, string> {
+  if (pgCache === null || Date.now() - pgCacheLoadedAt > PG_CACHE_TTL_MS) {
+    refreshPgCacheInBackground();
+  }
+  return pgCache ?? {};
+}
+
+async function persistPgOverride(key: string, value: string): Promise<void> {
+  try {
+    await ensurePostgresBootstrap();
+    await getKyselyDb()
+      .insertInto("key_value")
+      .values({ namespace: NAMESPACE, key, value })
+      .onConflict((oc) => oc.columns(["namespace", "key"]).doUpdateSet({ value }))
+      .execute();
+  } catch (err) {
+    log.warn("feature_flags.pg_persist_failed", {
+      key,
+      error: err instanceof Error ? err.message : String(err),
+    });
+  }
+}
+
+async function deletePgOverride(key?: string): Promise<void> {
+  try {
+    await ensurePostgresBootstrap();
+    let query = getKyselyDb().deleteFrom("key_value").where("namespace", "=", NAMESPACE);
+    if (key !== undefined) query = query.where("key", "=", key);
+    await query.execute();
+  } catch (err) {
+    log.warn("feature_flags.pg_delete_failed", {
+      key,
+      error: err instanceof Error ? err.message : String(err),
+    });
+  }
+}
 
 /**
  * Returns all feature flag overrides as a key→value map.
  */
 export function getFeatureFlagOverrides(): Record<string, string> {
+  if (isPostgres()) {
+    return { ...getPgCache() };
+  }
+
   const db = getDbInstance();
   const rows = db
     .prepare("SELECT key, value FROM key_value WHERE namespace = ?")
@@ -32,6 +126,10 @@ export function getFeatureFlagOverrides(): Record<string, string> {
  * is stored.
  */
 export function getFeatureFlagOverride(key: string): string | undefined {
+  if (isPostgres()) {
+    return getPgCache()[key];
+  }
+
   const db = getDbInstance();
   const row = db
     .prepare("SELECT value FROM key_value WHERE namespace = ? AND key = ?")
@@ -56,6 +154,16 @@ export function setFeatureFlagOverride(key: string, value: string): void {
       `Invalid value "${value}" for enum flag ${key}. Allowed: ${definition.enumValues.join(", ")}`
     );
   }
+
+  if (isPostgres()) {
+    // Update the cache optimistically so a read immediately after this call
+    // sees the new value, then persist to Postgres in the background.
+    pgCache = { ...(pgCache ?? {}), [key]: value };
+    pgCacheLoadedAt = Date.now();
+    void persistPgOverride(key, value);
+    return;
+  }
+
   const db = getDbInstance();
   db.prepare("INSERT OR REPLACE INTO key_value (namespace, key, value) VALUES (?, ?, ?)").run(
     NAMESPACE,
@@ -69,6 +177,17 @@ export function setFeatureFlagOverride(key: string, value: string): void {
  * behaviour.
  */
 export function removeFeatureFlagOverride(key: string): void {
+  if (isPostgres()) {
+    if (pgCache) {
+      const next = { ...pgCache };
+      delete next[key];
+      pgCache = next;
+      pgCacheLoadedAt = Date.now();
+    }
+    void deletePgOverride(key);
+    return;
+  }
+
   const db = getDbInstance();
   db.prepare("DELETE FROM key_value WHERE namespace = ? AND key = ?").run(NAMESPACE, key);
 }
@@ -77,6 +196,13 @@ export function removeFeatureFlagOverride(key: string): void {
  * Removes all stored feature flag overrides.
  */
 export function clearAllFeatureFlagOverrides(): void {
+  if (isPostgres()) {
+    pgCache = {};
+    pgCacheLoadedAt = Date.now();
+    void deletePgOverride();
+    return;
+  }
+
   const db = getDbInstance();
   db.prepare("DELETE FROM key_value WHERE namespace = ?").run(NAMESPACE);
 }
