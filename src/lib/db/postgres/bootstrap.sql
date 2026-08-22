@@ -358,6 +358,22 @@ CREATE TABLE IF NOT EXISTS compression_cache_stats (
   created_at TEXT DEFAULT CURRENT_TIMESTAMP
 );
 
+CREATE TABLE IF NOT EXISTS compression_run_telemetry (
+  id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  "timestamp" BIGINT NOT NULL,
+  request_id TEXT,
+  model TEXT,
+  provider TEXT,
+  source TEXT,
+  tokens_before BIGINT NOT NULL,
+  tokens_after BIGINT NOT NULL,
+  ratio DOUBLE PRECISION,
+  cost_delta DOUBLE PRECISION,
+  output_styles TEXT,
+  output_style_bypass TEXT,
+  output_tokens BIGINT
+);
+
 CREATE TABLE IF NOT EXISTS compression_combo_assignments (
   id TEXT PRIMARY KEY,
   compression_combo_id TEXT NOT NULL,

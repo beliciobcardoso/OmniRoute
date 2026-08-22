@@ -1,4 +1,19 @@
 import { getDbInstance } from "./core";
+import { resolveDbDriverConfig } from "./driverConfig";
+import { ensurePostgresBootstrap, getKyselyDb } from "./kysely/client";
+
+function isPostgres(): boolean {
+  return resolveDbDriverConfig().driver === "postgres";
+}
+
+function toNum(value: unknown, fallback = 0): number {
+  if (typeof value === "number" && Number.isFinite(value)) return value;
+  if (typeof value === "string" && value.trim()) {
+    const parsed = Number(value);
+    return Number.isFinite(parsed) ? parsed : fallback;
+  }
+  return fallback;
+}
 
 export interface CompressionRunTelemetryInput {
   requestId: string;
@@ -26,7 +41,7 @@ export interface CompressionRunTelemetrySummary {
 function ensureCompressionRunTelemetryTable(): void {
   const db = getDbInstance();
   // `CREATE TABLE IF NOT EXISTS` is idempotent and cheap; run it unconditionally so the
-  // table self-heals if it was dropped (e.g. test isolation) under the same db handle.
+  // table exists even if the migration that would normally create it hasn't run yet.
   db.exec(`
     CREATE TABLE IF NOT EXISTS compression_run_telemetry (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -51,8 +66,36 @@ function ensureCompressionRunTelemetryTable(): void {
  * the `timestamp` is stamped here (never inside the pure resolvers). Mirrors the
  * compression-stats / compressionAnalytics recording discipline — never throws into a request.
  */
-export function insertCompressionRunTelemetryRow(row: CompressionRunTelemetryInput): void {
+export async function insertCompressionRunTelemetryRow(
+  row: CompressionRunTelemetryInput
+): Promise<void> {
   try {
+    if (isPostgres()) {
+      await ensurePostgresBootstrap();
+      const kdb = getKyselyDb();
+      await kdb
+        .insertInto("compression_run_telemetry")
+        .values({
+          timestamp: Date.now(),
+          request_id: row.requestId ?? null,
+          model: row.model ?? null,
+          provider: row.provider ?? null,
+          source: row.source ?? null,
+          tokens_before: row.tokensBefore,
+          tokens_after: row.tokensAfter,
+          ratio: row.ratio,
+          cost_delta: row.costDelta ?? null,
+          output_styles:
+            row.outputStyles && row.outputStyles.length > 0
+              ? JSON.stringify(row.outputStyles)
+              : null,
+          output_style_bypass: row.outputStyleBypass ?? null,
+          output_tokens: row.outputTokens ?? null,
+        })
+        .execute();
+      return;
+    }
+
     const db = getDbInstance();
     ensureCompressionRunTelemetryTable();
     db.prepare(
@@ -80,21 +123,51 @@ export function insertCompressionRunTelemetryRow(row: CompressionRunTelemetryInp
   }
 }
 
-export function getCompressionRunTelemetrySummary(): CompressionRunTelemetrySummary {
-  const db = getDbInstance();
-  ensureCompressionRunTelemetryTable();
-  const rows = db
-    .prepare(
-      `SELECT tokens_before, tokens_after, output_styles, output_style_bypass, output_tokens
-       FROM compression_run_telemetry`
-    )
-    .all() as Array<{
+export async function getCompressionRunTelemetrySummary(): Promise<CompressionRunTelemetrySummary> {
+  let rows: Array<{
     tokens_before: number;
     tokens_after: number;
     output_styles: string | null;
     output_style_bypass: string | null;
     output_tokens: number | null;
   }>;
+
+  if (isPostgres()) {
+    await ensurePostgresBootstrap();
+    const kdb = getKyselyDb();
+    const pgRows = await kdb
+      .selectFrom("compression_run_telemetry")
+      .select([
+        "tokens_before",
+        "tokens_after",
+        "output_styles",
+        "output_style_bypass",
+        "output_tokens",
+      ])
+      .execute();
+    rows = pgRows.map((r) => ({
+      tokens_before: toNum(r.tokens_before),
+      tokens_after: toNum(r.tokens_after),
+      output_styles: r.output_styles,
+      output_style_bypass: r.output_style_bypass,
+      output_tokens: r.output_tokens === null ? null : toNum(r.output_tokens),
+    }));
+  } else {
+    const db = getDbInstance();
+    ensureCompressionRunTelemetryTable();
+    rows = db
+      .prepare(
+        `SELECT tokens_before, tokens_after, output_styles, output_style_bypass, output_tokens
+         FROM compression_run_telemetry`
+      )
+      .all() as Array<{
+      tokens_before: number;
+      tokens_after: number;
+      output_styles: string | null;
+      output_style_bypass: string | null;
+      output_tokens: number | null;
+    }>;
+  }
 
   const summary: CompressionRunTelemetrySummary = {
     totalRuns: rows.length,
@@ -114,8 +187,7 @@ export function getCompressionRunTelemetrySummary(): CompressionRunTelemetrySumm
       try {
         const styles = JSON.parse(row.output_styles) as Array<{ id: string }>;
         for (const style of styles) {
-          summary.appliedStyleCounts[style.id] =
-            (summary.appliedStyleCounts[style.id] ?? 0) + 1;
+          summary.appliedStyleCounts[style.id] = (summary.appliedStyleCounts[style.id] ?? 0) + 1;
         }
       } catch {
         // ignore a corrupt JSON cell

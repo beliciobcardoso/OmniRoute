@@ -27,9 +27,8 @@ export function emitOutputStyleTelemetry(args: {
 
   void (async () => {
     try {
-      const { buildOutputStyleTelemetry } = await import(
-        "../../services/compression/outputStyles/telemetry.ts"
-      );
+      const { buildOutputStyleTelemetry } =
+        await import("../../services/compression/outputStyles/telemetry.ts");
       const { insertCompressionRunTelemetryRow } = await import("@/lib/db/compressionRunTelemetry");
       const record = buildOutputStyleTelemetry({
         requestId: args.skillRequestId ?? args.traceId ?? "",
@@ -42,7 +41,7 @@ export function emitOutputStyleTelemetry(args: {
         appliedStyles: result.appliedStyles,
         skippedReason: result.skippedReason,
       });
-      insertCompressionRunTelemetryRow(record);
+      await insertCompressionRunTelemetryRow(record);
     } catch (err) {
       args.log?.debug?.(
         "COMPRESSION",

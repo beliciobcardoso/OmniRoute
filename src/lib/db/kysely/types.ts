@@ -384,6 +384,22 @@ export interface CompressionCacheStatsTable {
   created_at: Generated<string | null>;
 }
 
+export interface CompressionRunTelemetryTable {
+  id: Generated<number>;
+  timestamp: number;
+  request_id: string | null;
+  model: string | null;
+  provider: string | null;
+  source: string | null;
+  tokens_before: number;
+  tokens_after: number;
+  ratio: number | null;
+  cost_delta: number | null;
+  output_styles: string | null;
+  output_style_bypass: string | null;
+  output_tokens: number | null;
+}
+
 export interface CompressionComboAssignmentsTable {
   id: string;
   compression_combo_id: string;
@@ -1388,6 +1404,7 @@ export interface Database {
   compression_analytics: CompressionAnalyticsTable;
   compression_cache_stats: CompressionCacheStatsTable;
   compression_combo_assignments: CompressionComboAssignmentsTable;
+  compression_run_telemetry: CompressionRunTelemetryTable;
   compression_combos: CompressionCombosTable;
   context_handoffs: ContextHandoffsTable;
   daily_usage_summary: DailyUsageSummaryTable;

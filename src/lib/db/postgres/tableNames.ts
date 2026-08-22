@@ -26,6 +26,7 @@ export const POSTGRES_BOOTSTRAP_TABLES = [
   "compression_cache_stats",
   "compression_combo_assignments",
   "compression_combos",
+  "compression_run_telemetry",
   "context_handoffs",
   "daily_usage_summary",
   "db_meta",
