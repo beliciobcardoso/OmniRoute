@@ -13,6 +13,12 @@
  */
 
 import { getDbInstance } from "./core";
+import { resolveDbDriverConfig } from "./driverConfig";
+import { ensurePostgresBootstrap, getKyselyDb } from "./kysely/client";
+
+function isPostgres(): boolean {
+  return resolveDbDriverConfig().driver === "postgres";
+}
 
 // ---------------------------------------------------------------------------
 // Types
@@ -72,7 +78,23 @@ function getDb(): DbLike {
  * Retrieve the cap for a specific (pool, key, model) triple.
  * Returns null if no cap is configured.
  */
-export function getModelCap(poolId: string, apiKeyId: string, model: string): ModelCap | null {
+export async function getModelCap(
+  poolId: string,
+  apiKeyId: string,
+  model: string
+): Promise<ModelCap | null> {
+  if (isPostgres()) {
+    await ensurePostgresBootstrap();
+    const row = await getKyselyDb()
+      .selectFrom("quota_allocation_model_caps")
+      .selectAll()
+      .where("pool_id", "=", poolId)
+      .where("api_key_id", "=", apiKeyId)
+      .where("model", "=", model)
+      .executeTakeFirst();
+    return row ? rowToModelCap(row) : null;
+  }
+
   const row = getDb()
     .prepare<ModelCapRow>(
       `SELECT pool_id, api_key_id, model, cap_value, cap_unit
@@ -86,7 +108,18 @@ export function getModelCap(poolId: string, apiKeyId: string, model: string): Mo
 /**
  * List all model caps for a given (pool, key) pair.
  */
-export function listModelCaps(poolId: string, apiKeyId: string): ModelCap[] {
+export async function listModelCaps(poolId: string, apiKeyId: string): Promise<ModelCap[]> {
+  if (isPostgres()) {
+    await ensurePostgresBootstrap();
+    const rows = await getKyselyDb()
+      .selectFrom("quota_allocation_model_caps")
+      .selectAll()
+      .where("pool_id", "=", poolId)
+      .where("api_key_id", "=", apiKeyId)
+      .execute();
+    return rows.map(rowToModelCap);
+  }
+
   const rows = getDb()
     .prepare<ModelCapRow>(
       `SELECT pool_id, api_key_id, model, cap_value, cap_unit
@@ -101,7 +134,27 @@ export function listModelCaps(poolId: string, apiKeyId: string): ModelCap[] {
  * Insert or replace a model cap.
  * cap_value must be > 0 (enforced by DB CHECK constraint).
  */
-export function setModelCap(cap: ModelCap): void {
+export async function setModelCap(cap: ModelCap): Promise<void> {
+  if (isPostgres()) {
+    await ensurePostgresBootstrap();
+    await getKyselyDb()
+      .insertInto("quota_allocation_model_caps")
+      .values({
+        pool_id: cap.poolId,
+        api_key_id: cap.apiKeyId,
+        model: cap.model,
+        cap_value: cap.capValue,
+        cap_unit: cap.capUnit,
+      })
+      .onConflict((oc) =>
+        oc
+          .columns(["pool_id", "api_key_id", "model"])
+          .doUpdateSet({ cap_value: cap.capValue, cap_unit: cap.capUnit })
+      )
+      .execute();
+    return;
+  }
+
   getDb()
     .prepare(
       `INSERT INTO quota_allocation_model_caps
@@ -118,7 +171,22 @@ export function setModelCap(cap: ModelCap): void {
  * Remove the cap for a specific (pool, key, model) triple.
  * No-op if it does not exist.
  */
-export function deleteModelCap(poolId: string, apiKeyId: string, model: string): void {
+export async function deleteModelCap(
+  poolId: string,
+  apiKeyId: string,
+  model: string
+): Promise<void> {
+  if (isPostgres()) {
+    await ensurePostgresBootstrap();
+    await getKyselyDb()
+      .deleteFrom("quota_allocation_model_caps")
+      .where("pool_id", "=", poolId)
+      .where("api_key_id", "=", apiKeyId)
+      .where("model", "=", model)
+      .execute();
+    return;
+  }
+
   getDb()
     .prepare(
       `DELETE FROM quota_allocation_model_caps

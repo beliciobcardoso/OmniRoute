@@ -131,7 +131,7 @@ export async function enforceQuotaShare(input: EnforceInput): Promise<EnforceDec
   if (input.model) {
     let modelCap: import("@/lib/db/quotaModelCaps").ModelCap | null = null;
     try {
-      modelCap = getModelCap(pool.id, input.apiKeyId, input.model);
+      modelCap = await getModelCap(pool.id, input.apiKeyId, input.model);
     } catch {
       // DB error — fail-open per B16
     }
@@ -346,7 +346,7 @@ export async function recordConsumption(input: RecordConsumptionInput): Promise<
   if (input.model) {
     let modelCap: import("@/lib/db/quotaModelCaps").ModelCap | null = null;
     try {
-      modelCap = getModelCap(poolId, input.apiKeyId, input.model);
+      modelCap = await getModelCap(poolId, input.apiKeyId, input.model);
     } catch {
       // DB not available — silent no-op per B29
     }
