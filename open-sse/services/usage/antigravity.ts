@@ -147,8 +147,7 @@ function getAntigravityLocalUsageUnits(
            AND timestamp < ?`
       )
       .get(provider, connectionId, modelId, windowStart, windowEnd) as
-      | { tokens?: unknown }
-      | undefined;
+      { tokens?: unknown } | undefined;
 
     const tokens = Number(row?.tokens || 0);
     if (!Number.isFinite(tokens) || tokens <= 0) return 0;
@@ -591,7 +590,7 @@ export async function getAntigravityUsage(
     const accountId: string = connectionId || "unknown";
 
     // Read cached credit balance (hydrated from DB on first access)
-    let creditBalance = getAntigravityRemainingCredits(accountId);
+    let creditBalance = await getAntigravityRemainingCredits(accountId);
 
     // If no cached balance and credits mode is enabled, fire a minimal probe
     const creditsMode = getCreditsMode();

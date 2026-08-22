@@ -244,7 +244,7 @@ async function getAntigravityUsage(
     const accountId: string = connectionId || "unknown";
 
     // Read cached credit balance from executor module (populated from SSE remainingCredits)
-    let creditBalance = getAntigravityRemainingCredits(accountId);
+    let creditBalance = await getAntigravityRemainingCredits(accountId);
 
     // If no cached balance and credits mode is enabled, fire a minimal probe
     const creditsMode = getCreditsMode();

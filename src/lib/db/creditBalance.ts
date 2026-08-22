@@ -7,6 +7,12 @@
  */
 
 import { getDbInstance, isBuildPhase, isCloud } from "./core";
+import { resolveDbDriverConfig } from "./driverConfig";
+import { ensurePostgresBootstrap, getKyselyDb } from "./kysely/client";
+
+function isPostgres(): boolean {
+  return resolveDbDriverConfig().driver === "postgres";
+}
 
 interface StatementLike<TRow = unknown> {
   get: (...params: unknown[]) => TRow | undefined;
@@ -42,8 +48,23 @@ function parseJson(raw: string): unknown {
  * Read the persisted credit balance for an accountId.
  * Returns the balance number, or null if not found.
  */
-export function getPersistedCreditBalance(accountId: string): number | null {
+export async function getPersistedCreditBalance(accountId: string): Promise<number | null> {
   if (isBuildPhase || isCloud) return null;
+
+  if (isPostgres()) {
+    await ensurePostgresBootstrap();
+    const row = await getKyselyDb()
+      .selectFrom("key_value")
+      .select("value")
+      .where("namespace", "=", NAMESPACE)
+      .where("key", "=", accountId)
+      .executeTakeFirst();
+    if (!row?.value) return null;
+    const parsed = parseJson(row.value) as CreditBalanceEntry | null;
+    if (!parsed || typeof parsed.balance !== "number") return null;
+    return parsed.balance;
+  }
+
   const db = getDbInstance() as unknown as DbLike;
   const row = db
     .prepare("SELECT value FROM key_value WHERE namespace = ? AND key = ?")
@@ -58,9 +79,26 @@ export function getPersistedCreditBalance(accountId: string): number | null {
  * Read all persisted credit balances.
  * Returns a Map of accountId → balance.
  */
-export function getAllPersistedCreditBalances(): Map<string, number> {
+export async function getAllPersistedCreditBalances(): Promise<Map<string, number>> {
   const result = new Map<string, number>();
   if (isBuildPhase || isCloud) return result;
+
+  if (isPostgres()) {
+    await ensurePostgresBootstrap();
+    const rows = await getKyselyDb()
+      .selectFrom("key_value")
+      .select(["key", "value"])
+      .where("namespace", "=", NAMESPACE)
+      .execute();
+    for (const row of rows) {
+      const parsed = parseJson(row.value) as CreditBalanceEntry | null;
+      if (parsed && typeof parsed.balance === "number") {
+        result.set(row.key, parsed.balance);
+      }
+    }
+    return result;
+  }
+
   const db = getDbInstance() as unknown as DbLike;
   const rows = db
     .prepare("SELECT key, value FROM key_value WHERE namespace = ?")
@@ -77,13 +115,26 @@ export function getAllPersistedCreditBalances(): Map<string, number> {
 /**
  * Persist a credit balance for an accountId.
  */
-export function persistCreditBalance(accountId: string, balance: number): void {
+export async function persistCreditBalance(accountId: string, balance: number): Promise<void> {
   if (isBuildPhase || isCloud) return;
-  const db = getDbInstance() as unknown as DbLike;
   const entry: CreditBalanceEntry = {
     balance,
     updatedAt: new Date().toISOString(),
   };
+
+  if (isPostgres()) {
+    await ensurePostgresBootstrap();
+    await getKyselyDb()
+      .insertInto("key_value")
+      .values({ namespace: NAMESPACE, key: accountId, value: JSON.stringify(entry) })
+      .onConflict((oc) =>
+        oc.columns(["namespace", "key"]).doUpdateSet({ value: JSON.stringify(entry) })
+      )
+      .execute();
+    return;
+  }
+
+  const db = getDbInstance() as unknown as DbLike;
   db.prepare("INSERT OR REPLACE INTO key_value (namespace, key, value) VALUES (?, ?, ?)").run(
     NAMESPACE,
     accountId,

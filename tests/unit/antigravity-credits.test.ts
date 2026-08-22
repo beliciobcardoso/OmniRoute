@@ -20,45 +20,53 @@ import {
 // ── Credit balance cache tests ────────────────────────────────────────────────
 
 describe("getAntigravityRemainingCredits / updateAntigravityRemainingCredits", () => {
-  it("returns null for an account with no cached balance", () => {
+  it("returns null for an account with no cached balance", async () => {
     const accountId = `test-unknown-${Date.now()}`;
     assert.equal(
-      getAntigravityRemainingCredits(accountId),
+      await getAntigravityRemainingCredits(accountId),
       null,
       "should return null before any update"
     );
   });
 
-  it("returns the balance after updateAntigravityRemainingCredits", () => {
+  it("returns the balance after updateAntigravityRemainingCredits", async () => {
     const accountId = `test-write-${Date.now()}`;
-    updateAntigravityRemainingCredits(accountId, 42);
-    assert.equal(getAntigravityRemainingCredits(accountId), 42, "stored balance should be 42");
-  });
-
-  it("overwrites a previous balance with a new value", () => {
-    const accountId = `test-overwrite-${Date.now()}`;
-    updateAntigravityRemainingCredits(accountId, 100);
-    updateAntigravityRemainingCredits(accountId, 55);
-    assert.equal(getAntigravityRemainingCredits(accountId), 55, "should reflect the latest update");
-  });
-
-  it("stores balance=0 correctly (not treated as null/falsy)", () => {
-    const accountId = `test-zero-${Date.now()}`;
-    updateAntigravityRemainingCredits(accountId, 0);
+    await updateAntigravityRemainingCredits(accountId, 42);
     assert.equal(
-      getAntigravityRemainingCredits(accountId),
+      await getAntigravityRemainingCredits(accountId),
+      42,
+      "stored balance should be 42"
+    );
+  });
+
+  it("overwrites a previous balance with a new value", async () => {
+    const accountId = `test-overwrite-${Date.now()}`;
+    await updateAntigravityRemainingCredits(accountId, 100);
+    await updateAntigravityRemainingCredits(accountId, 55);
+    assert.equal(
+      await getAntigravityRemainingCredits(accountId),
+      55,
+      "should reflect the latest update"
+    );
+  });
+
+  it("stores balance=0 correctly (not treated as null/falsy)", async () => {
+    const accountId = `test-zero-${Date.now()}`;
+    await updateAntigravityRemainingCredits(accountId, 0);
+    assert.equal(
+      await getAntigravityRemainingCredits(accountId),
       0,
       "balance 0 must be stored and returned as 0"
     );
   });
 
-  it("different accountIds do not interfere with each other", () => {
+  it("different accountIds do not interfere with each other", async () => {
     const idA = `test-a-${Date.now()}`;
     const idB = `test-b-${Date.now()}`;
-    updateAntigravityRemainingCredits(idA, 200);
-    updateAntigravityRemainingCredits(idB, 999);
-    assert.equal(getAntigravityRemainingCredits(idA), 200);
-    assert.equal(getAntigravityRemainingCredits(idB), 999);
+    await updateAntigravityRemainingCredits(idA, 200);
+    await updateAntigravityRemainingCredits(idB, 999);
+    assert.equal(await getAntigravityRemainingCredits(idA), 200);
+    assert.equal(await getAntigravityRemainingCredits(idB), 999);
   });
 });
 
@@ -137,7 +145,7 @@ describe("SSE remainingCredits extraction logic", () => {
     assert.ok(isNaN(balance), "NaN guard prevents invalid balance storage");
   });
 
-  it("balance update is correctly reflected in the cache after a successful parse", () => {
+  it("balance update is correctly reflected in the cache after a successful parse", async () => {
     const accountId = `test-sse-${Date.now()}`;
     const remainingCredits = [{ creditType: "GOOGLE_ONE_AI", creditAmount: "77" }];
 
@@ -145,14 +153,14 @@ describe("SSE remainingCredits extraction logic", () => {
     if (googleCredit) {
       const balance = parseInt(googleCredit.creditAmount, 10);
       if (!isNaN(balance)) {
-        updateAntigravityRemainingCredits(accountId, balance);
+        await updateAntigravityRemainingCredits(accountId, balance);
       }
     }
 
-    assert.equal(getAntigravityRemainingCredits(accountId), 77);
+    assert.equal(await getAntigravityRemainingCredits(accountId), 77);
   });
 
-  it("skips cache update when creditAmount is NaN — balance remains null", () => {
+  it("skips cache update when creditAmount is NaN — balance remains null", async () => {
     const accountId = `test-nan-guard-${Date.now()}`;
     const remainingCredits = [{ creditType: "GOOGLE_ONE_AI", creditAmount: "bad" }];
 
@@ -160,13 +168,13 @@ describe("SSE remainingCredits extraction logic", () => {
     if (googleCredit) {
       const balance = parseInt(googleCredit.creditAmount, 10);
       if (!isNaN(balance)) {
-        updateAntigravityRemainingCredits(accountId, balance);
+        await updateAntigravityRemainingCredits(accountId, balance);
       }
       // NaN — no update should happen
     }
 
     assert.equal(
-      getAntigravityRemainingCredits(accountId),
+      await getAntigravityRemainingCredits(accountId),
       null,
       "balance should remain null when parsing yields NaN"
     );

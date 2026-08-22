@@ -217,11 +217,11 @@ const CREDIT_BALANCE_TTL_MS = 5 * 60 * 1000;
 const creditBalanceCache = new Map<string, { balance: number; updatedAt: number }>();
 let creditCacheHydrated = false;
 
-function hydrateCreditCacheFromDb(): void {
+async function hydrateCreditCacheFromDb(): Promise<void> {
   if (creditCacheHydrated) return;
   creditCacheHydrated = true;
   try {
-    const persisted = getAllPersistedCreditBalances();
+    const persisted = await getAllPersistedCreditBalances();
     for (const [accountId, balance] of persisted) {
       if (!creditBalanceCache.has(accountId)) {
         creditBalanceCache.set(accountId, { balance, updatedAt: Date.now() });
@@ -249,8 +249,8 @@ if (typeof _creditBalanceSweep === "object" && "unref" in _creditBalanceSweep) {
   (_creditBalanceSweep as { unref?: () => void }).unref?.();
 }
 
-export function getAntigravityRemainingCredits(accountId: string): number | null {
-  hydrateCreditCacheFromDb();
+export async function getAntigravityRemainingCredits(accountId: string): Promise<number | null> {
+  await hydrateCreditCacheFromDb();
   const entry = creditBalanceCache.get(accountId);
   if (!entry) return null;
   if (Date.now() - entry.updatedAt > CREDIT_BALANCE_TTL_MS) {
@@ -260,14 +260,17 @@ export function getAntigravityRemainingCredits(accountId: string): number | null
   return entry.balance;
 }
 
-export function updateAntigravityRemainingCredits(accountId: string, balance: number): void {
+export async function updateAntigravityRemainingCredits(
+  accountId: string,
+  balance: number
+): Promise<void> {
   if (creditBalanceCache.size >= MAX_CREDIT_BALANCE_ENTRIES && !creditBalanceCache.has(accountId)) {
     const oldestKey = creditBalanceCache.keys().next().value;
     if (oldestKey !== undefined) creditBalanceCache.delete(oldestKey);
   }
   creditBalanceCache.set(accountId, { balance, updatedAt: Date.now() });
   try {
-    persistCreditBalance(accountId, balance);
+    await persistCreditBalance(accountId, balance);
   } catch {}
 }
 
@@ -1389,7 +1392,7 @@ export class AntigravityExecutor extends BaseExecutor {
                           if (googleCredit) {
                             const balance = parseInt(googleCredit.creditAmount, 10);
                             if (!isNaN(balance))
-                              updateAntigravityRemainingCredits(accountId, balance);
+                              await updateAntigravityRemainingCredits(accountId, balance);
                           }
                         }
                       } catch {
@@ -1579,7 +1582,7 @@ export class AntigravityExecutor extends BaseExecutor {
               );
               if (googleCredit) {
                 const balance = parseInt(googleCredit.creditAmount, 10);
-                if (!isNaN(balance)) updateAntigravityRemainingCredits(accountId, balance);
+                if (!isNaN(balance)) await updateAntigravityRemainingCredits(accountId, balance);
               }
             }
           } catch {
@@ -1670,7 +1673,7 @@ export class AntigravityExecutor extends BaseExecutor {
                   /* decoding best-effort */
                 }
               },
-              flush() {
+              async flush() {
                 // Final decode for any remaining bytes
                 try {
                   const text = decoder.decode(); // Flush pending bytes
@@ -1697,7 +1700,7 @@ export class AntigravityExecutor extends BaseExecutor {
                         if (googleCredit) {
                           const balance = parseInt(String(googleCredit.creditAmount ?? ""), 10);
                           if (!isNaN(balance)) {
-                            updateAntigravityRemainingCredits(accountId, balance);
+                            await updateAntigravityRemainingCredits(accountId, balance);
                           }
                         }
                       }
