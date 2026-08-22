@@ -317,9 +317,14 @@ function buildPerformance(comboName: string, since: string): ComboHealthMetrics[
   };
 }
 
-function buildQuotaHealth(providers: string[], since: string): ComboHealthMetrics["quotaHealth"] {
-  const providerHealth = providers.map((provider) =>
-    buildProviderHealth(provider, getQuotaSnapshots({ provider, since }))
+async function buildQuotaHealth(
+  providers: string[],
+  since: string
+): Promise<ComboHealthMetrics["quotaHealth"]> {
+  const providerHealth = await Promise.all(
+    providers.map(async (provider) =>
+      buildProviderHealth(provider, await getQuotaSnapshots({ provider, since }))
+    )
   );
 
   const worstRemainingPct =
@@ -417,83 +422,85 @@ function getHistoricalTargetMetrics(
   return metrics;
 }
 
-function buildTargetHealth(
+async function buildTargetHealth(
   comboName: string,
   targets: ResolvedComboTargetView[],
   since: string
-): NonNullable<ComboHealthMetrics["targetHealth"]> {
+): Promise<NonNullable<ComboHealthMetrics["targetHealth"]>> {
   const comboMetrics = getComboMetrics(comboName);
   const historicalMetrics = getHistoricalTargetMetrics(comboName, since);
 
-  return targets.map((target) => {
-    const historicalMetric =
-      historicalMetrics.get(target.executionKey) || historicalMetrics.get(target.stepId) || null;
-    const runtimeMetric =
-      historicalMetric === null
-        ? ((comboMetrics?.byTarget?.[target.executionKey] ||
-            comboMetrics?.byTarget?.[target.stepId] ||
-            null) as RuntimeTargetMetricView | null)
-        : null;
+  return Promise.all(
+    targets.map(async (target) => {
+      const historicalMetric =
+        historicalMetrics.get(target.executionKey) || historicalMetrics.get(target.stepId) || null;
+      const runtimeMetric =
+        historicalMetric === null
+          ? ((comboMetrics?.byTarget?.[target.executionKey] ||
+              comboMetrics?.byTarget?.[target.stepId] ||
+              null) as RuntimeTargetMetricView | null)
+          : null;
 
-    let quotaRemainingPct: number | null = null;
-    let quotaIsExhausted: boolean | null = null;
-    let quotaTrend: "improving" | "stable" | "declining" | null = null;
-    let quotaScope: "connection" | "provider" | "none" = "none";
+      let quotaRemainingPct: number | null = null;
+      let quotaIsExhausted: boolean | null = null;
+      let quotaTrend: "improving" | "stable" | "declining" | null = null;
+      let quotaScope: "connection" | "provider" | "none" = "none";
 
-    if (target.connectionId) {
-      const connectionHealth = buildConnectionHealth(
-        target.provider,
-        target.connectionId,
-        getQuotaSnapshots({
-          provider: target.provider,
-          connectionId: target.connectionId,
-          since,
-        })
-      );
-      if (connectionHealth) {
-        quotaRemainingPct = connectionHealth.remainingPct;
-        quotaIsExhausted = connectionHealth.isExhausted;
-        quotaTrend = connectionHealth.trend;
-        quotaScope = "connection";
+      if (target.connectionId) {
+        const connectionHealth = buildConnectionHealth(
+          target.provider,
+          target.connectionId,
+          await getQuotaSnapshots({
+            provider: target.provider,
+            connectionId: target.connectionId,
+            since,
+          })
+        );
+        if (connectionHealth) {
+          quotaRemainingPct = connectionHealth.remainingPct;
+          quotaIsExhausted = connectionHealth.isExhausted;
+          quotaTrend = connectionHealth.trend;
+          quotaScope = "connection";
+        }
       }
-    }
 
-    if (quotaScope === "none") {
-      const providerSnapshots = getQuotaSnapshots({ provider: target.provider, since });
-      const providerHealth = buildProviderHealth(target.provider, providerSnapshots);
-      if (providerSnapshots.length > 0) {
-        quotaRemainingPct = providerHealth.remainingPct;
-        quotaIsExhausted = providerHealth.isExhausted;
-        quotaTrend = providerHealth.trend;
-        quotaScope = "provider";
+      if (quotaScope === "none") {
+        const providerSnapshots = await getQuotaSnapshots({ provider: target.provider, since });
+        const providerHealth = buildProviderHealth(target.provider, providerSnapshots);
+        if (providerSnapshots.length > 0) {
+          quotaRemainingPct = providerHealth.remainingPct;
+          quotaIsExhausted = providerHealth.isExhausted;
+          quotaTrend = providerHealth.trend;
+          quotaScope = "provider";
+        }
       }
-    }
 
-    return {
-      executionKey: target.executionKey,
-      stepId: target.stepId,
-      model: target.modelStr,
-      provider: target.provider,
-      connectionId: target.connectionId,
-      label: target.label,
-      requests: toSafeNumber(historicalMetric?.requests ?? runtimeMetric?.requests),
-      successRate: toSafeNumber(historicalMetric?.successRate ?? runtimeMetric?.successRate),
-      avgLatencyMs: toSafeNumber(historicalMetric?.avgLatencyMs ?? runtimeMetric?.avgLatencyMs),
-      lastStatus: historicalMetric?.lastStatus ?? runtimeMetric?.lastStatus ?? null,
-      lastUsedAt: historicalMetric?.lastUsedAt ?? runtimeMetric?.lastUsedAt ?? null,
-      quotaRemainingPct,
-      quotaIsExhausted,
-      quotaTrend,
-      quotaScope,
-    };
-  });
+      return {
+        executionKey: target.executionKey,
+        stepId: target.stepId,
+        model: target.modelStr,
+        provider: target.provider,
+        connectionId: target.connectionId,
+        label: target.label,
+        requests: toSafeNumber(historicalMetric?.requests ?? runtimeMetric?.requests),
+        successRate: toSafeNumber(historicalMetric?.successRate ?? runtimeMetric?.successRate),
+        avgLatencyMs: toSafeNumber(historicalMetric?.avgLatencyMs ?? runtimeMetric?.avgLatencyMs),
+        lastStatus: historicalMetric?.lastStatus ?? runtimeMetric?.lastStatus ?? null,
+        lastUsedAt: historicalMetric?.lastUsedAt ?? runtimeMetric?.lastUsedAt ?? null,
+        quotaRemainingPct,
+        quotaIsExhausted,
+        quotaTrend,
+        quotaScope,
+      };
+    })
+  );
 }
 
-function buildComboHealth(
+async function buildComboHealth(
   combo: ComboRecord,
   since: string,
   allCombos: ComboRecord[]
-): ComboHealthMetrics | null {
+): Promise<ComboHealthMetrics | null> {
   const comboId = typeof combo.id === "string" ? combo.id : "";
   const comboName = typeof combo.name === "string" ? combo.name : "";
   if (!comboId || !comboName) return null;
@@ -501,6 +508,11 @@ function buildComboHealth(
   const targets = resolveNestedComboTargets(combo, allCombos) as ResolvedComboTargetView[];
   const models = targets.map((target) => target.modelStr);
   const providers = Array.from(new Set(targets.map((target) => target.provider)));
+
+  const [targetHealth, quotaHealth] = await Promise.all([
+    buildTargetHealth(comboName, targets, since),
+    buildQuotaHealth(providers, since),
+  ]);
 
   return {
     comboId,
@@ -510,8 +522,8 @@ function buildComboHealth(
         ? combo.strategy
         : "priority",
     models,
-    targetHealth: buildTargetHealth(comboName, targets, since),
-    quotaHealth: buildQuotaHealth(providers, since),
+    targetHealth,
+    quotaHealth,
     usageSkew: buildUsageSkew(comboName, models, since),
     performance: buildPerformance(comboName, since),
   };
@@ -536,10 +548,12 @@ export async function buildComboHealthResponse(opts: {
     combos = allCombos;
   }
 
+  const comboHealth = await Promise.all(
+    combos.map((combo) => buildComboHealth(combo, since, allCombos))
+  );
+
   return {
     timeRange: opts.range,
-    combos: combos
-      .map((combo) => buildComboHealth(combo, since, allCombos))
-      .filter((combo): combo is ComboHealthMetrics => combo !== null),
+    combos: comboHealth.filter((combo): combo is ComboHealthMetrics => combo !== null),
   };
 }

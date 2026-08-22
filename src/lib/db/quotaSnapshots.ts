@@ -1,7 +1,11 @@
 import { getDbInstance, rowToCamel } from "./core";
+import { resolveDbDriverConfig } from "./driverConfig";
+import { ensurePostgresBootstrap, getKyselyDb } from "./kysely/client";
 import type { QuotaSnapshotRow, ProviderUtilizationPoint } from "@/shared/types/utilization";
 
-type JsonRecord = Record<string, unknown>;
+function isPostgres(): boolean {
+  return resolveDbDriverConfig().driver === "postgres";
+}
 
 interface StatementLike<TRow = unknown> {
   all: (...params: unknown[]) => TRow[];
@@ -15,9 +19,32 @@ interface DbLike {
 
 let lastCleanupAt = 0;
 
-export function saveQuotaSnapshot(snapshot: Omit<QuotaSnapshotRow, "id" | "created_at">): void {
-  const db = getDbInstance() as unknown as DbLike;
+export async function saveQuotaSnapshot(
+  snapshot: Omit<QuotaSnapshotRow, "id" | "created_at">
+): Promise<void> {
   const now = new Date().toISOString();
+
+  if (isPostgres()) {
+    await ensurePostgresBootstrap();
+    const kdb = getKyselyDb();
+    await kdb
+      .insertInto("quota_snapshots")
+      .values({
+        provider: snapshot.provider,
+        connection_id: snapshot.connection_id,
+        window_key: snapshot.window_key,
+        remaining_percentage: snapshot.remaining_percentage,
+        is_exhausted: snapshot.is_exhausted,
+        next_reset_at: snapshot.next_reset_at,
+        window_duration_ms: snapshot.window_duration_ms,
+        raw_data: snapshot.raw_data,
+        created_at: now,
+      })
+      .execute();
+    return;
+  }
+
+  const db = getDbInstance() as unknown as DbLike;
 
   try {
     db.prepare(
@@ -47,12 +74,23 @@ export function saveQuotaSnapshot(snapshot: Omit<QuotaSnapshotRow, "id" | "creat
   }
 }
 
-export function getQuotaSnapshots(opts: {
+export async function getQuotaSnapshots(opts: {
   provider?: string;
   connectionId?: string;
   since: string;
   until?: string;
-}): QuotaSnapshotRow[] {
+}): Promise<QuotaSnapshotRow[]> {
+  if (isPostgres()) {
+    await ensurePostgresBootstrap();
+    const kdb = getKyselyDb();
+    let query = kdb.selectFrom("quota_snapshots").selectAll().where("created_at", ">=", opts.since);
+    if (opts.provider) query = query.where("provider", "=", opts.provider);
+    if (opts.connectionId) query = query.where("connection_id", "=", opts.connectionId);
+    if (opts.until) query = query.where("created_at", "<=", opts.until);
+    const rows = await query.orderBy("created_at", "asc").execute();
+    return rows.map((r) => rowToCamel(r) as unknown as QuotaSnapshotRow);
+  }
+
   const db = getDbInstance() as unknown as DbLike;
   const conditions: string[] = ["created_at >= ?"];
   const params: unknown[] = [opts.since];
@@ -84,6 +122,13 @@ export function getQuotaSnapshots(opts: {
   }
 }
 
+/**
+ * Hot-path read used by src/domain/quotaCache.ts to rehydrate the in-memory
+ * cache on a miss. Stays SQLite-only (out of scope this session, same
+ * coupling as proxies.ts/contextHandoffs.ts): the caller is fully synchronous
+ * on purpose to avoid rippling async through the request-routing hot path.
+ * See docs/architecture/POSTGRES_SUPPORT.md.
+ */
 export function getLatestQuotaSnapshotsForConnection(connectionId: string): QuotaSnapshotRow[] {
   const db = getDbInstance() as unknown as DbLike;
 
@@ -115,13 +160,70 @@ export function getLatestQuotaSnapshotsForConnection(connectionId: string): Quot
   }
 }
 
-export function getAggregatedSnapshots(opts: {
+export async function getAggregatedSnapshots(opts: {
   provider?: string;
   since: string;
   until?: string;
   bucketMinutes: number;
   aggregateBy?: "provider" | "connection";
-}): ProviderUtilizationPoint[] {
+}): Promise<ProviderUtilizationPoint[]> {
+  const bucketSeconds = Number(opts.bucketMinutes) * 60;
+  if (!Number.isFinite(bucketSeconds) || bucketSeconds <= 0) {
+    throw new Error("Invalid bucket size");
+  }
+
+  if (isPostgres()) {
+    await ensurePostgresBootstrap();
+    const kdb = getKyselyDb();
+    const { sql } = await import("kysely");
+
+    const conditions = [sql`created_at >= ${opts.since}`];
+    if (opts.provider) conditions.push(sql`provider = ${opts.provider}`);
+    if (opts.until) conditions.push(sql`created_at <= ${opts.until}`);
+    const whereClause = sql.join(conditions, sql` AND `);
+
+    const selectKey =
+      opts.aggregateBy === "connection"
+        ? sql`provider || ':' || connection_id as provider`
+        : sql`provider`;
+    const groupByFields =
+      opts.aggregateBy === "connection"
+        ? sql`bucket, provider, connection_id, window_key`
+        : sql`bucket, provider, window_key`;
+
+    const query = sql<{
+      bucket: string;
+      provider: string;
+      remainingPct: number | string | null;
+      isExhausted: number | string | null;
+      windowKey: string;
+    }>`
+      SELECT
+        to_char(
+          to_timestamp(floor(extract(epoch from created_at::timestamptz) / ${bucketSeconds}) * ${bucketSeconds}),
+          'YYYY-MM-DD"T"HH24:MI:SS"Z"'
+        ) as bucket,
+        ${selectKey},
+        AVG(remaining_percentage) as "remainingPct",
+        MAX(is_exhausted) as "isExhausted",
+        window_key as "windowKey"
+      FROM quota_snapshots
+      WHERE ${whereClause}
+      GROUP BY ${groupByFields}
+      ORDER BY bucket ASC
+    `;
+
+    const { rows: pgRows } = await query.execute(kdb);
+
+    return pgRows.map((r) => ({
+      timestamp: r.bucket,
+      provider: r.provider,
+      remainingPct: Number(r.remainingPct ?? 0),
+      isExhausted: Number(r.isExhausted) === 1,
+      windowKey: r.windowKey,
+    }));
+  }
+
   const db = getDbInstance() as unknown as DbLike;
   const conditions: string[] = ["created_at >= ?"];
   const params: unknown[] = [opts.since];
@@ -134,11 +236,6 @@ export function getAggregatedSnapshots(opts: {
   if (opts.until) {
     conditions.push("created_at <= ?");
     params.push(opts.until);
-  }
-
-  const bucketSeconds = Number(opts.bucketMinutes) * 60;
-  if (!Number.isFinite(bucketSeconds) || bucketSeconds <= 0) {
-    throw new Error("Invalid bucket size");
   }
 
   const groupFields =
@@ -185,7 +282,7 @@ export function getAggregatedSnapshots(opts: {
   }
 }
 
-export function cleanupOldSnapshots(retentionDays = 90): number {
+export async function cleanupOldSnapshots(retentionDays = 90): Promise<number> {
   const now = Date.now();
   const cleanupThresholdMs = 6 * 60 * 60 * 1000;
 
@@ -193,8 +290,20 @@ export function cleanupOldSnapshots(retentionDays = 90): number {
     return 0;
   }
 
-  const db = getDbInstance() as unknown as DbLike;
   const cutoffDate = new Date(Date.now() - retentionDays * 24 * 60 * 60 * 1000).toISOString();
+
+  if (isPostgres()) {
+    await ensurePostgresBootstrap();
+    const kdb = getKyselyDb();
+    const result = await kdb
+      .deleteFrom("quota_snapshots")
+      .where("created_at", "<", cutoffDate)
+      .executeTakeFirst();
+    lastCleanupAt = now;
+    return Number(result.numDeletedRows ?? 0);
+  }
+
+  const db = getDbInstance() as unknown as DbLike;
 
   try {
     const result = db.prepare("DELETE FROM quota_snapshots WHERE created_at < ?").run(cutoffDate);

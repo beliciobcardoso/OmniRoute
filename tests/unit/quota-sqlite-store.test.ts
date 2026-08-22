@@ -123,13 +123,13 @@ test("sqliteQuotaStore: bucket rotation applies decay from prev bucket", async (
   const dimKey = `pool-rotate:tokens:hourly`;
 
   // Write directly to prev bucket (bypassing store)
-  incrementBucket("key-rotate", dimKey, prevBucket, 1000, nowMs - windowMs);
+  await incrementBucket("key-rotate", dimKey, prevBucket, 1000, nowMs - windowMs);
 
   // Peek at 50% elapsed through current bucket
   // We can't easily fake time without mocking Date.now, so we verify the formula
   // by reading the pair directly and computing manually.
   const { getPair } = await import("../../src/lib/db/quotaConsumption.ts");
-  const { curr, prev } = getPair("key-rotate", dimKey, currentBucket);
+  const { curr, prev } = await getPair("key-rotate", dimKey, currentBucket);
 
   assert.equal(curr, 0, "curr bucket should be empty");
   assert.equal(prev, 1000, "prev bucket should have 1000");

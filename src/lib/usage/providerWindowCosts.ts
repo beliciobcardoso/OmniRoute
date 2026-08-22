@@ -115,14 +115,14 @@ function parseResetAt(value: unknown, nowMs: number): number | null {
   return parsed;
 }
 
-function getProviderWindowStart(
+async function getProviderWindowStart(
   connectionId: string | null,
   resetMs: number,
   nowMs: number
-): { startMs: number; source: ProviderWindowCostBreakdown["windowStartSource"] } | null {
+): Promise<{ startMs: number; source: ProviderWindowCostBreakdown["windowStartSource"] } | null> {
   if (!connectionId) return null;
   const resetIso = new Date(resetMs).toISOString();
-  const start = getProviderQuotaWindowStart(connectionId, resetIso, nowMs);
+  const start = await getProviderQuotaWindowStart(connectionId, resetIso, nowMs);
   if (!start) return null;
   const startMs = Date.parse(start.windowStartIso);
   if (!Number.isFinite(startMs)) return null;
@@ -216,7 +216,7 @@ async function selectWeeklyWindow(
   }
 
   if (selected) {
-    const providerWindowStart = getProviderWindowStart(
+    const providerWindowStart = await getProviderWindowStart(
       selected.connectionId,
       selected.resetMs,
       nowMs

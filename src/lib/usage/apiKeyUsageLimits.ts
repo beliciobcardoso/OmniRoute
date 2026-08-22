@@ -279,13 +279,13 @@ function getObservedWeeklyWindowStartIso(
 // Prefer the persisted, provider-observed window start (recorded by
 // quotaResetEvents on real reset transitions); fall back to inferring it from
 // historical snapshots when no observed event is available yet.
-function getWeeklyWindowStartIso(
+async function getWeeklyWindowStartIso(
   connectionId: string,
   targetResetAtIso: string,
   nowMs: number
-): string | null {
+): Promise<string | null> {
   return (
-    getProviderQuotaWindowStartIso(connectionId, targetResetAtIso, nowMs) ??
+    (await getProviderQuotaWindowStartIso(connectionId, targetResetAtIso, nowMs)) ??
     getObservedWeeklyWindowStartIso(connectionId, targetResetAtIso, nowMs)
   );
 }
@@ -334,7 +334,7 @@ async function getProviderWeeklyWindow(
           connectionId: connection.id,
           provider: connection.provider,
           resetAtIso: resetAt,
-          observedWindowStartIso: getWeeklyWindowStartIso(connection.id, resetAt, nowMs),
+          observedWindowStartIso: await getWeeklyWindowStartIso(connection.id, resetAt, nowMs),
         });
       }
     }
@@ -350,7 +350,7 @@ async function getProviderWeeklyWindow(
           connectionId: connection.id,
           provider: connection.provider,
           resetAtIso: resetAt,
-          observedWindowStartIso: getWeeklyWindowStartIso(connection.id, resetAt, nowMs),
+          observedWindowStartIso: await getWeeklyWindowStartIso(connection.id, resetAt, nowMs),
         });
       }
     }

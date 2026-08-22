@@ -7,12 +7,19 @@
  * bucket_index = floor(now_ms / window_ms).
  *
  * Atomicity: incrementBucket uses INSERT ... ON CONFLICT DO UPDATE (UPSERT)
- * which is a single atomic SQLite statement — no separate read-modify-write.
+ * which is a single atomic statement under both dialects — no separate
+ * read-modify-write.
  *
  * Part of: Group B — Quota Sharing Engine (plan 22, frente F2).
  */
 
 import { getDbInstance } from "./core";
+import { resolveDbDriverConfig } from "./driverConfig";
+import { ensurePostgresBootstrap, getKyselyDb } from "./kysely/client";
+
+function isPostgres(): boolean {
+  return resolveDbDriverConfig().driver === "postgres";
+}
 
 // ---------------------------------------------------------------------------
 // Internal helpers
@@ -34,6 +41,15 @@ function getDb(): DbLike {
 
 interface BucketRow {
   consumed: number;
+}
+
+function toNumber(value: unknown, fallback = 0): number {
+  if (typeof value === "number" && Number.isFinite(value)) return value;
+  if (typeof value === "string" && value.trim()) {
+    const parsed = Number(value);
+    return Number.isFinite(parsed) ? parsed : fallback;
+  }
+  return fallback;
 }
 
 // ---------------------------------------------------------------------------
@@ -67,11 +83,24 @@ export interface ConsumptionEvent {
 /**
  * Read the consumed value for a single bucket. Returns 0 if no row exists.
  */
-export function getBucket(
+export async function getBucket(
   apiKeyId: string,
   dimensionKey: string,
   bucketIndex: number
-): number {
+): Promise<number> {
+  if (isPostgres()) {
+    await ensurePostgresBootstrap();
+    const kdb = getKyselyDb();
+    const row = await kdb
+      .selectFrom("quota_consumption")
+      .select("consumed")
+      .where("api_key_id", "=", apiKeyId)
+      .where("dimension_key", "=", dimensionKey)
+      .where("bucket_index", "=", bucketIndex)
+      .executeTakeFirst();
+    return toNumber(row?.consumed, 0);
+  }
+
   const row = getDb()
     .prepare<BucketRow>(
       `SELECT consumed FROM quota_consumption
@@ -92,13 +121,35 @@ export function getBucket(
  * @param delta         Amount to add (positive number).
  * @param nowMs         Current epoch milliseconds (used for updated_at).
  */
-export function incrementBucket(
+export async function incrementBucket(
   apiKeyId: string,
   dimensionKey: string,
   bucketIndex: number,
   delta: number,
   nowMs: number
-): void {
+): Promise<void> {
+  if (isPostgres()) {
+    await ensurePostgresBootstrap();
+    const kdb = getKyselyDb();
+    await kdb
+      .insertInto("quota_consumption")
+      .values({
+        api_key_id: apiKeyId,
+        dimension_key: dimensionKey,
+        bucket_index: bucketIndex,
+        consumed: delta,
+        updated_at: nowMs,
+      })
+      .onConflict((oc) =>
+        oc.columns(["api_key_id", "dimension_key", "bucket_index"]).doUpdateSet((eb) => ({
+          consumed: eb("quota_consumption.consumed", "+", eb.ref("excluded.consumed")),
+          updated_at: eb.ref("excluded.updated_at"),
+        }))
+      )
+      .execute();
+    return;
+  }
+
   getDb()
     .prepare(
       `INSERT INTO quota_consumption (api_key_id, dimension_key, bucket_index, consumed, updated_at)
@@ -120,12 +171,20 @@ export function incrementBucket(
  * @param currentBucket The current bucket index (floor(nowMs / windowMs)).
  * @returns             { curr, prev } — both default to 0 when row is absent.
  */
-export function getPair(
+export async function getPair(
   apiKeyId: string,
   dimensionKey: string,
   currentBucket: number
-): { curr: number; prev: number } {
+): Promise<{ curr: number; prev: number }> {
   const prevBucket = currentBucket - 1;
+
+  if (isPostgres()) {
+    const [curr, prev] = await Promise.all([
+      getBucket(apiKeyId, dimensionKey, currentBucket),
+      getBucket(apiKeyId, dimensionKey, prevBucket),
+    ]);
+    return { curr, prev };
+  }
 
   const currRow = getDb()
     .prepare<BucketRow>(
@@ -168,20 +227,45 @@ interface ConsumptionRow {
  * @param limit   Maximum rows to return (caller should clamp; default 50).
  * @returns       Array of ConsumptionEvent (may be empty if no data yet).
  */
-export function listConsumptionForPool(poolId: string, limit: number): ConsumptionEvent[] {
+export async function listConsumptionForPool(
+  poolId: string,
+  limit: number
+): Promise<ConsumptionEvent[]> {
   const safeLimit = Math.max(1, Math.min(limit, 500));
   // dimension_key format: "<poolId>:<unit>:<window>"
   // The LIKE pattern uses "%" — escape literal "%" or "_" in poolId defensively.
   const prefix = poolId.replace(/[%_\\]/g, "\\$&") + ":%";
-  const rows = getDb()
-    .prepare<ConsumptionRow>(
-      `SELECT api_key_id, dimension_key, bucket_index, consumed, updated_at
-       FROM quota_consumption
-       WHERE dimension_key LIKE ? ESCAPE '\\'
-       ORDER BY updated_at DESC
-       LIMIT ?`
-    )
-    .all(prefix, safeLimit);
+
+  let rows: ConsumptionRow[];
+
+  if (isPostgres()) {
+    await ensurePostgresBootstrap();
+    const kdb = getKyselyDb();
+    const pgRows = await kdb
+      .selectFrom("quota_consumption")
+      .select(["api_key_id", "dimension_key", "bucket_index", "consumed", "updated_at"])
+      .where("dimension_key", "like", prefix)
+      .orderBy("updated_at", "desc")
+      .limit(safeLimit)
+      .execute();
+    rows = pgRows.map((r) => ({
+      api_key_id: r.api_key_id,
+      dimension_key: r.dimension_key,
+      bucket_index: toNumber(r.bucket_index),
+      consumed: toNumber(r.consumed),
+      updated_at: toNumber(r.updated_at),
+    }));
+  } else {
+    rows = getDb()
+      .prepare<ConsumptionRow>(
+        `SELECT api_key_id, dimension_key, bucket_index, consumed, updated_at
+         FROM quota_consumption
+         WHERE dimension_key LIKE ? ESCAPE '\\'
+         ORDER BY updated_at DESC
+         LIMIT ?`
+      )
+      .all(prefix, safeLimit);
+  }
 
   return rows.map((r) => {
     const parts = r.dimension_key.split(":");
@@ -204,12 +288,6 @@ export function listConsumptionForPool(poolId: string, limit: number): Consumpti
 // Pool-wide aggregate
 // ---------------------------------------------------------------------------
 
-interface BucketPairRow {
-  api_key_id: string;
-  curr: number;
-  prev: number;
-}
-
 /**
  * Sum the consumed values for a given (dimensionKey, currentBucketIndex) and
  * (dimensionKey, currentBucketIndex - 1) across ALL api_key_id values.
@@ -220,11 +298,34 @@ interface BucketPairRow {
  * @param dimensionKey   "<poolId>:<unit>:<window>" string — same format as consume/peek.
  * @param currentBucket  floor(nowMs / windowMs) — caller must pass the same value.
  */
-export function sumPoolDimension(
+export async function sumPoolDimension(
   dimensionKey: string,
   currentBucket: number
-): { currTotal: number; prevTotal: number } {
+): Promise<{ currTotal: number; prevTotal: number }> {
   const prevBucket = currentBucket - 1;
+
+  if (isPostgres()) {
+    await ensurePostgresBootstrap();
+    const kdb = getKyselyDb();
+    const [currRow, prevRow] = await Promise.all([
+      kdb
+        .selectFrom("quota_consumption")
+        .select((eb) => eb.fn.coalesce(eb.fn.sum<number>("consumed"), eb.val(0)).as("total"))
+        .where("dimension_key", "=", dimensionKey)
+        .where("bucket_index", "=", currentBucket)
+        .executeTakeFirst(),
+      kdb
+        .selectFrom("quota_consumption")
+        .select((eb) => eb.fn.coalesce(eb.fn.sum<number>("consumed"), eb.val(0)).as("total"))
+        .where("dimension_key", "=", dimensionKey)
+        .where("bucket_index", "=", prevBucket)
+        .executeTakeFirst(),
+    ]);
+    return {
+      currTotal: toNumber(currRow?.total, 0),
+      prevTotal: toNumber(prevRow?.total, 0),
+    };
+  }
 
   interface SumRow {
     total: number;
@@ -266,7 +367,17 @@ export function sumPoolDimension(
  * @param maxUpdatedAtMs Epoch ms threshold (exclusive lower bound for kept rows).
  * @returns              Number of rows deleted.
  */
-export function gcOlderThan(maxUpdatedAtMs: number): number {
+export async function gcOlderThan(maxUpdatedAtMs: number): Promise<number> {
+  if (isPostgres()) {
+    await ensurePostgresBootstrap();
+    const kdb = getKyselyDb();
+    const result = await kdb
+      .deleteFrom("quota_consumption")
+      .where("updated_at", "<", maxUpdatedAtMs)
+      .executeTakeFirst();
+    return Number(result.numDeletedRows ?? 0);
+  }
+
   const result = getDb()
     .prepare("DELETE FROM quota_consumption WHERE updated_at < ?")
     .run(maxUpdatedAtMs);

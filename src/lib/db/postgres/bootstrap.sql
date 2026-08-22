@@ -893,8 +893,12 @@ CREATE TABLE IF NOT EXISTS provider_quota_reset_events (
   previous_used_percentage DOUBLE PRECISION,
   new_used_percentage DOUBLE PRECISION,
   raw_data TEXT,
-  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  UNIQUE(connection_id, window_key, window_started_at, window_resets_at)
 );
+
+CREATE INDEX IF NOT EXISTS idx_provider_quota_reset_events_connection_window
+  ON provider_quota_reset_events(connection_id, window_key, window_resets_at);
 
 CREATE TABLE IF NOT EXISTS proxy_assignments (
   id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,

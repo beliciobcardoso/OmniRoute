@@ -1,4 +1,10 @@
 import { getDbInstance } from "./core";
+import { resolveDbDriverConfig } from "./driverConfig";
+import { ensurePostgresBootstrap, getKyselyDb } from "./kysely/client";
+
+function isPostgres(): boolean {
+  return resolveDbDriverConfig().driver === "postgres";
+}
 
 interface StatementLike<TRow = unknown> {
   all: (...params: unknown[]) => TRow[];
@@ -103,10 +109,30 @@ function isPrimaryWeeklyWindow(windowKey: string): boolean {
   );
 }
 
-function getLatestSnapshotObservation(
+async function getLatestSnapshotObservation(
   connectionId: string,
   windowKey: string
-): QuotaObservation | null {
+): Promise<QuotaObservation | null> {
+  if (isPostgres()) {
+    await ensurePostgresBootstrap();
+    const kdb = getKyselyDb();
+    const row = await kdb
+      .selectFrom("quota_snapshots")
+      .select(["next_reset_at", "remaining_percentage"])
+      .where("connection_id", "=", connectionId)
+      .where(({ fn, eb }) => eb(fn("lower", ["window_key"]), "=", windowKey.toLowerCase()))
+      .where("next_reset_at", "is not", null)
+      .orderBy("created_at", "desc")
+      .orderBy("id", "desc")
+      .limit(1)
+      .executeTakeFirst();
+    if (!row) return null;
+    return {
+      resetAt: row.next_reset_at ?? null,
+      remainingPercentage: toNumberOrNull(row.remaining_percentage),
+    };
+  }
+
   const db = getDbInstance() as unknown as DbLike;
   try {
     const row = db
@@ -135,14 +161,17 @@ function getLatestSnapshotObservation(
   }
 }
 
-export function recordProviderQuotaResetEventIfChanged(input: ResetEventInput): void {
+export async function recordProviderQuotaResetEventIfChanged(
+  input: ResetEventInput
+): Promise<void> {
   if (!input.connectionId || !input.windowKey || !isPrimaryWeeklyWindow(input.windowKey)) return;
 
   const currentResetIso = parseResetIso(input.currentResetAt);
   if (!currentResetIso) return;
 
   const previous =
-    input.previousObservation ?? getLatestSnapshotObservation(input.connectionId, input.windowKey);
+    input.previousObservation ??
+    (await getLatestSnapshotObservation(input.connectionId, input.windowKey));
   const previousResetIso = parseResetIso(previous?.resetAt ?? null);
   if (!previousResetIso) return;
 
@@ -165,6 +194,33 @@ export function recordProviderQuotaResetEventIfChanged(input: ResetEventInput): 
   if (!resetMovedForward && !resetObservedWithinSameResetAt) return;
 
   const windowStartedAt = resetMovedForward ? previousResetIso : observedAt;
+
+  if (isPostgres()) {
+    await ensurePostgresBootstrap();
+    const kdb = getKyselyDb();
+    await kdb
+      .insertInto("provider_quota_reset_events")
+      .values({
+        provider: input.provider,
+        connection_id: input.connectionId,
+        window_key: input.windowKey,
+        window_started_at: windowStartedAt,
+        window_resets_at: currentResetIso,
+        observed_at: observedAt,
+        previous_remaining_percentage: previousRemaining,
+        new_remaining_percentage: currentRemaining,
+        previous_used_percentage: previousUsed,
+        new_used_percentage: currentUsed,
+        raw_data: null,
+      })
+      .onConflict((oc) =>
+        oc
+          .columns(["connection_id", "window_key", "window_started_at", "window_resets_at"])
+          .doNothing()
+      )
+      .execute();
+    return;
+  }
 
   try {
     const db = getDbInstance() as unknown as DbLike;
@@ -195,18 +251,36 @@ export function recordProviderQuotaResetEventIfChanged(input: ResetEventInput): 
   }
 }
 
-function getRecordedQuotaWindowStartIso(
+async function getRecordedQuotaWindowStartIso(
   connectionId: string,
   targetResetAtIso: string,
   nowMs = Date.now()
-): string | null {
+): Promise<string | null> {
   if (!connectionId || !targetResetAtIso) return null;
   const targetDay = resetDay(targetResetAtIso);
   if (!targetDay) return null;
 
-  const db = getDbInstance() as unknown as DbLike;
   const nowIso = new Date(nowMs).toISOString();
 
+  if (isPostgres()) {
+    await ensurePostgresBootstrap();
+    const kdb = getKyselyDb();
+    const rows = await kdb
+      .selectFrom("provider_quota_reset_events")
+      .select(["window_started_at", "window_resets_at", "observed_at"])
+      .where("connection_id", "=", connectionId)
+      .where("observed_at", "<=", nowIso)
+      .orderBy("observed_at", "desc")
+      .execute();
+
+    for (const row of rows) {
+      if (resetDay(row.window_resets_at) !== targetDay) continue;
+      return parseResetIso(row.window_started_at);
+    }
+    return null;
+  }
+
+  const db = getDbInstance() as unknown as DbLike;
   try {
     const rows = db
       .prepare<ResetEventWindowRow>(
@@ -216,19 +290,16 @@ function getRecordedQuotaWindowStartIso(
           window_resets_at as windowResetsAt,
           observed_at as observedAt
         FROM provider_quota_reset_events
-        WHERE connection_id = @connectionId
-          AND LOWER(window_key) LIKE '%weekly%'
-          AND LOWER(window_key) NOT LIKE '%sonnet%'
-          AND observed_at <= @nowIso
-        ORDER BY observed_at DESC, id DESC
+        WHERE connection_id = ?
+          AND observed_at <= ?
+        ORDER BY observed_at DESC
       `
       )
-      .all({ connectionId, nowIso });
+      .all(connectionId, nowIso);
 
     for (const row of rows) {
-      if (resetDay(row.windowResetsAt) === targetDay) {
-        return parseResetIso(row.windowStartedAt);
-      }
+      if (resetDay(row.windowResetsAt) !== targetDay) continue;
+      return parseResetIso(row.windowStartedAt);
     }
     return null;
   } catch (error: unknown) {
@@ -237,71 +308,93 @@ function getRecordedQuotaWindowStartIso(
   }
 }
 
-function getObservedQuotaWindowStartIso(
+async function getObservedQuotaWindowStartIso(
   connectionId: string,
   targetResetAtIso: string,
   nowMs = Date.now()
-): { windowStartIso: string; resetDrop: boolean } | null {
+): Promise<{ windowStartIso: string; resetDrop: boolean } | null> {
   if (!connectionId || !targetResetAtIso) return null;
   const targetDay = resetDay(targetResetAtIso);
   if (!targetDay) return null;
 
-  const db = getDbInstance() as unknown as DbLike;
   const nowIso = new Date(nowMs).toISOString();
 
-  try {
-    const rows = db
-      .prepare<QuotaSnapshotWindowRow>(
+  let rows: QuotaSnapshotWindowRow[];
+
+  if (isPostgres()) {
+    await ensurePostgresBootstrap();
+    const kdb = getKyselyDb();
+    const pgRows = await kdb
+      .selectFrom("quota_snapshots")
+      .select(["next_reset_at", "remaining_percentage", "created_at"])
+      .where("connection_id", "=", connectionId)
+      .where(({ fn, eb }) => eb(fn("lower", ["window_key"]), "like", "%weekly%"))
+      .where(({ fn, eb }) => eb(fn("lower", ["window_key"]), "not like", "%sonnet%"))
+      .where("created_at", "<=", nowIso)
+      .orderBy("created_at", "asc")
+      .orderBy("id", "asc")
+      .execute();
+    rows = pgRows.map((r) => ({
+      nextResetAt: r.next_reset_at ?? null,
+      remainingPercentage: toNumberOrNull(r.remaining_percentage),
+      createdAt: r.created_at ?? null,
+    }));
+  } else {
+    const db = getDbInstance() as unknown as DbLike;
+    try {
+      rows = db
+        .prepare<QuotaSnapshotWindowRow>(
+          `
+          SELECT
+            next_reset_at as nextResetAt,
+            remaining_percentage as remainingPercentage,
+            created_at as createdAt
+          FROM quota_snapshots
+          WHERE connection_id = @connectionId
+            AND LOWER(window_key) LIKE '%weekly%'
+            AND LOWER(window_key) NOT LIKE '%sonnet%'
+            AND created_at <= @nowIso
+          ORDER BY created_at ASC, id ASC
         `
-        SELECT
-          next_reset_at as nextResetAt,
-          remaining_percentage as remainingPercentage,
-          created_at as createdAt
-        FROM quota_snapshots
-        WHERE connection_id = @connectionId
-          AND LOWER(window_key) LIKE '%weekly%'
-          AND LOWER(window_key) NOT LIKE '%sonnet%'
-          AND created_at <= @nowIso
-        ORDER BY created_at ASC, id ASC
-      `
-      )
-      .all({ connectionId, nowIso });
-
-    let firstObservedIso: string | null = null;
-    let resetDropIso: string | null = null;
-    let previousUsedPercentage: number | null = null;
-
-    for (const row of rows) {
-      const createdIso = parseResetIso(row.createdAt);
-      if (!createdIso || resetDay(row.nextResetAt) !== targetDay) continue;
-
-      if (!firstObservedIso) firstObservedIso = createdIso;
-
-      const currentUsedPercentage = usedPercent(clampPercent(row.remainingPercentage));
-      if (currentUsedPercentage !== null) {
-        if (isResetDrop(previousUsedPercentage, currentUsedPercentage)) {
-          resetDropIso = createdIso;
-        }
-        previousUsedPercentage = currentUsedPercentage;
-      }
+        )
+        .all({ connectionId, nowIso });
+    } catch (error: unknown) {
+      if (error instanceof Error && error.message.includes("no such table")) return null;
+      throw error;
     }
-
-    if (resetDropIso) return { windowStartIso: resetDropIso, resetDrop: true };
-    if (firstObservedIso) return { windowStartIso: firstObservedIso, resetDrop: false };
-    return null;
-  } catch (error: unknown) {
-    if (error instanceof Error && error.message.includes("no such table")) return null;
-    throw error;
   }
+
+  let firstObservedIso: string | null = null;
+  let resetDropIso: string | null = null;
+  let previousUsedPercentage: number | null = null;
+
+  for (const row of rows) {
+    const createdIso = parseResetIso(row.createdAt);
+    if (!createdIso || resetDay(row.nextResetAt) !== targetDay) continue;
+
+    if (!firstObservedIso) firstObservedIso = createdIso;
+
+    const currentUsedPercentage = usedPercent(clampPercent(row.remainingPercentage));
+    if (currentUsedPercentage !== null) {
+      if (isResetDrop(previousUsedPercentage, currentUsedPercentage)) {
+        resetDropIso = createdIso;
+      }
+      previousUsedPercentage = currentUsedPercentage;
+    }
+  }
+
+  if (resetDropIso) return { windowStartIso: resetDropIso, resetDrop: true };
+  if (firstObservedIso) return { windowStartIso: firstObservedIso, resetDrop: false };
+  return null;
 }
 
-export function getProviderQuotaWindowStart(
+export async function getProviderQuotaWindowStart(
   connectionId: string,
   targetResetAtIso: string,
   nowMs = Date.now()
-): ProviderQuotaWindowStart | null {
-  const recordedIso = getRecordedQuotaWindowStartIso(connectionId, targetResetAtIso, nowMs);
-  const observed = getObservedQuotaWindowStartIso(connectionId, targetResetAtIso, nowMs);
+): Promise<ProviderQuotaWindowStart | null> {
+  const recordedIso = await getRecordedQuotaWindowStartIso(connectionId, targetResetAtIso, nowMs);
+  const observed = await getObservedQuotaWindowStartIso(connectionId, targetResetAtIso, nowMs);
 
   if (!recordedIso && !observed) return null;
   if (!recordedIso && observed) {
@@ -325,10 +418,11 @@ export function getProviderQuotaWindowStart(
   return { windowStartIso: recordedIso!, source: "recorded_reset_event" };
 }
 
-export function getProviderQuotaWindowStartIso(
+export async function getProviderQuotaWindowStartIso(
   connectionId: string,
   targetResetAtIso: string,
   nowMs = Date.now()
-): string | null {
-  return getProviderQuotaWindowStart(connectionId, targetResetAtIso, nowMs)?.windowStartIso ?? null;
+): Promise<string | null> {
+  const result = await getProviderQuotaWindowStart(connectionId, targetResetAtIso, nowMs);
+  return result?.windowStartIso ?? null;
 }
