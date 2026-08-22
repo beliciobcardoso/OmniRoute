@@ -166,6 +166,21 @@ export interface ApiKeysTable {
   usage_limit_enabled: Generated<SqliteBoolean>;
   daily_usage_limit_usd: number | null;
   weekly_usage_limit_usd: number | null;
+  blocked_models: string | null;
+  allowed_connections: string | null;
+  auto_resolve: Generated<SqliteBoolean>;
+  is_active: Generated<SqliteBoolean>;
+  access_schedule: string | null;
+  max_requests_per_day: number | null;
+  max_requests_per_minute: number | null;
+  max_sessions: Generated<number>;
+  rate_limits: string | null;
+  is_banned: Generated<SqliteBoolean>;
+  key_hash: string | null;
+  proxy_id: string | null;
+  allowed_endpoints: string | null;
+  allow_usage_command: Generated<SqliteBoolean>;
+  chaos_mode_enabled: Generated<SqliteBoolean>;
 }
 
 export interface BadgeDefinitionsTable {

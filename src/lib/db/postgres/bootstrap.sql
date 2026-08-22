@@ -138,7 +138,22 @@ CREATE TABLE IF NOT EXISTS api_keys (
   disable_non_public_models BOOLEAN NOT NULL DEFAULT FALSE,
   usage_limit_enabled BOOLEAN NOT NULL DEFAULT FALSE,
   daily_usage_limit_usd DOUBLE PRECISION,
-  weekly_usage_limit_usd DOUBLE PRECISION
+  weekly_usage_limit_usd DOUBLE PRECISION,
+  blocked_models TEXT,
+  allowed_connections TEXT,
+  auto_resolve BOOLEAN NOT NULL DEFAULT FALSE,
+  is_active BOOLEAN NOT NULL DEFAULT TRUE,
+  access_schedule TEXT,
+  max_requests_per_day BIGINT,
+  max_requests_per_minute BIGINT,
+  max_sessions BIGINT NOT NULL DEFAULT 0,
+  rate_limits TEXT,
+  is_banned BOOLEAN NOT NULL DEFAULT FALSE,
+  key_hash TEXT,
+  proxy_id TEXT,
+  allowed_endpoints TEXT,
+  allow_usage_command BOOLEAN NOT NULL DEFAULT FALSE,
+  chaos_mode_enabled BOOLEAN NOT NULL DEFAULT FALSE
 );
 
 CREATE TABLE IF NOT EXISTS badge_definitions (

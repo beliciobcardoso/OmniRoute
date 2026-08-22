@@ -8,6 +8,9 @@ import { getDbInstance, rowToCamel } from "./core";
 import { backupDbFile } from "./backup";
 import { registerDbStateResetter } from "./stateReset";
 import { getKeyGroupsForApiKey, checkKeyModelAccess } from "./apiKeyGroups";
+import { resolveDbDriverConfig } from "./driverConfig";
+import { ensurePostgresBootstrap, getKyselyDb } from "./kysely/client";
+import type { SqliteBoolean } from "./kysely/types";
 import { API_KEY_COLUMN_FALLBACKS } from "./apiKeyColumnFallbacks";
 import {
   appendUsageLimitUpdates,
@@ -223,6 +226,61 @@ function toRecord(value: unknown): JsonRecord {
   return value && typeof value === "object" ? (value as JsonRecord) : {};
 }
 
+function isPostgres(): boolean {
+  return resolveDbDriverConfig().driver === "postgres";
+}
+
+// Postgres BIGINT columns (max_requests_per_day, max_requests_per_minute,
+// max_sessions, throttle_delay_ms) come back as JS strings from
+// node-postgres, not numbers — coerce before any numeric comparison.
+function toPositiveIntOrNull(value: unknown): number | null {
+  if (typeof value === "number") return value > 0 ? value : null;
+  if (typeof value === "string" && value.trim().length > 0) {
+    const parsed = Number(value);
+    return Number.isFinite(parsed) && parsed > 0 ? parsed : null;
+  }
+  return null;
+}
+
+// api_keys columns declared as native Postgres BOOLEAN (vs. SQLite's 0/1
+// INTEGER convention) — values built by the shared SQLite param-building
+// logic (0/1) must be coerced to true/false before a Kysely write.
+const API_KEYS_BOOLEAN_COLUMNS = new Set([
+  "no_log",
+  "disable_non_public_models",
+  "usage_limit_enabled",
+  "auto_resolve",
+  "is_active",
+  "is_banned",
+  "allow_usage_command",
+  "chaos_mode_enabled",
+]);
+
+/**
+ * Translate the dialect-agnostic `updates`/`params` pair built for the
+ * SQLite `UPDATE api_keys SET ${updates.join(", ")} WHERE id = @id` query
+ * into a Kysely `.set()` object, e.g. `["name = @name"]` + `{name: "x"}` →
+ * `{name: "x"}`. Boolean columns get their 0/1 SQLite convention coerced to
+ * true/false for the native Postgres BOOLEAN columns.
+ */
+function buildPgSetFromUpdates(
+  updates: string[],
+  params: Record<string, unknown>
+): Record<string, unknown> {
+  const set: Record<string, unknown> = {};
+  for (const clause of updates) {
+    const match = /^(\w+)\s*=\s*@(\w+)$/.exec(clause.trim());
+    if (!match) continue;
+    const [, column, paramKey] = match;
+    let value = params[paramKey];
+    if (API_KEYS_BOOLEAN_COLUMNS.has(column) && typeof value === "number") {
+      value = value === 1;
+    }
+    set[column] = value;
+  }
+  return set;
+}
+
 function isConfiguredEnvApiKey(key: string): boolean {
   const envKey = process.env.OMNIROUTE_API_KEY || process.env.ROUTER_API_KEY;
   return Boolean(envKey && key === envKey);
@@ -253,8 +311,19 @@ async function deleteRedisAuthCacheEntries(...keyHashes: unknown[]): Promise<voi
   await Promise.all(keyHashes.map((keyHash) => deleteRedisAuthCacheEntry(keyHash)));
 }
 
-async function deleteRedisAuthCacheForKeyId(db: ApiKeysDbLike, id: string): Promise<void> {
+async function deleteRedisAuthCacheForKeyId(db: ApiKeysDbLike | null, id: string): Promise<void> {
   if (!isRedisAuthCacheEnabled()) return;
+
+  if (!db) {
+    await ensurePostgresBootstrap();
+    const row = await getKyselyDb()
+      .selectFrom("api_keys")
+      .select("key_hash")
+      .where("id", "=", id)
+      .executeTakeFirst();
+    await deleteRedisAuthCacheEntry(row?.key_hash);
+    return;
+  }
 
   const row = db
     .prepare<{ key_hash: string | null }>("SELECT key_hash FROM api_keys WHERE id = ?")
@@ -262,17 +331,28 @@ async function deleteRedisAuthCacheForKeyId(db: ApiKeysDbLike, id: string): Prom
   await deleteRedisAuthCacheEntry(row?.key_hash);
 }
 
-function markApiKeyUsed(db: ApiKeysDbLike, id: unknown, now: number): void {
+async function markApiKeyUsed(db: ApiKeysDbLike | null, id: unknown, now: number): Promise<void> {
   if (typeof id !== "string" || id.trim() === "") return;
 
   const lastUpdate = _lastUsedUpdateCache.get(id);
   if (lastUpdate && now - lastUpdate < LAST_USED_UPDATE_TTL) return;
 
+  _lastUsedUpdateCache.set(id, now);
+
+  if (!db) {
+    await ensurePostgresBootstrap();
+    await getKyselyDb()
+      .updateTable("api_keys")
+      .set({ last_used_at: new Date(now).toISOString() })
+      .where("id", "=", id)
+      .execute();
+    return;
+  }
+
   db.prepare("UPDATE api_keys SET last_used_at = @lastUsedAt WHERE id = @id").run({
     id,
     lastUsedAt: new Date(now).toISOString(),
   });
-  _lastUsedUpdateCache.set(id, now);
 }
 
 /**
@@ -427,37 +507,49 @@ function getPreparedStatements(db: ApiKeysDbLike): ApiKeysStatements {
   };
 }
 
+function shapeApiKeyRow(row: unknown): ApiKeyView {
+  const camelRow = toRecord(rowToCamel(row)) as ApiKeyView;
+  camelRow.allowedModels = parseAllowedModels(camelRow.allowedModels);
+  camelRow.blockedModels = parseAllowedModels(camelRow.blockedModels);
+  camelRow.allowedCombos = parseAllowedCombos(camelRow.allowedCombos);
+  camelRow.allowedConnections = parseAllowedConnections(camelRow.allowedConnections);
+  camelRow.allowedQuotas = parseAllowedQuotas((camelRow as JsonRecord).allowedQuotas);
+  camelRow.noLog = parseNoLog(camelRow.noLog);
+  camelRow.autoResolve = parseAutoResolve(camelRow.autoResolve);
+  camelRow.isActive = parseIsActive(camelRow.isActive);
+  camelRow.accessSchedule = parseAccessSchedule(camelRow.accessSchedule);
+  camelRow.rateLimits = parseRateLimits(camelRow.rateLimits);
+  camelRow.isBanned = parseIsBanned(camelRow.isBanned);
+  camelRow.scopes = parseStringList((camelRow as JsonRecord).scopes);
+  camelRow.allowedEndpoints = parseStringList((camelRow as JsonRecord).allowedEndpoints);
+  camelRow.streamDefaultMode = parseStreamDefaultMode((camelRow as JsonRecord).streamDefaultMode);
+  camelRow.disableNonPublicModels = parseDisableNonPublicModels(
+    (camelRow as JsonRecord).disableNonPublicModels
+  );
+  camelRow.allowUsageCommand = parseAllowUsageCommand((camelRow as JsonRecord).allowUsageCommand);
+  camelRow.chaosModeEnabled = parseChaosModeEnabled((camelRow as JsonRecord).chaosModeEnabled);
+  Object.assign(camelRow, parseApiKeyUsageLimitFields(camelRow));
+  if (typeof camelRow.id === "string" && camelRow.id.length > 0) {
+    setNoLog(camelRow.id, camelRow.noLog === true);
+  }
+  return camelRow;
+}
+
 export async function getApiKeys() {
+  if (isPostgres()) {
+    await ensurePostgresBootstrap();
+    const rows = await getKyselyDb()
+      .selectFrom("api_keys")
+      .selectAll()
+      .orderBy("created_at")
+      .execute();
+    return rows.map(shapeApiKeyRow);
+  }
+
   const db = getDbInstance() as ApiKeysDbLike;
   const stmt = getPreparedStatements(db);
   const rows = stmt.getAllKeys.all();
-  return rows.map((row) => {
-    const camelRow = toRecord(rowToCamel(row)) as ApiKeyView;
-    camelRow.allowedModels = parseAllowedModels(camelRow.allowedModels);
-    camelRow.blockedModels = parseAllowedModels(camelRow.blockedModels);
-    camelRow.allowedCombos = parseAllowedCombos(camelRow.allowedCombos);
-    camelRow.allowedConnections = parseAllowedConnections(camelRow.allowedConnections);
-    camelRow.allowedQuotas = parseAllowedQuotas((camelRow as JsonRecord).allowedQuotas);
-    camelRow.noLog = parseNoLog(camelRow.noLog);
-    camelRow.autoResolve = parseAutoResolve(camelRow.autoResolve);
-    camelRow.isActive = parseIsActive(camelRow.isActive);
-    camelRow.accessSchedule = parseAccessSchedule(camelRow.accessSchedule);
-    camelRow.rateLimits = parseRateLimits(camelRow.rateLimits);
-    camelRow.isBanned = parseIsBanned(camelRow.isBanned);
-    camelRow.scopes = parseStringList((camelRow as JsonRecord).scopes);
-    camelRow.allowedEndpoints = parseStringList((camelRow as JsonRecord).allowedEndpoints);
-    camelRow.streamDefaultMode = parseStreamDefaultMode((camelRow as JsonRecord).streamDefaultMode);
-    camelRow.disableNonPublicModels = parseDisableNonPublicModels(
-      (camelRow as JsonRecord).disableNonPublicModels
-    );
-    camelRow.allowUsageCommand = parseAllowUsageCommand((camelRow as JsonRecord).allowUsageCommand);
-    camelRow.chaosModeEnabled = parseChaosModeEnabled((camelRow as JsonRecord).chaosModeEnabled);
-    Object.assign(camelRow, parseApiKeyUsageLimitFields(camelRow));
-    if (typeof camelRow.id === "string" && camelRow.id.length > 0) {
-      setNoLog(camelRow.id, camelRow.noLog === true);
-    }
-    return camelRow;
-  });
+  return rows.map(shapeApiKeyRow);
 }
 
 /**
@@ -532,35 +624,21 @@ export async function pickApiKeyForInternalUse(
 }
 
 export async function getApiKeyById(id: string) {
+  if (isPostgres()) {
+    await ensurePostgresBootstrap();
+    const row = await getKyselyDb()
+      .selectFrom("api_keys")
+      .selectAll()
+      .where("id", "=", id)
+      .executeTakeFirst();
+    return row ? shapeApiKeyRow(row) : null;
+  }
+
   const db = getDbInstance() as ApiKeysDbLike;
   const stmt = getPreparedStatements(db);
   const row = stmt.getKeyById.get(id);
   if (!row) return null;
-  const camelRow = toRecord(rowToCamel(row)) as ApiKeyView;
-  camelRow.allowedModels = parseAllowedModels(camelRow.allowedModels);
-  camelRow.blockedModels = parseAllowedModels(camelRow.blockedModels);
-  camelRow.allowedCombos = parseAllowedCombos(camelRow.allowedCombos);
-  camelRow.allowedConnections = parseAllowedConnections(camelRow.allowedConnections);
-  camelRow.allowedQuotas = parseAllowedQuotas((camelRow as JsonRecord).allowedQuotas);
-  camelRow.noLog = parseNoLog(camelRow.noLog);
-  camelRow.autoResolve = parseAutoResolve(camelRow.autoResolve);
-  camelRow.isActive = parseIsActive(camelRow.isActive);
-  camelRow.accessSchedule = parseAccessSchedule(camelRow.accessSchedule);
-  camelRow.rateLimits = parseRateLimits(camelRow.rateLimits);
-  camelRow.isBanned = parseIsBanned(camelRow.isBanned);
-  camelRow.scopes = parseStringList((camelRow as JsonRecord).scopes);
-  camelRow.allowedEndpoints = parseStringList((camelRow as JsonRecord).allowedEndpoints);
-  camelRow.streamDefaultMode = parseStreamDefaultMode((camelRow as JsonRecord).streamDefaultMode);
-  camelRow.disableNonPublicModels = parseDisableNonPublicModels(
-    (camelRow as JsonRecord).disableNonPublicModels
-  );
-  camelRow.allowUsageCommand = parseAllowUsageCommand((camelRow as JsonRecord).allowUsageCommand);
-  camelRow.chaosModeEnabled = parseChaosModeEnabled((camelRow as JsonRecord).chaosModeEnabled);
-  Object.assign(camelRow, parseApiKeyUsageLimitFields(camelRow));
-  if (typeof camelRow.id === "string" && camelRow.id.length > 0) {
-    setNoLog(camelRow.id, camelRow.noLog === true);
-  }
-  return camelRow;
+  return shapeApiKeyRow(row);
 }
 
 async function hashKey(key: string): Promise<string> {
@@ -578,7 +656,6 @@ export async function createApiKey(name: string, machineId: string, scopes: stri
     throw new Error("machineId is required");
   }
 
-  const db = getDbInstance() as ApiKeysDbLike;
   const now = new Date().toISOString();
 
   const { generateApiKeyWithMachine } = await import("@/shared/utils/apiKey");
@@ -598,6 +675,30 @@ export async function createApiKey(name: string, machineId: string, scopes: stri
     scopes,
   };
 
+  const keyHash = await hashKey(apiKey.key);
+
+  if (isPostgres()) {
+    await ensurePostgresBootstrap();
+    await getKyselyDb()
+      .insertInto("api_keys")
+      .values({
+        id: apiKey.id,
+        name: apiKey.name,
+        key: apiKey.key,
+        machine_id: apiKey.machineId,
+        allowed_models: "[]",
+        no_log: false as unknown as SqliteBoolean,
+        created_at: apiKey.createdAt,
+        key_prefix: apiKey.key.slice(0, 12),
+        key_hash: keyHash,
+        scopes: JSON.stringify(scopes),
+      })
+      .execute();
+    setNoLog(apiKey.id, false);
+    return apiKey;
+  }
+
+  const db = getDbInstance() as ApiKeysDbLike;
   const stmt = getPreparedStatements(db);
   stmt.insertKey.run(
     apiKey.id,
@@ -608,7 +709,7 @@ export async function createApiKey(name: string, machineId: string, scopes: stri
     0,
     apiKey.createdAt,
     apiKey.key.slice(0, 12),
-    await hashKey(apiKey.key),
+    keyHash,
     JSON.stringify(scopes)
   );
   setNoLog(apiKey.id, false);
@@ -618,9 +719,20 @@ export async function createApiKey(name: string, machineId: string, scopes: stri
 }
 
 export async function regenerateApiKey(id: string) {
-  const db = getDbInstance() as ApiKeysDbLike;
-  const stmt = getPreparedStatements(db);
-  const row = stmt.getKeyById.get(id) as ApiKeyRow | undefined;
+  let row: ApiKeyRow | undefined;
+
+  if (isPostgres()) {
+    await ensurePostgresBootstrap();
+    row = (await getKyselyDb()
+      .selectFrom("api_keys")
+      .selectAll()
+      .where("id", "=", id)
+      .executeTakeFirst()) as ApiKeyRow | undefined;
+  } else {
+    const db = getDbInstance() as ApiKeysDbLike;
+    const stmt = getPreparedStatements(db);
+    row = stmt.getKeyById.get(id) as ApiKeyRow | undefined;
+  }
   if (!row) return null;
 
   const { generateApiKeyWithMachine } = await import("@/shared/utils/apiKey");
@@ -629,11 +741,19 @@ export async function regenerateApiKey(id: string) {
   const newHash = await hashKey(newKey);
   const newPrefix = newKey.slice(0, 12);
 
-  // Update in DB
-  const updateStmt = db.prepare(
-    "UPDATE api_keys SET key = ?, key_hash = ?, key_prefix = ? WHERE id = ?"
-  );
-  updateStmt.run(newKey, newHash, newPrefix, id);
+  if (isPostgres()) {
+    await getKyselyDb()
+      .updateTable("api_keys")
+      .set({ key: newKey, key_hash: newHash, key_prefix: newPrefix })
+      .where("id", "=", id)
+      .execute();
+  } else {
+    const db = getDbInstance() as ApiKeysDbLike;
+    const updateStmt = db.prepare(
+      "UPDATE api_keys SET key = ?, key_hash = ?, key_prefix = ? WHERE id = ?"
+    );
+    updateStmt.run(newKey, newHash, newPrefix, id);
+  }
 
   // Invalidate all caches
   clearApiKeyCaches();
@@ -685,8 +805,9 @@ export async function updateApiKeyPermissions(
         chaosModeEnabled?: boolean;
       }
 ) {
-  const db = getDbInstance() as ApiKeysDbLike;
-  getPreparedStatements(db);
+  const pg = isPostgres();
+  const db = pg ? null : (getDbInstance() as ApiKeysDbLike);
+  if (db) getPreparedStatements(db);
 
   const normalized =
     Array.isArray(update) || update === undefined
@@ -938,7 +1059,39 @@ export async function updateApiKeyPermissions(
   // nodeSqliteAdapter fall-back per v3.8.1 db driver cascade).
   let previousScopes: string[] = [];
   let changedRows = 0;
-  if (scopesUpdate !== undefined) {
+  if (pg) {
+    await ensurePostgresBootstrap();
+    const kdb = getKyselyDb();
+    if (scopesUpdate !== undefined) {
+      updates.push("scopes = @scopes");
+      params.scopes = JSON.stringify(nextScopes);
+    }
+    const pgSet = buildPgSetFromUpdates(updates, params);
+
+    if (scopesUpdate !== undefined) {
+      changedRows = await kdb.transaction().execute(async (trx) => {
+        const prevRow = await trx
+          .selectFrom("api_keys")
+          .select("scopes")
+          .where("id", "=", id)
+          .executeTakeFirst();
+        previousScopes = parseStringList(prevRow?.scopes ?? null);
+        const upd = await trx
+          .updateTable("api_keys")
+          .set(pgSet)
+          .where("id", "=", id)
+          .executeTakeFirst();
+        return Number(upd.numUpdatedRows);
+      });
+    } else {
+      const upd = await kdb
+        .updateTable("api_keys")
+        .set(pgSet)
+        .where("id", "=", id)
+        .executeTakeFirst();
+      changedRows = Number(upd.numUpdatedRows);
+    }
+  } else if (scopesUpdate !== undefined) {
     updates.push("scopes = @scopes");
     params.scopes = JSON.stringify(nextScopes);
 
@@ -948,30 +1101,30 @@ export async function updateApiKeyPermissions(
     // driver backends (better-sqlite3 / node:sqlite / sql.js) wired by the
     // v3.8.1 db driver cascade — none of them expose `db.transaction()` via
     // ApiKeysDbLike, which is intentionally minimal.
-    db.exec("BEGIN IMMEDIATE");
+    db!.exec("BEGIN IMMEDIATE");
     try {
-      const prevRow = db
+      const prevRow = db!
         .prepare<{ scopes: string | null }>("SELECT scopes FROM api_keys WHERE id = ?")
         .get(id);
       previousScopes = parseStringList(prevRow?.scopes ?? null);
-      const upd = db
+      const upd = db!
         .prepare(`UPDATE api_keys SET ${updates.join(", ")} WHERE id = @id`)
         .run(params);
       changedRows = upd.changes ?? 0;
-      db.exec("COMMIT");
+      db!.exec("COMMIT");
     } catch (err) {
       // Guard the ROLLBACK: if it throws (e.g. transaction already ended
       // due to an implicit commit, or backend in a bad state), the original
       // error from the try block is the actionable one — don't shadow it.
       try {
-        db.exec("ROLLBACK");
+        db!.exec("ROLLBACK");
       } catch {
         // swallow: original error is more important
       }
       throw err;
     }
   } else {
-    const upd = db.prepare(`UPDATE api_keys SET ${updates.join(", ")} WHERE id = @id`).run(params);
+    const upd = db!.prepare(`UPDATE api_keys SET ${updates.join(", ")} WHERE id = @id`).run(params);
     changedRows = upd.changes ?? 0;
   }
 
@@ -1039,6 +1192,27 @@ export async function updateApiKeyPermissions(
 }
 
 export async function deleteApiKey(id: string) {
+  if (isPostgres()) {
+    await ensurePostgresBootstrap();
+    const kdb = getKyselyDb();
+    const row = await kdb
+      .selectFrom("api_keys")
+      .select("key_hash")
+      .where("id", "=", id)
+      .executeTakeFirst();
+    const result = await kdb.deleteFrom("api_keys").where("id", "=", id).executeTakeFirst();
+
+    if (Number(result.numDeletedRows) === 0) return false;
+
+    await kdb.deleteFrom("domain_budgets").where("api_key_id", "=", id).execute();
+    await kdb.deleteFrom("domain_cost_history").where("api_key_id", "=", id).execute();
+    setNoLog(id, false);
+
+    invalidateCaches();
+    await deleteRedisAuthCacheEntry(row?.key_hash);
+    return true;
+  }
+
   const db = getDbInstance() as ApiKeysDbLike;
   const stmt = getPreparedStatements(db);
   const row = stmt.getKeyById.get(id) as ApiKeyRow | undefined;
@@ -1064,6 +1238,26 @@ export async function deleteApiKey(id: string) {
  * (or sooner because invalidateCaches() runs here).
  */
 export async function revokeApiKey(id: string): Promise<boolean> {
+  if (isPostgres()) {
+    await ensurePostgresBootstrap();
+    const kdb = getKyselyDb();
+    const ts = new Date().toISOString();
+    const result = await kdb
+      .updateTable("api_keys")
+      .set((eb) => ({
+        revoked_at: eb.fn.coalesce("revoked_at", eb.val(ts)),
+        is_active: false as unknown as SqliteBoolean,
+      }))
+      .where("id", "=", id)
+      .executeTakeFirst();
+
+    if (Number(result.numUpdatedRows) === 0) return false;
+
+    invalidateCaches();
+    await deleteRedisAuthCacheForKeyId(null, id);
+    return true;
+  }
+
   const db = getDbInstance() as ApiKeysDbLike;
   getPreparedStatements(db);
 
@@ -1085,6 +1279,21 @@ export async function revokeApiKey(id: string): Promise<boolean> {
  * Set or clear the expiry of an API key. Pass null to remove the expiry.
  */
 export async function setApiKeyExpiry(id: string, expiresAt: string | null): Promise<boolean> {
+  if (isPostgres()) {
+    await ensurePostgresBootstrap();
+    const result = await getKyselyDb()
+      .updateTable("api_keys")
+      .set({ expires_at: expiresAt })
+      .where("id", "=", id)
+      .executeTakeFirst();
+
+    if (Number(result.numUpdatedRows) === 0) return false;
+
+    invalidateCaches();
+    await deleteRedisAuthCacheForKeyId(null, id);
+    return true;
+  }
+
   const db = getDbInstance() as ApiKeysDbLike;
   getPreparedStatements(db);
 
@@ -1157,9 +1366,22 @@ export async function validateApiKey(key: string | null | undefined) {
     }
   }
 
-  const db = getDbInstance() as ApiKeysDbLike;
-  const stmt = getPreparedStatements(db);
-  const row = stmt.validateKey.get(key, hashedKey) as JsonRecord | undefined;
+  const pg = isPostgres();
+  let db: ApiKeysDbLike | null = null;
+  let row: JsonRecord | undefined;
+
+  if (pg) {
+    await ensurePostgresBootstrap();
+    row = (await getKyselyDb()
+      .selectFrom("api_keys")
+      .select(["id", "expires_at", "revoked_at", "is_active", "is_banned"])
+      .where((eb) => eb.or([eb("key", "=", key), eb("key_hash", "=", hashedKey)]))
+      .executeTakeFirst()) as JsonRecord | undefined;
+  } else {
+    db = getDbInstance() as ApiKeysDbLike;
+    const stmt = getPreparedStatements(db);
+    row = stmt.validateKey.get(key, hashedKey) as JsonRecord | undefined;
+  }
 
   if (!row) return false;
 
@@ -1206,7 +1428,7 @@ export async function validateApiKey(key: string | null | undefined) {
     }
   }
 
-  markApiKeyUsed(db, row.id, now);
+  void markApiKeyUsed(db, row.id, now);
 
   return true;
 }
@@ -1288,9 +1510,19 @@ export async function getApiKeyMetadata(
     return cached.value;
   }
 
-  const db = getDbInstance() as ApiKeysDbLike;
-  const stmt = getPreparedStatements(db);
-  const row = stmt.getKeyMetadata.get(key, hashedKey);
+  let row: unknown;
+  if (isPostgres()) {
+    await ensurePostgresBootstrap();
+    row = await getKyselyDb()
+      .selectFrom("api_keys")
+      .selectAll()
+      .where((eb) => eb.or([eb("key", "=", key), eb("key_hash", "=", hashedKey)]))
+      .executeTakeFirst();
+  } else {
+    const db = getDbInstance() as ApiKeysDbLike;
+    const stmt = getPreparedStatements(db);
+    row = stmt.getKeyMetadata.get(key, hashedKey);
+  }
 
   if (!row) return null;
 
@@ -1324,12 +1556,11 @@ export async function getApiKeyMetadata(
     isActive: parseIsActive(record.is_active ?? record.isActive),
     accessSchedule: parseAccessSchedule(record.access_schedule ?? record.accessSchedule),
     rateLimits: parseRateLimits(record.rate_limits ?? (record as JsonRecord).rateLimits),
-    maxRequestsPerDay: typeof rawMaxRPD === "number" && rawMaxRPD > 0 ? rawMaxRPD : null,
-    maxRequestsPerMinute: typeof rawMaxRPM === "number" && rawMaxRPM > 0 ? rawMaxRPM : null,
-    throttleDelayMs:
-      typeof rawThrottleDelayMs === "number" && rawThrottleDelayMs > 0 ? rawThrottleDelayMs : null,
+    maxRequestsPerDay: toPositiveIntOrNull(rawMaxRPD),
+    maxRequestsPerMinute: toPositiveIntOrNull(rawMaxRPM),
+    throttleDelayMs: toPositiveIntOrNull(rawThrottleDelayMs),
     // T08: max concurrent sessions; 0 = unlimited (default & backward-compatible)
-    maxSessions: typeof rawMaxSessions === "number" && rawMaxSessions > 0 ? rawMaxSessions : 0,
+    maxSessions: toPositiveIntOrNull(rawMaxSessions) ?? 0,
     revokedAt: parseNullableTimestamp(record.revoked_at ?? (record as JsonRecord).revokedAt),
     expiresAt: parseNullableTimestamp(record.expires_at ?? (record as JsonRecord).expiresAt),
     ipAllowlist: parseStringList(record.ip_allowlist ?? (record as JsonRecord).ipAllowlist),
