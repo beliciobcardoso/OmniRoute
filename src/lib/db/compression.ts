@@ -1,6 +1,8 @@
 import { backupDbFile } from "./backup";
 import { getDefaultCompressionCombo } from "./compressionCombos";
 import { getDbInstance } from "./core";
+import { resolveDbDriverConfig } from "./driverConfig";
+import { ensurePostgresBootstrap, getKyselyDb } from "./kysely/client";
 import { invalidateDbCache } from "./readCache";
 import {
   ENGINE_IDS,
@@ -35,6 +37,10 @@ import {
   normalizePreserveSystemPromptMode,
 } from "@omniroute/open-sse/services/compression/preserveSystemPromptMode.ts";
 import { maybePrewarmUltraSlmOnConfig } from "@omniroute/open-sse/services/compression/ultra.ts";
+
+function isPostgres(): boolean {
+  return resolveDbDriverConfig().driver === "postgres";
+}
 
 const NAMESPACE = "compression";
 const COMPRESSION_MODES = new Set<CompressionMode>([
@@ -540,7 +546,23 @@ export async function getCompressionSettings(): Promise<CompressionConfig> {
   }
   compressionSettingsCache = null;
 
-  const rows = db.prepare("SELECT key, value FROM key_value WHERE namespace = ?").all(NAMESPACE);
+  let rows: Array<{ key: unknown; value: unknown }>;
+  if (isPostgres()) {
+    await ensurePostgresBootstrap();
+    const kdb = getKyselyDb();
+    rows = await kdb
+      .selectFrom("key_value")
+      .select(["key", "value"])
+      .where("namespace", "=", NAMESPACE)
+      .execute();
+  } else {
+    rows = db
+      .prepare("SELECT key, value FROM key_value WHERE namespace = ?")
+      .all(NAMESPACE) as Array<{
+      key: unknown;
+      value: unknown;
+    }>;
+  }
 
   const config: CompressionConfig = {
     ...DEFAULT_COMPRESSION_CONFIG,
@@ -728,26 +750,47 @@ export async function getCompressionSettings(): Promise<CompressionConfig> {
 export async function updateCompressionSettings(
   updates: Partial<CompressionConfig>
 ): Promise<CompressionConfig> {
-  const db = getDbInstance();
-  const insert = db.prepare(
-    "INSERT OR REPLACE INTO key_value (namespace, key, value) VALUES (?, ?, ?)"
-  );
+  const entries: Array<[string, unknown]> = [];
+  for (const [key, value] of Object.entries(updates)) {
+    if (value === undefined) continue;
+    // Persist the engines map as ONE sanitized JSON row so the read path always gets
+    // well-formed { enabled, level? } toggles for known engine ids.
+    entries.push([
+      key,
+      key === "engines" ? JSON.stringify(sanitizeEnginesForWrite(value)) : JSON.stringify(value),
+    ]);
+  }
 
-  const tx = db.transaction(() => {
-    for (const [key, value] of Object.entries(updates)) {
-      if (value === undefined) continue;
-      // Persist the engines map as ONE sanitized JSON row so the read path always gets
-      // well-formed { enabled, level? } toggles for known engine ids.
-      if (key === "engines") {
-        insert.run(NAMESPACE, key, JSON.stringify(sanitizeEnginesForWrite(value)));
-        continue;
+  if (isPostgres()) {
+    await ensurePostgresBootstrap();
+    const kdb = getKyselyDb();
+    await kdb.transaction().execute(async (trx) => {
+      for (const [key, value] of entries) {
+        await trx
+          .insertInto("key_value")
+          .values({ namespace: NAMESPACE, key, value: value as string })
+          .onConflict((oc) =>
+            oc.columns(["namespace", "key"]).doUpdateSet({
+              value: (eb) => eb.ref("excluded.value"),
+            })
+          )
+          .execute();
       }
-      insert.run(NAMESPACE, key, JSON.stringify(value));
-    }
-  });
+    });
+  } else {
+    const db = getDbInstance();
+    const insert = db.prepare(
+      "INSERT OR REPLACE INTO key_value (namespace, key, value) VALUES (?, ?, ?)"
+    );
+    const tx = db.transaction(() => {
+      for (const [key, value] of entries) {
+        insert.run(NAMESPACE, key, value);
+      }
+    });
+    tx();
+    backupDbFile("pre-write");
+  }
 
-  tx();
-  backupDbFile("pre-write");
   compressionSettingsCache = null;
   invalidateDbCache();
   const next = await getCompressionSettings();
@@ -768,6 +811,17 @@ function normalizeMcpAccessibilityConfig(value: unknown): McpAccessibilityConfig
 }
 
 export async function getMcpAccessibilityConfig(): Promise<McpAccessibilityConfig> {
+  if (isPostgres()) {
+    await ensurePostgresBootstrap();
+    const kdb = getKyselyDb();
+    const row = await kdb
+      .selectFrom("key_value")
+      .select("value")
+      .where("namespace", "=", NAMESPACE)
+      .where("key", "=", "mcpAccessibility")
+      .executeTakeFirst();
+    return normalizeMcpAccessibilityConfig(parseJsonSafe(row?.value ?? null));
+  }
   const db = getDbInstance();
   const row = db
     .prepare("SELECT value FROM key_value WHERE namespace = ? AND key = ?")
@@ -779,12 +833,28 @@ export async function setMcpAccessibilityConfig(
   value: Partial<McpAccessibilityConfig>
 ): Promise<void> {
   const next = normalizeMcpAccessibilityConfig({ ...DEFAULT_MCP_ACCESSIBILITY_CONFIG, ...value });
-  const db = getDbInstance();
-  db.prepare("INSERT OR REPLACE INTO key_value (namespace, key, value) VALUES (?, ?, ?)").run(
-    NAMESPACE,
-    "mcpAccessibility",
-    JSON.stringify(next)
-  );
+
+  if (isPostgres()) {
+    await ensurePostgresBootstrap();
+    const kdb = getKyselyDb();
+    await kdb
+      .insertInto("key_value")
+      .values({ namespace: NAMESPACE, key: "mcpAccessibility", value: JSON.stringify(next) })
+      .onConflict((oc) =>
+        oc.columns(["namespace", "key"]).doUpdateSet({
+          value: (eb) => eb.ref("excluded.value"),
+        })
+      )
+      .execute();
+  } else {
+    const db = getDbInstance();
+    db.prepare("INSERT OR REPLACE INTO key_value (namespace, key, value) VALUES (?, ?, ?)").run(
+      NAMESPACE,
+      "mcpAccessibility",
+      JSON.stringify(next)
+    );
+  }
+
   compressionSettingsCache = null;
   invalidateDbCache();
 }
