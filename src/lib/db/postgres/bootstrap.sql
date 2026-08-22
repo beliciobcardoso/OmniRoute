@@ -395,7 +395,7 @@ CREATE TABLE IF NOT EXISTS compression_combos (
 );
 
 CREATE TABLE IF NOT EXISTS context_handoffs (
-  id TEXT PRIMARY KEY DEFAULT 'lower(hex(randomblob(8)))',
+  id TEXT PRIMARY KEY DEFAULT (substr(md5(random()::text || clock_timestamp()::text), 1, 16)),
   session_id TEXT NOT NULL,
   combo_name TEXT NOT NULL,
   from_account TEXT NOT NULL,
@@ -408,9 +408,12 @@ CREATE TABLE IF NOT EXISTS context_handoffs (
   warning_threshold_pct DOUBLE PRECISION NOT NULL DEFAULT 0.85,
   generated_at TEXT NOT NULL,
   expires_at TEXT NOT NULL,
-  created_at TEXT NOT NULL DEFAULT 'strftime(''%Y-%m-%dT%H:%M:%SZ'', ''now'')',
+  created_at TEXT NOT NULL DEFAULT (to_char(now() AT TIME ZONE 'utc', 'YYYY-MM-DD"T"HH24:MI:SS"Z"')),
   last_model TEXT
 );
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_context_handoffs_session_combo
+  ON context_handoffs(session_id, combo_name);
 
 CREATE TABLE IF NOT EXISTS daily_usage_summary (
   id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,

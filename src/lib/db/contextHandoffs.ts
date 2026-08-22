@@ -1,4 +1,10 @@
 import { getDbInstance, rowToCamel } from "./core";
+import { resolveDbDriverConfig } from "./driverConfig";
+import { ensurePostgresBootstrap, getKyselyDb } from "./kysely/client";
+
+function isPostgres(): boolean {
+  return resolveDbDriverConfig().driver === "postgres";
+}
 
 export interface HandoffPayload {
   id?: string;
@@ -77,9 +83,50 @@ function toHandoffPayload(row: unknown): HandoffPayload | null {
   };
 }
 
-export function upsertHandoff(payload: HandoffPayload): void {
-  const db = getDbInstance() as unknown as DbLike;
+export async function upsertHandoff(payload: HandoffPayload): Promise<void> {
   const createdAt = new Date().toISOString();
+
+  if (isPostgres()) {
+    await ensurePostgresBootstrap();
+    const kdb = getKyselyDb();
+    await kdb
+      .insertInto("context_handoffs")
+      .values({
+        session_id: payload.sessionId,
+        combo_name: payload.comboName,
+        from_account: payload.fromAccount,
+        summary: payload.summary,
+        key_decisions: JSON.stringify(payload.keyDecisions),
+        task_progress: payload.taskProgress,
+        active_entities: JSON.stringify(payload.activeEntities),
+        message_count: payload.messageCount,
+        model: payload.model,
+        last_model: payload.lastModel ?? null,
+        warning_threshold_pct: payload.warningThresholdPct,
+        generated_at: payload.generatedAt,
+        expires_at: payload.expiresAt,
+        created_at: createdAt,
+      })
+      .onConflict((oc) =>
+        oc.columns(["session_id", "combo_name"]).doUpdateSet((eb) => ({
+          from_account: eb.ref("excluded.from_account"),
+          summary: eb.ref("excluded.summary"),
+          key_decisions: eb.ref("excluded.key_decisions"),
+          task_progress: eb.ref("excluded.task_progress"),
+          active_entities: eb.ref("excluded.active_entities"),
+          message_count: eb.ref("excluded.message_count"),
+          model: eb.ref("excluded.model"),
+          last_model: eb.ref("excluded.last_model"),
+          warning_threshold_pct: eb.ref("excluded.warning_threshold_pct"),
+          generated_at: eb.ref("excluded.generated_at"),
+          expires_at: eb.ref("excluded.expires_at"),
+        }))
+      )
+      .execute();
+    return;
+  }
+
+  const db = getDbInstance() as unknown as DbLike;
 
   db.prepare(
     `INSERT INTO context_handoffs
@@ -98,19 +145,18 @@ export function upsertHandoff(payload: HandoffPayload): void {
        last_model = excluded.last_model,
        warning_threshold_pct = excluded.warning_threshold_pct,
        generated_at = excluded.generated_at,
-       expires_at = excluded.expires_at,
-       created_at = excluded.created_at`
+       expires_at = excluded.expires_at`
   ).run(
     payload.sessionId,
     payload.comboName,
     payload.fromAccount,
     payload.summary,
-    JSON.stringify(payload.keyDecisions || []),
+    JSON.stringify(payload.keyDecisions),
     payload.taskProgress,
-    JSON.stringify(payload.activeEntities || []),
+    JSON.stringify(payload.activeEntities),
     payload.messageCount,
     payload.model,
-    payload.lastModel || null,
+    payload.lastModel ?? null,
     payload.warningThresholdPct,
     payload.generatedAt,
     payload.expiresAt,
@@ -118,9 +164,28 @@ export function upsertHandoff(payload: HandoffPayload): void {
   );
 }
 
-export function getHandoff(sessionId: string, comboName: string): HandoffPayload | null {
-  const db = getDbInstance() as unknown as DbLike;
+export async function getHandoff(
+  sessionId: string,
+  comboName: string
+): Promise<HandoffPayload | null> {
   const now = new Date().toISOString();
+
+  if (isPostgres()) {
+    await ensurePostgresBootstrap();
+    const kdb = getKyselyDb();
+    const row = await kdb
+      .selectFrom("context_handoffs")
+      .selectAll()
+      .where("session_id", "=", sessionId)
+      .where("combo_name", "=", comboName)
+      .where("expires_at", ">", now)
+      .orderBy("created_at", "desc")
+      .limit(1)
+      .executeTakeFirst();
+    return toHandoffPayload(row);
+  }
+
+  const db = getDbInstance() as unknown as DbLike;
   const row = db
     .prepare(
       `SELECT *
@@ -134,7 +199,18 @@ export function getHandoff(sessionId: string, comboName: string): HandoffPayload
   return toHandoffPayload(row);
 }
 
-export function deleteHandoff(sessionId: string, comboName: string): void {
+export async function deleteHandoff(sessionId: string, comboName: string): Promise<void> {
+  if (isPostgres()) {
+    await ensurePostgresBootstrap();
+    const kdb = getKyselyDb();
+    await kdb
+      .deleteFrom("context_handoffs")
+      .where("session_id", "=", sessionId)
+      .where("combo_name", "=", comboName)
+      .execute();
+    return;
+  }
+
   const db = getDbInstance() as unknown as DbLike;
   db.prepare("DELETE FROM context_handoffs WHERE session_id = ? AND combo_name = ?").run(
     sessionId,
@@ -142,22 +218,48 @@ export function deleteHandoff(sessionId: string, comboName: string): void {
   );
 }
 
-export function cleanupExpiredHandoffs(): number {
+export async function cleanupExpiredHandoffs(): Promise<number> {
   const nowMs = Date.now();
   if (nowMs - lastCleanupAt < CLEANUP_THROTTLE_MS) {
     return 0;
   }
+  const now = new Date(nowMs).toISOString();
+
+  if (isPostgres()) {
+    await ensurePostgresBootstrap();
+    const kdb = getKyselyDb();
+    const result = await kdb
+      .deleteFrom("context_handoffs")
+      .where("expires_at", "<=", now)
+      .executeTakeFirst();
+    lastCleanupAt = nowMs;
+    return Number(result.numDeletedRows ?? 0);
+  }
 
   const db = getDbInstance() as unknown as DbLike;
-  const now = new Date(nowMs).toISOString();
   const result = db.prepare("DELETE FROM context_handoffs WHERE expires_at <= ?").run(now);
   lastCleanupAt = nowMs;
   return result.changes;
 }
 
-export function hasActiveHandoff(sessionId: string, comboName: string): boolean {
-  const db = getDbInstance() as unknown as DbLike;
+export async function hasActiveHandoff(sessionId: string, comboName: string): Promise<boolean> {
   const now = new Date().toISOString();
+
+  if (isPostgres()) {
+    await ensurePostgresBootstrap();
+    const kdb = getKyselyDb();
+    const row = await kdb
+      .selectFrom("context_handoffs")
+      .select("id")
+      .where("session_id", "=", sessionId)
+      .where("combo_name", "=", comboName)
+      .where("expires_at", ">", now)
+      .limit(1)
+      .executeTakeFirst();
+    return !!row;
+  }
+
+  const db = getDbInstance() as unknown as DbLike;
   const row = db
     .prepare(
       `SELECT 1
@@ -169,6 +271,7 @@ export function hasActiveHandoff(sessionId: string, comboName: string): boolean 
 
   return !!row;
 }
+
 /**
  * Record a model usage entry for a session/combo combination.
  * Used by context-relay to track which models have been active.
@@ -179,13 +282,29 @@ export function hasActiveHandoff(sessionId: string, comboName: string): boolean 
  * @param provider - The provider identifier.
  * @param connectionId - Optional connection ID used.
  */
-export function recordSessionModelUsage(
+export async function recordSessionModelUsage(
   sessionId: string,
   comboName: string,
   modelStr: string,
   provider: string,
   connectionId?: string
-): void {
+): Promise<void> {
+  if (isPostgres()) {
+    await ensurePostgresBootstrap();
+    const kdb = getKyselyDb();
+    await kdb
+      .insertInto("session_model_history")
+      .values({
+        session_id: sessionId,
+        combo_name: comboName,
+        model_str: modelStr,
+        provider,
+        connection_id: connectionId || null,
+      })
+      .execute();
+    return;
+  }
+
   const db = getDbInstance() as unknown as DbLike;
   db.prepare(
     `INSERT INTO session_model_history
@@ -202,7 +321,25 @@ export function recordSessionModelUsage(
  * @param comboName - The combo name.
  * @returns The model string, or null if no record exists.
  */
-export function getLastSessionModel(sessionId: string, comboName: string): string | null {
+export async function getLastSessionModel(
+  sessionId: string,
+  comboName: string
+): Promise<string | null> {
+  if (isPostgres()) {
+    await ensurePostgresBootstrap();
+    const kdb = getKyselyDb();
+    const row = await kdb
+      .selectFrom("session_model_history")
+      .select("model_str")
+      .where("session_id", "=", sessionId)
+      .where("combo_name", "=", comboName)
+      .orderBy("used_at", "desc")
+      .orderBy("id", "desc")
+      .limit(1)
+      .executeTakeFirst();
+    return row?.model_str ?? null;
+  }
+
   const db = getDbInstance() as unknown as DbLike;
   const row = db
     .prepare(
@@ -224,7 +361,17 @@ export function getLastSessionModel(sessionId: string, comboName: string): strin
  * @param comboName - The combo name whose pins should be cleared.
  * @returns The number of deleted entries.
  */
-export function clearSessionModelHistoryForCombo(comboName: string): number {
+export async function clearSessionModelHistoryForCombo(comboName: string): Promise<number> {
+  if (isPostgres()) {
+    await ensurePostgresBootstrap();
+    const kdb = getKyselyDb();
+    const result = await kdb
+      .deleteFrom("session_model_history")
+      .where("combo_name", "=", comboName)
+      .executeTakeFirst();
+    return Number(result.numDeletedRows ?? 0);
+  }
+
   const db = getDbInstance() as unknown as DbLike;
   const result = db
     .prepare("DELETE FROM session_model_history WHERE combo_name = ?")

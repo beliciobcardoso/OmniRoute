@@ -230,7 +230,10 @@ function formatMessagesForPrompt(messages: MessageLike[]): string {
     .join("\n\n");
 }
 
-export function selectMessagesForSummary(messages: MessageLike[], maxMessages: number): MessageLike[] {
+export function selectMessagesForSummary(
+  messages: MessageLike[],
+  maxMessages: number
+): MessageLike[] {
   const validMessages = messages.filter((m) => m && typeof m === "object");
   const system = validMessages.filter(
     (m) => typeof m.role === "string" && (m.role === "system" || m.role === "developer")
@@ -377,7 +380,7 @@ async function generateHandoffAsync(options: {
   config?: ContextRelayConfig | null;
   handleSingleModel: (body: Record<string, unknown>, modelStr: string) => Promise<Response>;
 }): Promise<void> {
-  cleanupExpiredHandoffs();
+  await cleanupExpiredHandoffs();
 
   const relayConfig = resolveContextRelayConfig(options.config as Record<string, unknown>);
   const summaryModel = relayConfig.handoffModel || options.model;
@@ -417,7 +420,7 @@ async function generateHandoffAsync(options: {
   const parsed = parseHandoffJSON(content);
   if (!parsed) return;
 
-  upsertHandoff({
+  await upsertHandoff({
     sessionId: options.sessionId,
     comboName: options.comboName,
     fromAccount: options.connectionId,
@@ -451,28 +454,45 @@ export function maybeGenerateHandoff(options: {
   if (options.percentUsed < relayConfig.handoffThreshold) return;
   if (options.percentUsed >= HANDOFF_EXHAUSTION_THRESHOLD) return;
 
-  cleanupExpiredHandoffs();
-  if (hasActiveHandoff(options.sessionId, options.comboName)) return;
-  const inflightKey = getInflightKey(options.sessionId, options.comboName);
-  if (inflightHandoffGenerations.has(inflightKey)) return;
-  inflightHandoffGenerations.add(inflightKey);
+  const sessionId = options.sessionId;
+  const connectionId = options.connectionId;
 
-  setImmediate(() => {
-    generateHandoffAsync({
-      ...options,
-      sessionId: options.sessionId as string,
-      connectionId: options.connectionId as string,
-      config: relayConfig,
-    })
-      .catch((err) => {
-        if (process.env.NODE_ENV !== "test") {
-          console.warn("[context-relay] Handoff generation failed:", err?.message || err);
-        }
-      })
-      .finally(() => {
-        inflightHandoffGenerations.delete(inflightKey);
+  // Fire-and-forget: the pre-checks below are now async (DB reads), but this
+  // function must stay non-blocking for its caller — same discipline as the
+  // generateHandoffAsync scheduling further down.
+  void (async () => {
+    try {
+      await cleanupExpiredHandoffs();
+      if (await hasActiveHandoff(sessionId, options.comboName)) return;
+      const inflightKey = getInflightKey(sessionId, options.comboName);
+      if (inflightHandoffGenerations.has(inflightKey)) return;
+      inflightHandoffGenerations.add(inflightKey);
+
+      setImmediate(() => {
+        generateHandoffAsync({
+          ...options,
+          sessionId,
+          connectionId,
+          config: relayConfig,
+        })
+          .catch((err) => {
+            if (process.env.NODE_ENV !== "test") {
+              console.warn("[context-relay] Handoff generation failed:", err?.message || err);
+            }
+          })
+          .finally(() => {
+            inflightHandoffGenerations.delete(inflightKey);
+          });
       });
-  });
+    } catch (err) {
+      if (process.env.NODE_ENV !== "test") {
+        console.warn(
+          "[context-relay] Handoff pre-check failed:",
+          err instanceof Error ? err.message : err
+        );
+      }
+    }
+  })();
 }
 
 export function buildHandoffSystemMessage(payload: HandoffPayload): string {
@@ -582,20 +602,20 @@ Continue seamlessly from where the session left off.`;
  *          "inject"  - handoff already exists, just inject it
  *          "skip"    - no handoff needed
  */
-export function shouldGenerateUniversalHandoff(options: {
+export async function shouldGenerateUniversalHandoff(options: {
   sessionId: string | null;
   comboName: string;
   previousModel: string | null;
   currentModel: string;
   universalConfig: UniversalHandoffConfig;
-}): "generate" | "inject" | "skip" {
+}): Promise<"generate" | "inject" | "skip"> {
   if (!options.universalConfig.enabled) return "skip";
   if (!options.previousModel) return "skip";
   if (options.previousModel === options.currentModel) return "skip";
 
   // Check if handoff already exists for this session/combo
   if (options.sessionId) {
-    const existing = getHandoff(options.sessionId, options.comboName);
+    const existing = await getHandoff(options.sessionId, options.comboName);
     if (existing && existing.summary) return "inject";
   }
 
@@ -654,7 +674,7 @@ async function generateUniversalHandoffAsync(options: {
   const parsed = parseHandoffJSON(content);
   if (!parsed) return;
 
-  upsertHandoff({
+  await upsertHandoff({
     sessionId: options.sessionId,
     comboName: options.comboName,
     fromAccount: `universal:${options.prevModel}`,
@@ -680,45 +700,61 @@ export function maybeGenerateUniversalHandoff(options: {
   universalConfig: UniversalHandoffConfig;
   handleSingleModel: (body: Record<string, unknown>, modelStr: string) => Promise<Response>;
 }): void {
-  const decision = shouldGenerateUniversalHandoff({
-    sessionId: options.sessionId,
-    comboName: options.comboName,
-    previousModel: options.prevModel,
-    currentModel: options.currModel,
-    universalConfig: options.universalConfig,
-  });
+  const sessionId = options.sessionId;
 
-  if (decision !== "generate") return;
-  if (!options.sessionId) return;
-
-  const inflightKey = getInflightKey(options.sessionId, options.comboName);
-  if (inflightHandoffGenerations.has(inflightKey)) return;
-  inflightHandoffGenerations.add(inflightKey);
-
-  const ttlMs = (options.universalConfig.ttlMinutes || 300) * 60 * 1000;
-
-  setImmediate(() => {
-    generateUniversalHandoffAsync({
-      sessionId: options.sessionId as string,
-      comboName: options.comboName,
-      messages: options.messages,
-      prevModel: options.prevModel || "unknown",
-      currModel: options.currModel,
-      handoffModel: options.universalConfig.handoffModel || options.currModel,
-      ttlMs,
-      maxMessages: options.universalConfig.maxMessagesForSummary,
-      providerAllowlist: options.universalConfig.providerAllowlist,
-      handleSingleModel: options.handleSingleModel,
-    })
-      .catch((err) => {
-        if (process.env.NODE_ENV !== "test") {
-          console.warn("[universal-handoff] Generation failed:", err?.message || err);
-        }
-      })
-      .finally(() => {
-        inflightHandoffGenerations.delete(inflightKey);
+  // Fire-and-forget: shouldGenerateUniversalHandoff's DB read is now async, but
+  // this function must stay non-blocking for its caller (same discipline as
+  // maybeGenerateHandoff above).
+  void (async () => {
+    try {
+      const decision = await shouldGenerateUniversalHandoff({
+        sessionId,
+        comboName: options.comboName,
+        previousModel: options.prevModel,
+        currentModel: options.currModel,
+        universalConfig: options.universalConfig,
       });
-  });
+
+      if (decision !== "generate") return;
+      if (!sessionId) return;
+
+      const inflightKey = getInflightKey(sessionId, options.comboName);
+      if (inflightHandoffGenerations.has(inflightKey)) return;
+      inflightHandoffGenerations.add(inflightKey);
+
+      const ttlMs = (options.universalConfig.ttlMinutes || 300) * 60 * 1000;
+
+      setImmediate(() => {
+        generateUniversalHandoffAsync({
+          sessionId,
+          comboName: options.comboName,
+          messages: options.messages,
+          prevModel: options.prevModel || "unknown",
+          currModel: options.currModel,
+          handoffModel: options.universalConfig.handoffModel || options.currModel,
+          ttlMs,
+          maxMessages: options.universalConfig.maxMessagesForSummary,
+          providerAllowlist: options.universalConfig.providerAllowlist,
+          handleSingleModel: options.handleSingleModel,
+        })
+          .catch((err) => {
+            if (process.env.NODE_ENV !== "test") {
+              console.warn("[universal-handoff] Generation failed:", err?.message || err);
+            }
+          })
+          .finally(() => {
+            inflightHandoffGenerations.delete(inflightKey);
+          });
+      });
+    } catch (err) {
+      if (process.env.NODE_ENV !== "test") {
+        console.warn(
+          "[universal-handoff] Pre-check failed:",
+          err instanceof Error ? err.message : err
+        );
+      }
+    }
+  })();
 }
 
 export function injectUniversalHandoffBody(
