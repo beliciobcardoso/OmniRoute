@@ -407,7 +407,7 @@ export async function buildComboForecastResponse(opts: {
   );
   const onlyComboName = comboNames.size === 1 ? Array.from(comboNames)[0] : undefined;
   const usageRows = await attachCosts(
-    getComboForecastUsageRows({ since, comboName: onlyComboName })
+    await getComboForecastUsageRows({ since, comboName: onlyComboName })
   );
   const rowsByCombo = new Map<string, CostedUsageRow[]>();
   for (const row of usageRows) {
