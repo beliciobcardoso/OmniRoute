@@ -293,6 +293,9 @@ export async function registerNodejs(): Promise<void> {
     );
     startSessionAccountAffinityCleanup();
 
+    const { ensureParamFilterCacheLoaded } = await import("@/lib/db/paramFilters");
+    await ensureParamFilterCacheLoaded();
+
     const migration = await migrateCodexConnectionDefaultsFromLegacySettings();
     if (migration.migrated) {
       console.log(

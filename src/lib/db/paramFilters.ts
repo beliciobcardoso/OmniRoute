@@ -3,9 +3,21 @@
  *
  * CRUD against the key_value table under namespace "provider_param_filters".
  * Follows the established key_value pattern from databaseSettings.ts.
+ *
+ * Read access (getParamFilterConfig/isAutoLearnGloballyEnabled) is on the hot
+ * dispatch path (open-sse/executors/base.ts, translator/paramSupport.ts) and
+ * must stay synchronous — it reads from an in-memory cache that is warmed
+ * asynchronously at startup (see ensureParamFilterCacheLoaded, called from
+ * src/instrumentation-node.ts) and refreshed after every write.
  */
 
 import { getDbInstance } from "./core";
+import { resolveDbDriverConfig } from "./driverConfig";
+import { ensurePostgresBootstrap, getKyselyDb } from "./kysely/client";
+
+function isPostgres(): boolean {
+  return resolveDbDriverConfig().driver === "postgres";
+}
 
 const NAMESPACE = "provider_param_filters";
 
@@ -31,11 +43,6 @@ export interface ProviderParamFilter {
 
 let filterCache: Map<string, ProviderParamFilter> | null = null;
 let cacheGeneration = 0;
-
-function bumpCacheGeneration(): void {
-  cacheGeneration++;
-  filterCache = null;
-}
 
 // ── Helpers ─────────────────────────────────────────────────────────────────
 
@@ -92,11 +99,21 @@ function toProviderParamFilter(raw: unknown): ProviderParamFilter | null {
 
 // ── Read ────────────────────────────────────────────────────────────────────
 
-function readNamespace(namespace: string): Record<string, unknown> {
-  const db = getDbInstance();
-  const rows = db
-    .prepare("SELECT key, value FROM key_value WHERE namespace = ?")
-    .all(namespace) as Array<{ key: string; value: string }>;
+async function readNamespace(namespace: string): Promise<Record<string, unknown>> {
+  let rows: Array<{ key: string; value: string }>;
+
+  if (isPostgres()) {
+    await ensurePostgresBootstrap();
+    rows = (await getKyselyDb()
+      .selectFrom("key_value")
+      .select(["key", "value"])
+      .where("namespace", "=", namespace)
+      .execute()) as Array<{ key: string; value: string }>;
+  } else {
+    rows = getDbInstance()
+      .prepare("SELECT key, value FROM key_value WHERE namespace = ?")
+      .all(namespace) as Array<{ key: string; value: string }>;
+  }
 
   const values: Record<string, unknown> = {};
   for (const row of rows) {
@@ -105,8 +122,8 @@ function readNamespace(namespace: string): Record<string, unknown> {
   return values;
 }
 
-function loadAllConfigs(): Map<string, ProviderParamFilter> {
-  const raw = readNamespace(NAMESPACE);
+async function loadAllConfigs(): Promise<Map<string, ProviderParamFilter>> {
+  const raw = await readNamespace(NAMESPACE);
   const map = new Map<string, ProviderParamFilter>();
   for (const [key, value] of Object.entries(raw)) {
     const parsed = toProviderParamFilter(value);
@@ -120,35 +137,42 @@ function loadAllConfigs(): Map<string, ProviderParamFilter> {
 // ── Public API ──────────────────────────────────────────────────────────────
 
 /**
- * Warm the cache on module load so the first call to getParamFilterConfig
- * does not hit the DB. Idempotent — subsequent calls return the cached map.
+ * Warm (or re-warm) the in-memory cache from the DB. Call once at startup
+ * (src/instrumentation-node.ts) before serving traffic, and after every write
+ * in this module so the hot-path sync readers below see fresh data.
  */
-export function loadParamFilterConfigs(): Map<string, ProviderParamFilter> {
-  if (filterCache === null) {
-    filterCache = loadAllConfigs();
-  }
+export async function ensureParamFilterCacheLoaded(): Promise<Map<string, ProviderParamFilter>> {
+  filterCache = await loadAllConfigs();
   return filterCache;
 }
 
 /**
+ * Synchronous hot-path read. Returns the cached map, which is empty (not
+ * null) once ensureParamFilterCacheLoaded() has resolved at least once; a
+ * lookup before startup warm-up completes returns an empty map (same
+ * behavior as "no filters configured yet").
+ */
+function loadParamFilterConfigsSync(): Map<string, ProviderParamFilter> {
+  return filterCache ?? new Map();
+}
+
+/**
  * Get the param filter config for a single provider, or null if not configured.
- * Uses an in-memory cache refreshed on write.
+ * Reads the in-memory cache — see module doc for why this stays synchronous.
  */
 export function getParamFilterConfig(provider: string): ProviderParamFilter | null {
-  return toNormalizedString(provider) ? (loadParamFilterConfigs().get(provider) ?? null) : null;
+  return toNormalizedString(provider) ? (loadParamFilterConfigsSync().get(provider) ?? null) : null;
 }
 
 /**
  * Upsert the entire param filter config for a provider.
- * Invalidates the in-memory cache.
+ * Refreshes the in-memory cache before returning.
  */
-export function setParamFilterConfig(provider: string, config: ProviderParamFilter): void {
+export async function setParamFilterConfig(
+  provider: string,
+  config: ProviderParamFilter
+): Promise<void> {
   if (!toNormalizedString(provider)) return;
-
-  const db = getDbInstance();
-  const stmt = db.prepare(
-    "INSERT OR REPLACE INTO key_value (namespace, key, value) VALUES (?, ?, ?)"
-  );
 
   // Normalize the filter before persisting
   const normalized: ProviderParamFilter = {
@@ -157,22 +181,47 @@ export function setParamFilterConfig(provider: string, config: ProviderParamFilt
     autoLearn: config.autoLearn ?? false,
     models: config.models && Object.keys(config.models).length > 0 ? config.models : undefined,
   };
+  const value = JSON.stringify(normalized);
 
-  stmt.run(NAMESPACE, provider, JSON.stringify(normalized));
-  bumpCacheGeneration();
+  if (isPostgres()) {
+    await ensurePostgresBootstrap();
+    await getKyselyDb()
+      .insertInto("key_value")
+      .values({ namespace: NAMESPACE, key: provider, value })
+      .onConflict((oc) => oc.columns(["namespace", "key"]).doUpdateSet({ value }))
+      .execute();
+  } else {
+    getDbInstance()
+      .prepare("INSERT OR REPLACE INTO key_value (namespace, key, value) VALUES (?, ?, ?)")
+      .run(NAMESPACE, provider, value);
+  }
+
+  cacheGeneration++;
+  await ensureParamFilterCacheLoaded();
 }
 
 /**
  * Delete the param filter config for a provider.
  * Resets to no filtering for that provider.
  */
-export function deleteParamFilterConfig(provider: string): void {
+export async function deleteParamFilterConfig(provider: string): Promise<void> {
   if (!toNormalizedString(provider)) return;
 
-  const db = getDbInstance();
-  const stmt = db.prepare("DELETE FROM key_value WHERE namespace = ? AND key = ?");
-  stmt.run(NAMESPACE, provider);
-  bumpCacheGeneration();
+  if (isPostgres()) {
+    await ensurePostgresBootstrap();
+    await getKyselyDb()
+      .deleteFrom("key_value")
+      .where("namespace", "=", NAMESPACE)
+      .where("key", "=", provider)
+      .execute();
+  } else {
+    getDbInstance()
+      .prepare("DELETE FROM key_value WHERE namespace = ? AND key = ?")
+      .run(NAMESPACE, provider);
+  }
+
+  cacheGeneration++;
+  await ensureParamFilterCacheLoaded();
 }
 
 // ── Global auto-learn flag ──────────────────────────────────────────────────
@@ -195,9 +244,9 @@ export function isAutoLearnGloballyEnabled(): boolean {
  * When enabled, the per-provider autoLearn flag is still honored after
  * the global check (either being on is sufficient to trigger auto-learn).
  */
-export function setGlobalAutoLearnEnabled(enabled: boolean): void {
+export async function setGlobalAutoLearnEnabled(enabled: boolean): Promise<void> {
   const existing = getParamFilterConfig(GLOBAL_AUTOLEARN_KEY);
-  setParamFilterConfig(GLOBAL_AUTOLEARN_KEY, {
+  await setParamFilterConfig(GLOBAL_AUTOLEARN_KEY, {
     block: existing?.block ?? [],
     allow: existing?.allow ?? [],
     autoLearn: enabled,
@@ -209,7 +258,11 @@ export function setGlobalAutoLearnEnabled(enabled: boolean): void {
  * If the field is already in the block list (or the config does not exist),
  * this is a no-op. Optionally scoped to a specific model.
  */
-export function addParamToBlocklist(provider: string, paramName: string, model?: string): void {
+export async function addParamToBlocklist(
+  provider: string,
+  paramName: string,
+  model?: string
+): Promise<void> {
   if (!toNormalizedString(provider) || !toNormalizedString(paramName)) return;
 
   const existing = getParamFilterConfig(provider) ?? {
@@ -234,5 +287,5 @@ export function addParamToBlocklist(provider: string, paramName: string, model?:
     existing.block = [...existing.block, paramName];
   }
 
-  setParamFilterConfig(provider, existing);
+  await setParamFilterConfig(provider, existing);
 }

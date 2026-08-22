@@ -1284,7 +1284,7 @@ export class BaseExecutor {
                 const shouldAutoLearn = isAutoLearnGloballyEnabled() || config?.autoLearn === true;
                 if (shouldAutoLearn) {
                   strippedFields.add(autoLearned);
-                  addParamToBlocklist(this.provider, autoLearned, model);
+                  await addParamToBlocklist(this.provider, autoLearned, model);
                   delete (transformedBody as Record<string, unknown>)[autoLearned];
                   let retryBody = JSON.stringify(transformedBody);
                   if (isClaudeCodeCompatible(this.provider) || this.provider === "claude") {

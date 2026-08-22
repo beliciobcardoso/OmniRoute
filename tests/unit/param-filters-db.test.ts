@@ -15,7 +15,7 @@ const {
   setParamFilterConfig,
   getParamFilterConfig,
   deleteParamFilterConfig,
-  loadParamFilterConfigs,
+  ensureParamFilterCacheLoaded,
   addParamToBlocklist,
   isAutoLearnGloballyEnabled,
   setGlobalAutoLearnEnabled,
@@ -31,13 +31,13 @@ test.after(() => {
 // setParamFilterConfig / getParamFilterConfig
 // ---------------------------------------------------------------------------
 
-test("setParamFilterConfig stores and getParamFilterConfig retrieves a config", () => {
+test("setParamFilterConfig stores and getParamFilterConfig retrieves a config", async () => {
   const config = {
     block: ["thinking", "reasoning_budget"],
     allow: [],
     autoLearn: true,
   };
-  setParamFilterConfig("test-provider", config);
+  await setParamFilterConfig("test-provider", config);
   const retrieved = getParamFilterConfig("test-provider");
   assert.notEqual(retrieved, null);
   assert.deepEqual(retrieved!.block, ["thinking", "reasoning_budget"]);
@@ -45,15 +45,15 @@ test("setParamFilterConfig stores and getParamFilterConfig retrieves a config", 
   assert.equal(retrieved!.autoLearn, true);
 });
 
-test("getParamFilterConfig returns null for unconfigured provider", () => {
+test("getParamFilterConfig returns null for unconfigured provider", async () => {
   assert.equal(getParamFilterConfig("nonexistent"), null);
 });
 
-test("getParamFilterConfig returns null for empty provider", () => {
+test("getParamFilterConfig returns null for empty provider", async () => {
   assert.equal(getParamFilterConfig(""), null);
 });
 
-test("setParamFilterConfig with model overrides stores correctly", () => {
+test("setParamFilterConfig with model overrides stores correctly", async () => {
   const config = {
     block: ["thinking"],
     allow: [],
@@ -63,7 +63,7 @@ test("setParamFilterConfig with model overrides stores correctly", () => {
     },
     autoLearn: false,
   };
-  setParamFilterConfig("nvidia", config);
+  await setParamFilterConfig("nvidia", config);
   const retrieved = getParamFilterConfig("nvidia");
   assert.notEqual(retrieved, null);
   assert.deepEqual(retrieved!.models?.["deepseek-r1"]?.block, ["max_tokens"]);
@@ -75,25 +75,25 @@ test("setParamFilterConfig with model overrides stores correctly", () => {
 // deleteParamFilterConfig
 // ---------------------------------------------------------------------------
 
-test("deleteParamFilterConfig removes config and getParamFilterConfig returns null", () => {
-  setParamFilterConfig("ephemeral", { block: ["param1"], allow: [], autoLearn: false });
+test("deleteParamFilterConfig removes config and getParamFilterConfig returns null", async () => {
+  await setParamFilterConfig("ephemeral", { block: ["param1"], allow: [], autoLearn: false });
   assert.notEqual(getParamFilterConfig("ephemeral"), null);
-  deleteParamFilterConfig("ephemeral");
+  await deleteParamFilterConfig("ephemeral");
   assert.equal(getParamFilterConfig("ephemeral"), null);
 });
 
-test("deleteParamFilterConfig is a no-op for unconfigured provider", () => {
-  deleteParamFilterConfig("nothing-here");
+test("deleteParamFilterConfig is a no-op for unconfigured provider", async () => {
+  await deleteParamFilterConfig("nothing-here");
 });
 
 // ---------------------------------------------------------------------------
 // loadParamFilterConfigs
 // ---------------------------------------------------------------------------
 
-test("loadParamFilterConfigs returns all configured providers", () => {
-  setParamFilterConfig("provider-a", { block: ["a"], allow: [], autoLearn: false });
-  setParamFilterConfig("provider-b", { block: ["b"], allow: [], autoLearn: true });
-  const all = loadParamFilterConfigs();
+test("loadParamFilterConfigs returns all configured providers", async () => {
+  await setParamFilterConfig("provider-a", { block: ["a"], allow: [], autoLearn: false });
+  await setParamFilterConfig("provider-b", { block: ["b"], allow: [], autoLearn: true });
+  const all = await ensureParamFilterCacheLoaded();
   assert.equal(all.has("provider-a"), true);
   assert.equal(all.has("provider-b"), true);
   assert.equal(all.get("provider-a")!.block[0], "a");
@@ -104,32 +104,32 @@ test("loadParamFilterConfigs returns all configured providers", () => {
 // addParamToBlocklist
 // ---------------------------------------------------------------------------
 
-test("addParamToBlocklist adds param to provider-level block list", () => {
-  setParamFilterConfig("test", { block: ["thinking"], allow: [], autoLearn: false });
-  addParamToBlocklist("test", "reasoning_budget");
+test("addParamToBlocklist adds param to provider-level block list", async () => {
+  await setParamFilterConfig("test", { block: ["thinking"], allow: [], autoLearn: false });
+  await addParamToBlocklist("test", "reasoning_budget");
   const config = getParamFilterConfig("test");
   assert.deepEqual(config!.block, ["thinking", "reasoning_budget"]);
 });
 
-test("addParamToBlocklist is idempotent — does not add duplicate", () => {
-  setParamFilterConfig("test-dup", { block: ["thinking"], allow: [], autoLearn: false });
-  addParamToBlocklist("test-dup", "thinking");
-  addParamToBlocklist("test-dup", "thinking");
+test("addParamToBlocklist is idempotent — does not add duplicate", async () => {
+  await setParamFilterConfig("test-dup", { block: ["thinking"], allow: [], autoLearn: false });
+  await addParamToBlocklist("test-dup", "thinking");
+  await addParamToBlocklist("test-dup", "thinking");
   const config = getParamFilterConfig("test-dup");
   assert.deepEqual(config!.block, ["thinking"]);
 });
 
-test("addParamToBlocklist creates config if none exists", () => {
-  addParamToBlocklist("fresh-provider", "thinking");
+test("addParamToBlocklist creates config if none exists", async () => {
+  await addParamToBlocklist("fresh-provider", "thinking");
   const config = getParamFilterConfig("fresh-provider");
   assert.notEqual(config, null);
   assert.deepEqual(config!.block, ["thinking"]);
   assert.equal(config!.autoLearn, false);
 });
 
-test("addParamToBlocklist with model param adds to model-level block list", () => {
-  setParamFilterConfig("test-model", { block: [], allow: [], autoLearn: false });
-  addParamToBlocklist("test-model", "temperature", "deepseek-r1");
+test("addParamToBlocklist with model param adds to model-level block list", async () => {
+  await setParamFilterConfig("test-model", { block: [], allow: [], autoLearn: false });
+  await addParamToBlocklist("test-model", "temperature", "deepseek-r1");
   const config = getParamFilterConfig("test-model");
   assert.deepEqual(config!.models?.["deepseek-r1"]?.block, ["temperature"]);
 });
@@ -138,25 +138,29 @@ test("addParamToBlocklist with model param adds to model-level block list", () =
 // Global auto-learn flag
 // ---------------------------------------------------------------------------
 
-test("isAutoLearnGloballyEnabled returns false by default", () => {
+test("isAutoLearnGloballyEnabled returns false by default", async () => {
   assert.equal(isAutoLearnGloballyEnabled(), false);
 });
 
-test("setGlobalAutoLearnEnabled(true) enables global auto-learn", () => {
-  setGlobalAutoLearnEnabled(true);
+test("await setGlobalAutoLearnEnabled(true) enables global auto-learn", async () => {
+  await setGlobalAutoLearnEnabled(true);
   assert.equal(isAutoLearnGloballyEnabled(), true);
 });
 
-test("setGlobalAutoLearnEnabled(false) disables global auto-learn", () => {
-  setGlobalAutoLearnEnabled(true);
+test("await setGlobalAutoLearnEnabled(false) disables global auto-learn", async () => {
+  await setGlobalAutoLearnEnabled(true);
   assert.equal(isAutoLearnGloballyEnabled(), true);
-  setGlobalAutoLearnEnabled(false);
+  await setGlobalAutoLearnEnabled(false);
   assert.equal(isAutoLearnGloballyEnabled(), false);
 });
 
-test("setGlobalAutoLearnEnabled does not affect per-provider configs", () => {
-  setParamFilterConfig("test-global-safe", { block: ["thinking"], allow: [], autoLearn: false });
-  setGlobalAutoLearnEnabled(true);
+test("setGlobalAutoLearnEnabled does not affect per-provider configs", async () => {
+  await setParamFilterConfig("test-global-safe", {
+    block: ["thinking"],
+    allow: [],
+    autoLearn: false,
+  });
+  await setGlobalAutoLearnEnabled(true);
   const config = getParamFilterConfig("test-global-safe");
   assert.deepEqual(config!.block, ["thinking"]);
   assert.equal(config!.autoLearn, false);
@@ -168,13 +172,13 @@ test("setGlobalAutoLearnEnabled does not affect per-provider configs", () => {
 // Full pipeline: DB config → stripUnsupportedParams
 // ---------------------------------------------------------------------------
 
-test("stripUnsupportedParams strips config-driven provider-level denylist", () => {
-  setParamFilterConfig("nvidia", {
+test("stripUnsupportedParams strips config-driven provider-level denylist", async () => {
+  await setParamFilterConfig("nvidia", {
     block: ["thinking", "reasoning_budget"],
     allow: [],
     autoLearn: false,
   });
-  loadParamFilterConfigs();
+  await ensureParamFilterCacheLoaded();
 
   const body = { model: "deepseek-r1", thinking: "enabled", max_tokens: 100 };
   const result = stripUnsupportedParams("nvidia", "deepseek-r1", body);
@@ -183,14 +187,14 @@ test("stripUnsupportedParams strips config-driven provider-level denylist", () =
   assert.equal((result as Record<string, unknown>).max_tokens, 100);
 });
 
-test("stripUnsupportedParams strips config-driven model-level denylist (stricter)", () => {
-  setParamFilterConfig("nvidia", {
+test("stripUnsupportedParams strips config-driven model-level denylist (stricter)", async () => {
+  await setParamFilterConfig("nvidia", {
     block: ["thinking"],
     allow: [],
     models: { "deepseek-r1": { block: ["max_tokens"] } },
     autoLearn: false,
   });
-  loadParamFilterConfigs();
+  await ensureParamFilterCacheLoaded();
 
   const body = { model: "deepseek-r1", thinking: "enabled", max_tokens: 100, temperature: 0.7 };
   const result = stripUnsupportedParams("nvidia", "deepseek-r1", body);
@@ -199,13 +203,13 @@ test("stripUnsupportedParams strips config-driven model-level denylist (stricter
   assert.equal((result as Record<string, unknown>).temperature, 0.7);
 });
 
-test("stripUnsupportedParams allowlist restores a denied param from original body", () => {
-  setParamFilterConfig("nvidia", {
+test("stripUnsupportedParams allowlist restores a denied param from original body", async () => {
+  await setParamFilterConfig("nvidia", {
     block: ["thinking", "reasoning_budget"],
     allow: ["thinking"],
     autoLearn: false,
   });
-  loadParamFilterConfigs();
+  await ensureParamFilterCacheLoaded();
 
   const body = { model: "deepseek-r1", thinking: "enabled", max_tokens: 100 };
   const result = stripUnsupportedParams("nvidia", "deepseek-r1", body);
@@ -214,27 +218,27 @@ test("stripUnsupportedParams allowlist restores a denied param from original bod
   assert.equal((result as Record<string, unknown>).max_tokens, 100);
 });
 
-test("stripUnsupportedParams allowlist does not introduce params not in original body", () => {
-  setParamFilterConfig("nvidia", {
+test("stripUnsupportedParams allowlist does not introduce params not in original body", async () => {
+  await setParamFilterConfig("nvidia", {
     block: [],
     allow: ["nonexistent_param"],
     autoLearn: false,
   });
-  loadParamFilterConfigs();
+  await ensureParamFilterCacheLoaded();
 
   const body = { model: "deepseek-r1", thinking: "enabled" };
   const result = stripUnsupportedParams("nvidia", "deepseek-r1", body);
   assert.equal((result as Record<string, unknown>).nonexistent_param, undefined);
 });
 
-test("stripUnsupportedParams model-level denylist overrides provider-level allowlist", () => {
-  setParamFilterConfig("nvidia", {
+test("stripUnsupportedParams model-level denylist overrides provider-level allowlist", async () => {
+  await setParamFilterConfig("nvidia", {
     block: ["thinking"],
     allow: ["thinking"],
     models: { "deepseek-r1": { block: ["thinking"] } },
     autoLearn: false,
   });
-  loadParamFilterConfigs();
+  await ensureParamFilterCacheLoaded();
 
   // Provider allowlist re-adds thinking, but model-level denylist strips it again
   const body = { model: "deepseek-r1", thinking: "enabled", max_tokens: 100 };
@@ -247,7 +251,7 @@ test("stripUnsupportedParams model-level denylist overrides provider-level allow
   assert.equal((result as Record<string, unknown>).max_tokens, 100);
 });
 
-test("stripUnsupportedParams no-op when no DB config exists (default behavior)", () => {
+test("stripUnsupportedParams no-op when no DB config exists (default behavior)", async () => {
   const body = { model: "deepseek-r1", thinking: "enabled", max_tokens: 100 };
   const result = stripUnsupportedParams("unknown", "deepseek-r1", body);
   assert.equal((result as Record<string, unknown>).thinking, "enabled");

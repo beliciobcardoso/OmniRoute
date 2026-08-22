@@ -50,7 +50,7 @@ export async function PUT(request: Request, { params }: { params: Promise<{ id: 
     }
     const { block, allow, models, autoLearn } = validation.data;
 
-    setParamFilterConfig(id, {
+    await setParamFilterConfig(id, {
       block: block ?? [],
       allow: allow ?? [],
       models,
@@ -72,7 +72,7 @@ export async function DELETE(request: Request, { params }: { params: Promise<{ i
 
   try {
     const { id } = await params;
-    deleteParamFilterConfig(id);
+    await deleteParamFilterConfig(id);
     return NextResponse.json({ success: true });
   } catch (error) {
     return NextResponse.json(buildErrorBody(500, sanitizeErrorMessage(error)), { status: 500 });
