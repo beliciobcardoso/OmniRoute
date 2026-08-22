@@ -377,7 +377,7 @@ export function getTerminalBatches(): BatchRecord[] {
   return rows.map((row) => parseBatchRow(row));
 }
 
-export function deleteBatch(id: string): boolean {
+export async function deleteBatch(id: string): Promise<boolean> {
   const db = getDbInstance();
   const batch = getBatch(id);
   if (!batch) return false;
@@ -387,21 +387,21 @@ export function deleteBatch(id: string): boolean {
   // Soft-delete associated files (input, output, error)
   if (batch.inputFileId) {
     try {
-      deleteFile(batch.inputFileId);
+      await deleteFile(batch.inputFileId);
     } catch {
       /* ignore */
     }
   }
   if (batch.outputFileId) {
     try {
-      deleteFile(batch.outputFileId);
+      await deleteFile(batch.outputFileId);
     } catch {
       /* ignore */
     }
   }
   if (batch.errorFileId) {
     try {
-      deleteFile(batch.errorFileId);
+      await deleteFile(batch.errorFileId);
     } catch {
       /* ignore */
     }
@@ -411,7 +411,10 @@ export function deleteBatch(id: string): boolean {
   return result.changes > 0;
 }
 
-export function deleteCompletedBatches(): { deletedBatches: number; deletedFiles: number } {
+export async function deleteCompletedBatches(): Promise<{
+  deletedBatches: number;
+  deletedFiles: number;
+}> {
   const db = getDbInstance();
 
   // Collect unique file IDs from all completed batches
@@ -435,7 +438,7 @@ export function deleteCompletedBatches(): { deletedBatches: number; deletedFiles
   let deletedFiles = 0;
   for (const fid of fileIds) {
     try {
-      if (deleteFile(fid)) deletedFiles++;
+      if (await deleteFile(fid)) deletedFiles++;
     } catch {
       /* ignore */
     }

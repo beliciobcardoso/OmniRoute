@@ -1,6 +1,12 @@
 import { getDbInstance, rowToCamel, objToSnake } from "./core";
 import { v4 as uuidv4 } from "uuid";
 import { DEFAULT_BATCH_EXPIRATION_SECONDS } from "@/shared/constants/batch";
+import { resolveDbDriverConfig } from "./driverConfig";
+import { ensurePostgresBootstrap, getKyselyDb } from "./kysely/client";
+
+function isPostgres(): boolean {
+  return resolveDbDriverConfig().driver === "postgres";
+}
 
 export interface FileRecord {
   id: string;
@@ -18,8 +24,7 @@ export interface FileRecord {
 const FILE_METADATA_COLUMNS =
   "id, bytes, created_at, filename, purpose, mime_type, api_key_id, expires_at, deleted_at";
 
-export function createFile(file: Omit<FileRecord, "id" | "createdAt">): FileRecord {
-  const db = getDbInstance();
+export async function createFile(file: Omit<FileRecord, "id" | "createdAt">): Promise<FileRecord> {
   const id = "file-" + uuidv4().replaceAll("-", "").substring(0, 24);
   const createdAt = Math.floor(Date.now() / 1000);
 
@@ -42,6 +47,27 @@ export function createFile(file: Omit<FileRecord, "id" | "createdAt">): FileReco
     deletedAt: null,
   };
 
+  if (isPostgres()) {
+    await ensurePostgresBootstrap();
+    await getKyselyDb()
+      .insertInto("files")
+      .values({
+        id: record.id,
+        bytes: record.bytes,
+        created_at: record.createdAt,
+        filename: record.filename,
+        purpose: record.purpose,
+        content: record.content,
+        mime_type: record.mimeType,
+        api_key_id: record.apiKeyId,
+        expires_at: record.expiresAt,
+        deleted_at: record.deletedAt,
+      })
+      .execute();
+    return record;
+  }
+
+  const db = getDbInstance();
   db.prepare(
     `
     INSERT INTO files (id, bytes, created_at, filename, purpose, content, mime_type, api_key_id, expires_at, deleted_at)
@@ -63,7 +89,28 @@ export function createFile(file: Omit<FileRecord, "id" | "createdAt">): FileReco
   return record;
 }
 
-export function getFile(id: string): FileRecord | null {
+export async function getFile(id: string): Promise<FileRecord | null> {
+  if (isPostgres()) {
+    await ensurePostgresBootstrap();
+    const row = await getKyselyDb()
+      .selectFrom("files")
+      .select([
+        "id",
+        "bytes",
+        "created_at",
+        "filename",
+        "purpose",
+        "mime_type",
+        "api_key_id",
+        "expires_at",
+        "deleted_at",
+      ])
+      .where("id", "=", id)
+      .where("deleted_at", "is", null)
+      .executeTakeFirst();
+    return row ? (rowToCamel(row) as unknown as FileRecord) : null;
+  }
+
   const db = getDbInstance();
   const row = db
     .prepare(`SELECT ${FILE_METADATA_COLUMNS} FROM files WHERE id = ? AND deleted_at IS NULL`)
@@ -71,7 +118,19 @@ export function getFile(id: string): FileRecord | null {
   return row ? (rowToCamel(row) as unknown as FileRecord) : null;
 }
 
-export function getFileContent(id: string): Buffer | null {
+export async function getFileContent(id: string): Promise<Buffer | null> {
+  if (isPostgres()) {
+    await ensurePostgresBootstrap();
+    const row = await getKyselyDb()
+      .selectFrom("files")
+      .select(["content"])
+      .where("id", "=", id)
+      .where("deleted_at", "is", null)
+      .executeTakeFirst();
+    if (!row?.content) return null;
+    return Buffer.isBuffer(row.content) ? row.content : Buffer.from(row.content);
+  }
+
   const db = getDbInstance();
   const row = db
     .prepare("SELECT content FROM files WHERE id = ? AND deleted_at IS NULL")
@@ -80,7 +139,7 @@ export function getFileContent(id: string): Buffer | null {
   return Buffer.isBuffer(row.content) ? row.content : Buffer.from(row.content);
 }
 
-export function listFiles(
+export async function listFiles(
   options: {
     apiKeyId?: string;
     purpose?: string;
@@ -88,10 +147,60 @@ export function listFiles(
     after?: string;
     order?: "asc" | "desc";
   } = {}
-): FileRecord[] {
-  const db = getDbInstance();
+): Promise<FileRecord[]> {
   const { apiKeyId, purpose, limit = 20, after, order = "desc" } = options;
 
+  if (isPostgres()) {
+    await ensurePostgresBootstrap();
+    let query = getKyselyDb()
+      .selectFrom("files")
+      .select([
+        "id",
+        "bytes",
+        "created_at",
+        "filename",
+        "purpose",
+        "mime_type",
+        "api_key_id",
+        "expires_at",
+        "deleted_at",
+      ])
+      .where("deleted_at", "is", null);
+
+    if (apiKeyId) query = query.where("api_key_id", "=", apiKeyId);
+    if (purpose) query = query.where("purpose", "=", purpose);
+
+    if (after) {
+      const afterFile = await getFile(after);
+      if (afterFile) {
+        if (order === "desc") {
+          query = query.where((eb) =>
+            eb.or([
+              eb("created_at", "<", afterFile.createdAt),
+              eb.and([eb("created_at", "=", afterFile.createdAt), eb("id", "<", after)]),
+            ])
+          );
+        } else {
+          query = query.where((eb) =>
+            eb.or([
+              eb("created_at", ">", afterFile.createdAt),
+              eb.and([eb("created_at", "=", afterFile.createdAt), eb("id", ">", after)]),
+            ])
+          );
+        }
+      }
+    }
+
+    const rows = await query
+      .orderBy("created_at", order === "asc" ? "asc" : "desc")
+      .orderBy("id", order === "asc" ? "asc" : "desc")
+      .limit(limit)
+      .execute();
+
+    return rows.map((row) => rowToCamel(row) as unknown as FileRecord);
+  }
+
+  const db = getDbInstance();
   let query = `SELECT ${FILE_METADATA_COLUMNS} FROM files WHERE deleted_at IS NULL`;
   const params: any[] = [];
 
@@ -107,7 +216,7 @@ export function listFiles(
 
   if (after) {
     // Get the creation time of the 'after' file to use for pagination
-    const afterFile = getFile(after);
+    const afterFile = await getFile(after);
     if (afterFile) {
       if (order === "desc") {
         query += " AND (created_at < ? OR (created_at = ? AND id < ?))";
@@ -126,9 +235,24 @@ export function listFiles(
   return rows.map((row) => rowToCamel(row) as unknown as FileRecord);
 }
 
-export function countFiles(options: { apiKeyId?: string; purpose?: string } = {}): number {
-  const db = getDbInstance();
+export async function countFiles(
+  options: { apiKeyId?: string; purpose?: string } = {}
+): Promise<number> {
   const { apiKeyId, purpose } = options;
+
+  if (isPostgres()) {
+    await ensurePostgresBootstrap();
+    let query = getKyselyDb()
+      .selectFrom("files")
+      .select((eb) => eb.fn.countAll().as("c"))
+      .where("deleted_at", "is", null);
+    if (apiKeyId) query = query.where("api_key_id", "=", apiKeyId);
+    if (purpose) query = query.where("purpose", "=", purpose);
+    const row = await query.executeTakeFirst();
+    return row ? Number(row.c) : 0;
+  }
+
+  const db = getDbInstance();
   let query = "SELECT COUNT(*) as c FROM files WHERE deleted_at IS NULL";
   const params: any[] = [];
   if (apiKeyId) {
@@ -161,7 +285,17 @@ export function formatFileResponse(file: FileRecord) {
   };
 }
 
-export function deleteFile(id: string): boolean {
+export async function deleteFile(id: string): Promise<boolean> {
+  if (isPostgres()) {
+    await ensurePostgresBootstrap();
+    const result = await getKyselyDb()
+      .updateTable("files")
+      .set({ deleted_at: Math.floor(Date.now() / 1000), content: null })
+      .where("id", "=", id)
+      .executeTakeFirst();
+    return Number(result.numUpdatedRows) > 0;
+  }
+
   const db = getDbInstance();
   const result = db
     .prepare("UPDATE files SET deleted_at = ?, content = NULL WHERE id = ?")

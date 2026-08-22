@@ -30,7 +30,7 @@ export async function POST(request: Request) {
     }
     const validated = validation.data;
 
-    const inputFile = getFile(validated.input_file_id);
+    const inputFile = await getFile(validated.input_file_id);
     if (!inputFile || (inputFile.apiKeyId !== null && inputFile.apiKeyId !== apiKeyId)) {
       return NextResponse.json(
         { error: { message: "Input file not found", type: "invalid_request_error" } },

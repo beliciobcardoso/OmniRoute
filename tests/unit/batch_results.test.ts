@@ -71,7 +71,7 @@ test("Batch processor produces output file for successful items", async () => {
       }),
     ].join("\n");
 
-    const file = createFile({
+    const file = await createFile({
       bytes: Buffer.byteLength(fileContent),
       filename: "embeddings_batch.jsonl",
       purpose: "batch",
@@ -118,7 +118,7 @@ test("Batch processor produces output file for successful items", async () => {
     // If the batch completed successfully, it should have produced an output file
     if (currentBatch?.status === "completed") {
       assert.ok(currentBatch.outputFileId, "Batch should have an outputFileId");
-      const outputContent = getFileContent(currentBatch.outputFileId!);
+      const outputContent = await getFileContent(currentBatch.outputFileId!);
       assert.ok(outputContent, "Output file should have content");
       const lines = outputContent.toString().split("\n").filter(Boolean);
       assert.strictEqual(lines.length, 1, "Should have one result line");
@@ -128,7 +128,7 @@ test("Batch processor produces output file for successful items", async () => {
 
       // Output file should have an expiration timestamp set (30 days default)
       const { getFile } = await import("../../src/lib/localDb.ts");
-      const fileRow = getFile(currentBatch.outputFileId!);
+      const fileRow = await getFile(currentBatch.outputFileId!);
       assert.ok(fileRow?.expiresAt && typeof fileRow.expiresAt === "number");
     }
   } finally {
