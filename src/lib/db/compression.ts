@@ -470,10 +470,10 @@ function parseStoredEnginesMap(value: unknown): Record<string, EngineToggle> | n
 // aggressive) come from their dedicated config blocks; structural engines (lite/headroom/
 // session-dedup/ccr/llmlingua) come from the default-combo pipeline. `defaultMode` is a last-resort
 // signal that turns on its single-mode engine when nothing else already did.
-function deriveEnginesMap(config: CompressionConfig): Record<string, EngineToggle> {
+async function deriveEnginesMap(config: CompressionConfig): Promise<Record<string, EngineToggle>> {
   let defaultComboEngines = new Set<string>();
   try {
-    const combo = getDefaultCompressionCombo();
+    const combo = await getDefaultCompressionCombo();
     if (combo) {
       defaultComboEngines = new Set(combo.pipeline.map((step) => step.engine));
     }
@@ -693,7 +693,7 @@ export async function getCompressionSettings(): Promise<CompressionConfig> {
   // Engines map: prefer the stored row; otherwise derive from the legacy fields (migration 102
   // backfill on the read path). Always fill EVERY id in ENGINE_IDS so the shape matches
   // DEFAULT_COMPRESSION_CONFIG.
-  const derived = storedEngines ?? deriveEnginesMap(config);
+  const derived = storedEngines ?? (await deriveEnginesMap(config));
   const engines: Record<string, EngineToggle> = {};
   for (const id of ENGINE_IDS) {
     engines[id] = derived[id] ?? { enabled: false };

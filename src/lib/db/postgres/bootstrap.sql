@@ -374,13 +374,6 @@ CREATE TABLE IF NOT EXISTS compression_run_telemetry (
   output_tokens BIGINT
 );
 
-CREATE TABLE IF NOT EXISTS compression_combo_assignments (
-  id TEXT PRIMARY KEY,
-  compression_combo_id TEXT NOT NULL,
-  routing_combo_id TEXT NOT NULL,
-  created_at TEXT DEFAULT CURRENT_TIMESTAMP
-);
-
 CREATE TABLE IF NOT EXISTS compression_combos (
   id TEXT PRIMARY KEY,
   name TEXT NOT NULL,
@@ -393,6 +386,21 @@ CREATE TABLE IF NOT EXISTS compression_combos (
   created_at TEXT DEFAULT CURRENT_TIMESTAMP,
   updated_at TEXT DEFAULT CURRENT_TIMESTAMP
 );
+
+CREATE TABLE IF NOT EXISTS compression_combo_assignments (
+  id TEXT PRIMARY KEY,
+  compression_combo_id TEXT NOT NULL REFERENCES compression_combos(id) ON DELETE CASCADE,
+  routing_combo_id TEXT NOT NULL,
+  created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+  UNIQUE(routing_combo_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_compression_combos_default
+  ON compression_combos(is_default);
+CREATE INDEX IF NOT EXISTS idx_compression_combo_assignments_combo
+  ON compression_combo_assignments(compression_combo_id);
+CREATE INDEX IF NOT EXISTS idx_compression_combo_assignments_routing
+  ON compression_combo_assignments(routing_combo_id);
 
 CREATE TABLE IF NOT EXISTS context_handoffs (
   id TEXT PRIMARY KEY DEFAULT (substr(md5(random()::text || clock_timestamp()::text), 1, 16)),

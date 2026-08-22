@@ -1,3 +1,4 @@
+import { sql } from "kysely";
 import { v4 as uuidv4 } from "uuid";
 import type {
   CompressionEngineId,
@@ -6,6 +7,12 @@ import type {
 
 import { backupDbFile } from "./backup";
 import { getDbInstance, rowToCamel } from "./core";
+import { resolveDbDriverConfig } from "./driverConfig";
+import { ensurePostgresBootstrap, getKyselyDb } from "./kysely/client";
+
+function isPostgres(): boolean {
+  return resolveDbDriverConfig().driver === "postgres";
+}
 
 export interface CompressionCombo {
   id: string;
@@ -89,7 +96,37 @@ function isLegacySeededDefaultPipeline(pipeline: CompressionPipelineStep[]): boo
   return step.engine === "caveman" && (step.intensity === undefined || step.intensity === "full");
 }
 
-function upgradeLegacySeededDefaultCompressionCombo(): void {
+async function upgradeLegacySeededDefaultCompressionCombo(): Promise<void> {
+  if (isPostgres()) {
+    const kdb = getKyselyDb();
+    const row = await kdb
+      .selectFrom("compression_combos")
+      .select(["name", "description", "pipeline"])
+      .where("id", "=", DEFAULT_COMPRESSION_COMBO_ID)
+      .executeTakeFirst();
+    if (!row) return;
+
+    const description = String(row.description ?? "");
+    const isSeededMetadata =
+      String(row.name ?? "") === DEFAULT_COMPRESSION_COMBO_NAME &&
+      (description === LEGACY_DEFAULT_COMPRESSION_COMBO_DESCRIPTION ||
+        description === DEFAULT_COMPRESSION_COMBO_DESCRIPTION);
+
+    if (!isSeededMetadata || !isLegacySeededDefaultPipeline(normalizePipeline(row.pipeline)))
+      return;
+
+    await kdb
+      .updateTable("compression_combos")
+      .set({
+        description: DEFAULT_COMPRESSION_COMBO_DESCRIPTION,
+        pipeline: JSON.stringify(defaultCompressionComboPipeline()),
+        updated_at: new Date().toISOString(),
+      })
+      .where("id", "=", DEFAULT_COMPRESSION_COMBO_ID)
+      .execute();
+    return;
+  }
+
   const db = getDbInstance();
   const row = db
     .prepare("SELECT name, description, pipeline FROM compression_combos WHERE id = ?")
@@ -120,7 +157,28 @@ function upgradeLegacySeededDefaultCompressionCombo(): void {
   );
 }
 
-function ensureCompressionComboTables(): void {
+async function ensureCompressionComboTables(): Promise<void> {
+  if (isPostgres()) {
+    await ensurePostgresBootstrap();
+    const kdb = getKyselyDb();
+    await kdb
+      .insertInto("compression_combos")
+      .values({
+        id: DEFAULT_COMPRESSION_COMBO_ID,
+        name: DEFAULT_COMPRESSION_COMBO_NAME,
+        description: DEFAULT_COMPRESSION_COMBO_DESCRIPTION,
+        pipeline: JSON.stringify(defaultCompressionComboPipeline()),
+        language_packs: JSON.stringify(["en"]),
+        output_mode: 0,
+        output_mode_intensity: "full",
+        is_default: 1,
+      })
+      .onConflict((oc) => oc.column("id").doNothing())
+      .execute();
+    await upgradeLegacySeededDefaultCompressionCombo();
+    return;
+  }
+
   const db = getDbInstance();
   db.exec(`
     CREATE TABLE IF NOT EXISTS compression_combos (
@@ -168,7 +226,14 @@ function ensureCompressionComboTables(): void {
     "full",
     1
   );
-  upgradeLegacySeededDefaultCompressionCombo();
+  await upgradeLegacySeededDefaultCompressionCombo();
+}
+
+function isTruthyFlag(value: unknown): boolean {
+  if (typeof value === "boolean") return value;
+  if (typeof value === "number" || typeof value === "bigint") return Number(value) !== 0;
+  if (typeof value === "string") return value !== "0" && value !== "";
+  return Boolean(value);
 }
 
 function rowToCompressionCombo(row: unknown): CompressionCombo | null {
@@ -180,9 +245,9 @@ function rowToCompressionCombo(row: unknown): CompressionCombo | null {
     description: String(camel.description ?? ""),
     pipeline: normalizePipeline(camel.pipeline),
     languagePacks: normalizeLanguagePacks(camel.languagePacks),
-    outputMode: Boolean(camel.outputMode),
+    outputMode: isTruthyFlag(camel.outputMode),
     outputModeIntensity: String(camel.outputModeIntensity ?? "full"),
-    isDefault: Boolean(camel.isDefault),
+    isDefault: isTruthyFlag(camel.isDefault),
     createdAt: String(camel.createdAt ?? ""),
     updatedAt: String(camel.updatedAt ?? ""),
   };
@@ -225,8 +290,20 @@ function buildComboPayload(data: Partial<CompressionCombo>, existing?: Compressi
   };
 }
 
-export function listCompressionCombos(): CompressionCombo[] {
-  ensureCompressionComboTables();
+export async function listCompressionCombos(): Promise<CompressionCombo[]> {
+  await ensureCompressionComboTables();
+  if (isPostgres()) {
+    const kdb = getKyselyDb();
+    const rows = await kdb
+      .selectFrom("compression_combos")
+      .selectAll()
+      .orderBy(sql`is_default desc`)
+      .orderBy(sql`lower(name) asc`)
+      .execute();
+    return rows
+      .map(rowToCompressionCombo)
+      .filter((combo): combo is CompressionCombo => combo !== null);
+  }
   const db = getDbInstance();
   return db
     .prepare("SELECT * FROM compression_combos ORDER BY is_default DESC, name COLLATE NOCASE ASC")
@@ -235,14 +312,34 @@ export function listCompressionCombos(): CompressionCombo[] {
     .filter((combo): combo is CompressionCombo => combo !== null);
 }
 
-export function getCompressionCombo(id: string): CompressionCombo | null {
-  ensureCompressionComboTables();
+export async function getCompressionCombo(id: string): Promise<CompressionCombo | null> {
+  await ensureCompressionComboTables();
+  if (isPostgres()) {
+    const kdb = getKyselyDb();
+    const row = await kdb
+      .selectFrom("compression_combos")
+      .selectAll()
+      .where("id", "=", id)
+      .executeTakeFirst();
+    return rowToCompressionCombo(row);
+  }
   const row = getDbInstance().prepare("SELECT * FROM compression_combos WHERE id = ?").get(id);
   return rowToCompressionCombo(row);
 }
 
-export function getDefaultCompressionCombo(): CompressionCombo | null {
-  ensureCompressionComboTables();
+export async function getDefaultCompressionCombo(): Promise<CompressionCombo | null> {
+  await ensureCompressionComboTables();
+  if (isPostgres()) {
+    const kdb = getKyselyDb();
+    const row = await kdb
+      .selectFrom("compression_combos")
+      .selectAll()
+      .where("is_default", "=", 1)
+      .orderBy("updated_at", "desc")
+      .limit(1)
+      .executeTakeFirst();
+    return rowToCompressionCombo(row);
+  }
   const row = getDbInstance()
     .prepare(
       "SELECT * FROM compression_combos WHERE is_default = 1 ORDER BY updated_at DESC LIMIT 1"
@@ -251,10 +348,38 @@ export function getDefaultCompressionCombo(): CompressionCombo | null {
   return rowToCompressionCombo(row);
 }
 
-export function createCompressionCombo(data: Partial<CompressionCombo>): CompressionCombo {
-  ensureCompressionComboTables();
-  const db = getDbInstance();
+export async function createCompressionCombo(
+  data: Partial<CompressionCombo>
+): Promise<CompressionCombo> {
+  await ensureCompressionComboTables();
   const combo = buildComboPayload(data);
+
+  if (isPostgres()) {
+    const kdb = getKyselyDb();
+    await kdb.transaction().execute(async (trx) => {
+      if (combo.isDefault) {
+        await trx.updateTable("compression_combos").set({ is_default: 0 }).execute();
+      }
+      await trx
+        .insertInto("compression_combos")
+        .values({
+          id: combo.id,
+          name: combo.name,
+          description: combo.description,
+          pipeline: JSON.stringify(combo.pipeline),
+          language_packs: JSON.stringify(combo.languagePacks),
+          output_mode: combo.outputMode ? 1 : 0,
+          output_mode_intensity: combo.outputModeIntensity,
+          is_default: combo.isDefault ? 1 : 0,
+          created_at: combo.createdAt,
+          updated_at: combo.updatedAt,
+        })
+        .execute();
+    });
+    return (await getCompressionCombo(combo.id)) as CompressionCombo;
+  }
+
+  const db = getDbInstance();
   const tx = db.transaction(() => {
     if (combo.isDefault) db.prepare("UPDATE compression_combos SET is_default = 0").run();
     db.prepare(
@@ -280,17 +405,42 @@ export function createCompressionCombo(data: Partial<CompressionCombo>): Compres
   });
   tx();
   backupDbFile("pre-write");
-  return getCompressionCombo(combo.id) as CompressionCombo;
+  return (await getCompressionCombo(combo.id)) as CompressionCombo;
 }
 
-export function updateCompressionCombo(
+export async function updateCompressionCombo(
   id: string,
   data: Partial<CompressionCombo>
-): CompressionCombo | null {
-  ensureCompressionComboTables();
-  const existing = getCompressionCombo(id);
+): Promise<CompressionCombo | null> {
+  await ensureCompressionComboTables();
+  const existing = await getCompressionCombo(id);
   if (!existing) return null;
   const combo = buildComboPayload(data, existing);
+
+  if (isPostgres()) {
+    const kdb = getKyselyDb();
+    await kdb.transaction().execute(async (trx) => {
+      if (combo.isDefault) {
+        await trx.updateTable("compression_combos").set({ is_default: 0 }).execute();
+      }
+      await trx
+        .updateTable("compression_combos")
+        .set({
+          name: combo.name,
+          description: combo.description,
+          pipeline: JSON.stringify(combo.pipeline),
+          language_packs: JSON.stringify(combo.languagePacks),
+          output_mode: combo.outputMode ? 1 : 0,
+          output_mode_intensity: combo.outputModeIntensity,
+          is_default: combo.isDefault ? 1 : 0,
+          updated_at: combo.updatedAt,
+        })
+        .where("id", "=", id)
+        .execute();
+    });
+    return getCompressionCombo(id);
+  }
+
   const db = getDbInstance();
   const tx = db.transaction(() => {
     if (combo.isDefault) db.prepare("UPDATE compression_combos SET is_default = 0").run();
@@ -318,20 +468,44 @@ export function updateCompressionCombo(
   return getCompressionCombo(id);
 }
 
-export function deleteCompressionCombo(id: string): boolean {
-  ensureCompressionComboTables();
-  const existing = getCompressionCombo(id);
+export async function deleteCompressionCombo(id: string): Promise<boolean> {
+  await ensureCompressionComboTables();
+  const existing = await getCompressionCombo(id);
   if (!existing || existing.isDefault) return false;
+
+  if (isPostgres()) {
+    const kdb = getKyselyDb();
+    const result = await kdb
+      .deleteFrom("compression_combos")
+      .where("id", "=", id)
+      .executeTakeFirst();
+    return Number(result.numDeletedRows) > 0;
+  }
+
   const result = getDbInstance().prepare("DELETE FROM compression_combos WHERE id = ?").run(id);
   if (result.changes > 0) backupDbFile("pre-write");
   return result.changes > 0;
 }
 
-export function setDefaultCompressionCombo(id: string): boolean {
-  ensureCompressionComboTables();
-  if (!getCompressionCombo(id)) return false;
-  const db = getDbInstance();
+export async function setDefaultCompressionCombo(id: string): Promise<boolean> {
+  await ensureCompressionComboTables();
+  if (!(await getCompressionCombo(id))) return false;
   const now = new Date().toISOString();
+
+  if (isPostgres()) {
+    const kdb = getKyselyDb();
+    await kdb.transaction().execute(async (trx) => {
+      await trx.updateTable("compression_combos").set({ is_default: 0 }).execute();
+      await trx
+        .updateTable("compression_combos")
+        .set({ is_default: 1, updated_at: now })
+        .where("id", "=", id)
+        .execute();
+    });
+    return true;
+  }
+
+  const db = getDbInstance();
   db.transaction(() => {
     db.prepare("UPDATE compression_combos SET is_default = 0").run();
     db.prepare("UPDATE compression_combos SET is_default = 1, updated_at = ? WHERE id = ?").run(
@@ -343,8 +517,22 @@ export function setDefaultCompressionCombo(id: string): boolean {
   return true;
 }
 
-export function getAssignmentsForCompressionCombo(id: string): CompressionComboAssignment[] {
-  ensureCompressionComboTables();
+export async function getAssignmentsForCompressionCombo(
+  id: string
+): Promise<CompressionComboAssignment[]> {
+  await ensureCompressionComboTables();
+  if (isPostgres()) {
+    const kdb = getKyselyDb();
+    const rows = await kdb
+      .selectFrom("compression_combo_assignments")
+      .selectAll()
+      .where("compression_combo_id", "=", id)
+      .orderBy("routing_combo_id")
+      .execute();
+    return rows
+      .map(rowToAssignment)
+      .filter((assignment): assignment is CompressionComboAssignment => assignment !== null);
+  }
   return getDbInstance()
     .prepare(
       "SELECT * FROM compression_combo_assignments WHERE compression_combo_id = ? ORDER BY routing_combo_id"
@@ -354,10 +542,21 @@ export function getAssignmentsForCompressionCombo(id: string): CompressionComboA
     .filter((assignment): assignment is CompressionComboAssignment => assignment !== null);
 }
 
-export function getCompressionComboForRoutingCombo(
+export async function getCompressionComboForRoutingCombo(
   routingComboId: string
-): CompressionCombo | null {
-  ensureCompressionComboTables();
+): Promise<CompressionCombo | null> {
+  await ensureCompressionComboTables();
+  if (isPostgres()) {
+    const kdb = getKyselyDb();
+    const row = await kdb
+      .selectFrom("compression_combos as c")
+      .innerJoin("compression_combo_assignments as a", "a.compression_combo_id", "c.id")
+      .selectAll("c")
+      .where("a.routing_combo_id", "=", routingComboId)
+      .limit(1)
+      .executeTakeFirst();
+    return rowToCompressionCombo(row);
+  }
   const row = getDbInstance()
     .prepare(
       `
@@ -372,9 +571,33 @@ export function getCompressionComboForRoutingCombo(
   return rowToCompressionCombo(row);
 }
 
-export function assignRoutingCombo(compressionComboId: string, routingComboId: string): boolean {
-  ensureCompressionComboTables();
-  if (!getCompressionCombo(compressionComboId) || !routingComboId.trim()) return false;
+export async function assignRoutingCombo(
+  compressionComboId: string,
+  routingComboId: string
+): Promise<boolean> {
+  await ensureCompressionComboTables();
+  if (!(await getCompressionCombo(compressionComboId)) || !routingComboId.trim()) return false;
+
+  if (isPostgres()) {
+    const kdb = getKyselyDb();
+    await kdb
+      .insertInto("compression_combo_assignments")
+      .values({
+        id: uuidv4(),
+        compression_combo_id: compressionComboId,
+        routing_combo_id: routingComboId.trim(),
+        created_at: new Date().toISOString(),
+      })
+      .onConflict((oc) =>
+        oc.column("routing_combo_id").doUpdateSet({
+          compression_combo_id: (eb) => eb.ref("excluded.compression_combo_id"),
+          created_at: (eb) => eb.ref("excluded.created_at"),
+        })
+      )
+      .execute();
+    return true;
+  }
+
   getDbInstance()
     .prepare(
       `
@@ -389,8 +612,20 @@ export function assignRoutingCombo(compressionComboId: string, routingComboId: s
   return true;
 }
 
-export function unassignRoutingCombo(compressionComboId: string, routingComboId: string): boolean {
-  ensureCompressionComboTables();
+export async function unassignRoutingCombo(
+  compressionComboId: string,
+  routingComboId: string
+): Promise<boolean> {
+  await ensureCompressionComboTables();
+  if (isPostgres()) {
+    const kdb = getKyselyDb();
+    const result = await kdb
+      .deleteFrom("compression_combo_assignments")
+      .where("compression_combo_id", "=", compressionComboId)
+      .where("routing_combo_id", "=", routingComboId)
+      .executeTakeFirst();
+    return Number(result.numDeletedRows) > 0;
+  }
   const result = getDbInstance()
     .prepare(
       "DELETE FROM compression_combo_assignments WHERE compression_combo_id = ? AND routing_combo_id = ?"
@@ -415,14 +650,14 @@ const ENGINE_STACK_PRIORITY: Record<string, number> = {
   ultra: 40,
 };
 
-export function setEngineInDefaultCombo(
+export async function setEngineInDefaultCombo(
   engineId: string,
   enabled: boolean,
   config?: Record<string, unknown>
-): CompressionCombo | null {
+): Promise<CompressionCombo | null> {
   if (!KNOWN_ENGINE_IDS.includes(engineId)) return null;
-  ensureCompressionComboTables();
-  const existing = getDefaultCompressionCombo();
+  await ensureCompressionComboTables();
+  const existing = await getDefaultCompressionCombo();
   if (!existing) return null;
 
   let newPipeline = [...existing.pipeline];
@@ -448,8 +683,19 @@ export function setEngineInDefaultCombo(
   // Direct UPDATE — preserves empty pipeline (Fix #2) without going through
   // buildComboPayload which falls back to defaultCompressionComboPipeline() when
   // the incoming array is empty.
-  const db = getDbInstance();
   const now = new Date().toISOString();
+
+  if (isPostgres()) {
+    const kdb = getKyselyDb();
+    await kdb
+      .updateTable("compression_combos")
+      .set({ pipeline: JSON.stringify(newPipeline), updated_at: now })
+      .where("id", "=", existing.id)
+      .execute();
+    return getCompressionCombo(existing.id);
+  }
+
+  const db = getDbInstance();
   db.prepare("UPDATE compression_combos SET pipeline = ?, updated_at = ? WHERE id = ?").run(
     JSON.stringify(newPipeline),
     now,
@@ -460,10 +706,40 @@ export function setEngineInDefaultCombo(
   return getCompressionCombo(existing.id);
 }
 
-export function updateAssignments(compressionComboId: string, routingComboIds: string[]): boolean {
-  ensureCompressionComboTables();
-  if (!getCompressionCombo(compressionComboId)) return false;
+export async function updateAssignments(
+  compressionComboId: string,
+  routingComboIds: string[]
+): Promise<boolean> {
+  await ensureCompressionComboTables();
+  if (!(await getCompressionCombo(compressionComboId))) return false;
   const cleanedIds = [...new Set(routingComboIds.map((id) => id.trim()).filter(Boolean))];
+
+  if (isPostgres()) {
+    const kdb = getKyselyDb();
+    await kdb.transaction().execute(async (trx) => {
+      await trx
+        .deleteFrom("compression_combo_assignments")
+        .where("compression_combo_id", "=", compressionComboId)
+        .execute();
+      for (const routingComboId of cleanedIds) {
+        await trx
+          .deleteFrom("compression_combo_assignments")
+          .where("routing_combo_id", "=", routingComboId)
+          .execute();
+        await trx
+          .insertInto("compression_combo_assignments")
+          .values({
+            id: uuidv4(),
+            compression_combo_id: compressionComboId,
+            routing_combo_id: routingComboId,
+            created_at: new Date().toISOString(),
+          })
+          .execute();
+      }
+    });
+    return true;
+  }
+
   const db = getDbInstance();
   db.transaction(() => {
     db.prepare("DELETE FROM compression_combo_assignments WHERE compression_combo_id = ?").run(

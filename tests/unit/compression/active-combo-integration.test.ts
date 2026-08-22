@@ -11,8 +11,10 @@ process.env.DATA_DIR = TEST_DATA_DIR;
 const { getDbInstance, resetDbInstance } = await import("../../../src/lib/db/core.ts");
 const combosDb = await import("../../../src/lib/db/compressionCombos.ts");
 const { updateCompressionSettings } = await import("../../../src/lib/db/compression.ts");
-const { selectCompressionPlan } = await import("../../../open-sse/services/compression/strategySelector.ts");
-const { DEFAULT_COMPRESSION_CONFIG } = await import("../../../open-sse/services/compression/types.ts");
+const { selectCompressionPlan } =
+  await import("../../../open-sse/services/compression/strategySelector.ts");
+const { DEFAULT_COMPRESSION_CONFIG } =
+  await import("../../../open-sse/services/compression/types.ts");
 
 after(() => {
   resetDbInstance();
@@ -24,20 +26,21 @@ after(() => {
 test("an active named combo's pipeline is what selectCompressionPlan resolves, fed from the DB combos map", async () => {
   resetDbInstance();
   getDbInstance();
-  const created = combosDb.createCompressionCombo({
+  const created = await combosDb.createCompressionCombo({
     name: "RTK only",
     pipeline: [{ engine: "rtk", intensity: "standard" }],
   });
   await updateCompressionSettings({ enabled: true, activeComboId: created.id });
 
   // Mirror chatCore's load: build the combos map from the DB.
-  const combos = Object.fromEntries(combosDb.listCompressionCombos().map((c) => [c.id, c.pipeline]));
+  const allCombos = await combosDb.listCompressionCombos();
+  const combos = Object.fromEntries(allCombos.map((c) => [c.id, c.pipeline]));
   const config = { ...DEFAULT_COMPRESSION_CONFIG, enabled: true, activeComboId: created.id };
   const plan = selectCompressionPlan(config, null, 5000, undefined, undefined, combos);
   assert.equal(plan.mode, "stacked");
   assert.deepEqual(plan.stackedPipeline, [{ engine: "rtk", intensity: "standard" }]);
 
   // Setting activeComboId did NOT change which combo is is_default (legacy untouched).
-  const def = combosDb.getDefaultCompressionCombo();
+  const def = await combosDb.getDefaultCompressionCombo();
   assert.notEqual(def?.id, created.id);
 });

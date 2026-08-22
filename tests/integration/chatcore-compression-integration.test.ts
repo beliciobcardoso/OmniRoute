@@ -570,8 +570,7 @@ test("chatCore integration: combo requests run proactive compression before Kiro
 
     // Ensure request was translated to Kiro shape (messages are not sent directly upstream).
     const conversationState = capturedTranslatedBody?.conversationState as
-      | Record<string, unknown>
-      | undefined;
+      Record<string, unknown> | undefined;
     assert.ok(conversationState, "Kiro translated request should include conversationState");
 
     const history = Array.isArray(conversationState?.history)
@@ -584,8 +583,7 @@ test("chatCore integration: combo requests run proactive compression before Kiro
 
     const currentMessage = conversationState?.currentMessage as Record<string, unknown> | undefined;
     const userInputMessage = currentMessage?.userInputMessage as
-      | Record<string, unknown>
-      | undefined;
+      Record<string, unknown> | undefined;
     const currentContent =
       typeof userInputMessage?.content === "string" ? userInputMessage.content : "";
     assert.match(currentContent, /Please summarize everything\./);
@@ -633,7 +631,7 @@ test("chatCore integration: assigned compression combo applies language packs an
     ],
   });
 
-  const compressionCombo = compressionCombosDb.createCompressionCombo({
+  const compressionCombo = await compressionCombosDb.createCompressionCombo({
     name: "Assigned PT Output Mode",
     pipeline: [{ engine: "caveman", intensity: "lite" }],
     languagePacks: ["pt-BR"],
@@ -641,7 +639,7 @@ test("chatCore integration: assigned compression combo applies language packs an
     outputModeIntensity: "lite",
   });
   assert.equal(
-    compressionCombosDb.assignRoutingCombo(compressionCombo.id, routingCombo.id as string),
+    await compressionCombosDb.assignRoutingCombo(compressionCombo.id, routingCombo.id as string),
     true
   );
 
@@ -723,7 +721,7 @@ test("chatCore integration: default stacked compression combo applies for unassi
     },
   });
 
-  const compressionCombo = compressionCombosDb.createCompressionCombo({
+  const compressionCombo = await compressionCombosDb.createCompressionCombo({
     name: "Default PT Output Mode",
     pipeline: [
       { engine: "rtk", intensity: "standard" },
