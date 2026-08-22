@@ -24,7 +24,7 @@ export async function DELETE(_request: Request, { params }: Params): Promise<Res
   const decodedHost = decodeURIComponent(host);
 
   try {
-    removeCustomHost(decodedHost);
+    await removeCustomHost(decodedHost);
   } catch (err) {
     const msg = sanitizeErrorMessage(err);
     return new Response(JSON.stringify(buildErrorBody(500, msg || "Failed to remove host")), {
@@ -84,9 +84,9 @@ export async function PATCH(request: Request, { params }: Params): Promise<Respo
   }
 
   try {
-    toggleCustomHost(decodedHost, parsed.data.enabled);
+    await toggleCustomHost(decodedHost, parsed.data.enabled);
     // Return updated record
-    const hosts = listCustomHosts();
+    const hosts = await listCustomHosts();
     const updated = hosts.find((h) => h.host === decodedHost);
     if (!updated) {
       return new Response(JSON.stringify(buildErrorBody(404, "Host not found")), {

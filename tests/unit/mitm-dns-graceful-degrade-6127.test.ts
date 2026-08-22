@@ -27,8 +27,7 @@ function makeSpyLogger() {
   return {
     logger: {
       error: (payload: unknown, msg: string) => errorCalls.push({ payload, msg }),
-      info: (payload: unknown, msg?: string) =>
-        infoCalls.push({ payload, msg: msg ?? "" }),
+      info: (payload: unknown, msg?: string) => infoCalls.push({ payload, msg: msg ?? "" }),
     },
     errorCalls,
     infoCalls,
@@ -43,8 +42,8 @@ test("provisionDnsEntries: default DNS step failure does NOT abort (graceful deg
         throw new Error("Command failed with code 1\nsudo: a password is required");
       },
       // No agents / no custom hosts so the other two steps are no-ops.
-      getAgentStates: () => [],
-      listEnabledCustomHosts: () => [],
+      getAgentStates: async () => [],
+      listEnabledCustomHosts: async () => [],
       logger: spy.logger,
     })
   );
@@ -56,8 +55,8 @@ test("provisionDnsEntries: failed default DNS step logs the stderr to the logger
     addDefaultDns: async () => {
       throw new Error("Command failed with code 1\nsudo: a password is required");
     },
-    getAgentStates: () => [],
-    listEnabledCustomHosts: () => [],
+    getAgentStates: async () => [],
+    listEnabledCustomHosts: async () => [],
     logger: spy.logger,
   });
 
@@ -83,9 +82,8 @@ test("provisionDnsEntries: a failing agent/custom step does not stop the others 
       // Custom-hosts call must still happen even after default + agent errors.
       if (hosts.some((h) => h === "custom.example.com")) customCalled = true;
     },
-    getAgentStates: () =>
-      [{ dns_enabled: true, agent_id: "__nonexistent_agent__" }] as never,
-    listEnabledCustomHosts: () => [{ host: "custom.example.com" }] as never,
+    getAgentStates: async () => [{ dns_enabled: true, agent_id: "__nonexistent_agent__" }] as never,
+    listEnabledCustomHosts: async () => [{ host: "custom.example.com" }] as never,
     logger: spy.logger,
   });
   assert.ok(customCalled, "custom-hosts DNS step must run despite earlier failures");
@@ -98,8 +96,8 @@ test("provisionDnsEntries: happy path calls the default step and does not log er
     addDefaultDns: async () => {
       defaultCalled = true;
     },
-    getAgentStates: () => [],
-    listEnabledCustomHosts: () => [],
+    getAgentStates: async () => [],
+    listEnabledCustomHosts: async () => [],
     logger: spy.logger,
   });
   assert.ok(defaultCalled, "default DNS step must be invoked");

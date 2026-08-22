@@ -34,7 +34,7 @@ export type AgentBridgeConfig = z.infer<typeof AgentBridgeConfigSchema>;
 
 /** Read the current operator-tunable AgentBridge state into a portable blob. */
 export async function exportConfig(): Promise<AgentBridgeConfig> {
-  const customHosts = listCustomHosts().map((h) => ({
+  const customHosts = (await listCustomHosts()).map((h) => ({
     host: h.host,
     kind: (h.kind as "llm" | "app" | "custom") ?? "custom",
     label: h.label ?? null,
@@ -71,7 +71,7 @@ export async function importConfig(config: AgentBridgeConfig): Promise<ImportRes
   await replaceUserBypassPatterns(config.bypassPatterns);
 
   for (const h of config.customHosts) {
-    addCustomHost(h.host, h.kind, h.label ?? undefined);
+    await addCustomHost(h.host, h.kind, h.label ?? undefined);
   }
 
   for (const [agentId, mappings] of Object.entries(config.agentMappings)) {

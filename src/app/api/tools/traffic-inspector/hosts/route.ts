@@ -17,7 +17,7 @@ import { addDNSEntries } from "@/mitm/dns/dnsConfig";
 
 export async function GET(): Promise<Response> {
   try {
-    const hosts = listCustomHosts();
+    const hosts = await listCustomHosts();
     return Response.json({ hosts });
   } catch (err) {
     const msg = sanitizeErrorMessage(err);
@@ -50,7 +50,7 @@ export async function POST(request: Request): Promise<Response> {
   const { host, kind, label } = parsed.data;
 
   try {
-    addCustomHost(host, kind, label ?? undefined);
+    await addCustomHost(host, kind, label ?? undefined);
   } catch (err) {
     const msg = sanitizeErrorMessage(err);
     return new Response(JSON.stringify(buildErrorBody(500, msg || "Failed to add host")), {

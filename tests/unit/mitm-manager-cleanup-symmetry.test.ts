@@ -13,9 +13,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
-const TEST_DATA_DIR = fs.mkdtempSync(
-  path.join(os.tmpdir(), "omniroute-mitm-cleanup-symmetry-")
-);
+const TEST_DATA_DIR = fs.mkdtempSync(path.join(os.tmpdir(), "omniroute-mitm-cleanup-symmetry-"));
 process.env.DATA_DIR = TEST_DATA_DIR;
 
 const core = await import("../../src/lib/db/core.ts");
@@ -52,8 +50,8 @@ test.after(async () => {
   fs.rmSync(TEST_DATA_DIR, { recursive: true, force: true });
 });
 
-test("collectManagedHosts includes every host of every agent target", () => {
-  const managed = new Set(manager.collectManagedHosts());
+test("collectManagedHosts includes every host of every agent target", async () => {
+  const managed = new Set(await manager.collectManagedHosts());
   for (const target of ALL_TARGETS) {
     for (const host of target.hosts) {
       assert.ok(
@@ -64,18 +62,14 @@ test("collectManagedHosts includes every host of every agent target", () => {
   }
 });
 
-test("collectManagedHosts returns a de-duplicated list", () => {
-  const list = manager.collectManagedHosts();
-  assert.equal(
-    list.length,
-    new Set(list).size,
-    "collectManagedHosts must not return duplicates"
-  );
+test("collectManagedHosts returns a de-duplicated list", async () => {
+  const list = await manager.collectManagedHosts();
+  assert.equal(list.length, new Set(list).size, "collectManagedHosts must not return duplicates");
 });
 
-test("collectManagedHosts includes custom hosts persisted in the DB", () => {
-  customHostsDb.addCustomHost("api.my-internal-llm.test", "custom");
-  const managed = new Set(manager.collectManagedHosts());
+test("collectManagedHosts includes custom hosts persisted in the DB", async () => {
+  await customHostsDb.addCustomHost("api.my-internal-llm.test", "custom");
+  const managed = new Set(await manager.collectManagedHosts());
   assert.ok(
     managed.has("api.my-internal-llm.test"),
     "a custom host added to the DB must be enumerated for cleanup"

@@ -302,7 +302,7 @@ export async function handleExitCleanup(
     getCachedPassword?: () => string | null;
     removeDNSEntry?: (sudoPassword: string) => Promise<void>;
     removeDNSEntries?: (hosts: string[], sudoPassword: string) => Promise<void>;
-    collectManagedHosts?: () => string[];
+    collectManagedHosts?: () => Promise<string[]>;
   }
 ): Promise<void> {
   const deps = {
@@ -330,7 +330,7 @@ export async function handleExitCleanup(
 
   try {
     await deps.removeDNSEntry(sudoPassword);
-    const managed = deps.collectManagedHosts();
+    const managed = await deps.collectManagedHosts();
     if (managed.length > 0) {
       await deps.removeDNSEntries(managed, sudoPassword);
     }
@@ -647,14 +647,14 @@ async function removeStopDnsEntries(
   deps: {
     removeDNSEntry: (sudoPassword: string) => Promise<void>;
     removeDNSEntries: (hosts: string[], sudoPassword: string) => Promise<void>;
-    collectManagedHosts: () => string[];
+    collectManagedHosts: () => Promise<string[]>;
   },
   sudoPassword: string
 ): Promise<void> {
   log.info("Removing DNS entries...");
   await deps.removeDNSEntry(sudoPassword);
   try {
-    const managed = deps.collectManagedHosts();
+    const managed = await deps.collectManagedHosts();
     if (managed.length > 0) {
       await deps.removeDNSEntries(managed, sudoPassword);
     }
@@ -724,7 +724,7 @@ export async function stopMitm(
   _depsOverride?: {
     removeDNSEntry?: (sudoPassword: string) => Promise<void>;
     removeDNSEntries?: (hosts: string[], sudoPassword: string) => Promise<void>;
-    collectManagedHosts?: () => string[];
+    collectManagedHosts?: () => Promise<string[]>;
   }
 ): Promise<{ running: false; pid: null }> {
   const deps = {

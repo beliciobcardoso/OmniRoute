@@ -69,7 +69,7 @@ test("handleExitCleanup: with a cached sudo password, best-effort reverts manage
     removeDNSEntries: async (hosts: string[], sudoPassword: string) => {
       removeDNSEntriesCalls.push({ hosts, sudoPassword });
     },
-    collectManagedHosts: () => managedHosts,
+    collectManagedHosts: async () => managedHosts,
   });
 
   assert.deepEqual(
@@ -99,7 +99,11 @@ test("handleExitCleanup: with a cached sudo password, best-effort reverts manage
 
 test("handleExitCleanup: with NO cached password, falls back to orphaned-state flag and skips DNS removal", async () => {
   manager.clearCachedPassword();
-  assert.equal(manager.getCachedPassword(), null, "precondition: no password cached in this session");
+  assert.equal(
+    manager.getCachedPassword(),
+    null,
+    "precondition: no password cached in this session"
+  );
 
   let removeDNSEntryCalled = false;
   let removeDNSEntriesCalled = false;
@@ -111,7 +115,7 @@ test("handleExitCleanup: with NO cached password, falls back to orphaned-state f
     removeDNSEntries: async () => {
       removeDNSEntriesCalled = true;
     },
-    collectManagedHosts: () => ["should-not-be-used.invalid"],
+    collectManagedHosts: async () => ["should-not-be-used.invalid"],
   });
 
   assert.equal(

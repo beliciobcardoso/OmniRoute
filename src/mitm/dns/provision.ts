@@ -61,7 +61,7 @@ export async function provisionDnsEntries(
 
   // Collect hosts from agents that have dns_enabled=true in the DB.
   try {
-    const agentStates = getAgentStates();
+    const agentStates = await getAgentStates();
     const agentHostsToAdd: string[] = [];
     for (const state of agentStates) {
       if (!state.dns_enabled) continue;
@@ -80,7 +80,7 @@ export async function provisionDnsEntries(
 
   // Collect enabled custom hosts.
   try {
-    const customHosts = listEnabledCustomHosts();
+    const customHosts = await listEnabledCustomHosts();
     const customHostNames = customHosts.map((h) => h.host);
     if (customHostNames.length > 0) {
       logger.info({ count: customHostNames.length }, "Adding DNS for custom host(s)...");
