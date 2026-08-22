@@ -22,8 +22,8 @@ export async function GET(req: NextRequest) {
   const limit = Math.min(Number(url.searchParams.get("limit") ?? 50), 200);
   const offset = Number(url.searchParams.get("offset") ?? 0);
 
-  const logs = getRequestDetailLogs(limit, offset);
-  const total = getRequestDetailLogCount();
+  const logs = await getRequestDetailLogs(limit, offset);
+  const total = await getRequestDetailLogCount();
   const enabled = await isDetailedLoggingEnabled();
 
   return NextResponse.json({ enabled, total, logs });

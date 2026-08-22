@@ -404,7 +404,7 @@ test("getCallLogById falls back to legacy inline rows and request_detail_logs", 
     JSON.stringify({ message: "legacy-error" })
   );
 
-  detailedLogs.saveRequestDetailLog({
+  await detailedLogs.saveRequestDetailLog({
     call_log_id: "legacy-read",
     client_request: { body: { from: "detail-client" } },
     translated_request: { body: { from: "detail-provider-request" } },

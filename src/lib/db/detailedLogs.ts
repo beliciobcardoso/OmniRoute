@@ -7,6 +7,8 @@
  */
 import { v4 as uuidv4 } from "uuid";
 import { getDbInstance } from "./core";
+import { resolveDbDriverConfig } from "./driverConfig";
+import { ensurePostgresBootstrap, getKyselyDb } from "./kysely/client";
 import { getSettings } from "./settings";
 import { isNoLog } from "../compliance/noLog";
 import {
@@ -15,6 +17,10 @@ import {
   parseStoredPayload,
 } from "../logPayloads";
 import { compactStructuredStreamPayload } from "@omniroute/open-sse/utils/streamPayloadCollector.ts";
+
+function isPostgres(): boolean {
+  return resolveDbDriverConfig().driver === "postgres";
+}
 
 export interface RequestDetailLog {
   id?: string;
@@ -36,6 +42,8 @@ export interface RequestDetailLog {
 let requestDetailLogsTableExistsCache: boolean | undefined;
 
 function requestDetailLogsTableExists(): boolean {
+  if (isPostgres()) return true; // bootstrap.sql always creates the table
+
   if (requestDetailLogsTableExistsCache !== undefined) {
     return requestDetailLogsTableExistsCache;
   }
@@ -64,17 +72,44 @@ export async function isDetailedLoggingEnabled(): Promise<boolean> {
 }
 
 /** Save a detailed log entry — caller must verify isDetailedLoggingEnabled() first */
-export function saveRequestDetailLog(entry: RequestDetailLog): void {
+export async function saveRequestDetailLog(entry: RequestDetailLog): Promise<void> {
   const noLogEnabled =
     Boolean(entry.no_log) || (entry.api_key_id ? isNoLog(entry.api_key_id) : false);
   if (noLogEnabled || !requestDetailLogsTableExists()) return;
 
-  const db = getDbInstance();
   const id = entry.id ?? uuidv4();
   const timestamp = entry.timestamp ?? new Date().toISOString();
   const compactProviderResponse = compactStructuredStreamPayload(entry.provider_response);
   const compactClientResponse = compactStructuredStreamPayload(entry.client_response);
 
+  if (isPostgres()) {
+    await ensurePostgresBootstrap();
+    const kdb = getKyselyDb();
+    await kdb
+      .insertInto("request_detail_logs")
+      .values({
+        id,
+        call_log_id: entry.call_log_id ?? null,
+        timestamp,
+        client_request: serializePayloadForStorage(protectPayloadForLog(entry.client_request)),
+        translated_request: serializePayloadForStorage(
+          protectPayloadForLog(entry.translated_request)
+        ),
+        provider_response: serializePayloadForStorage(
+          protectPayloadForLog(compactProviderResponse)
+        ),
+        client_response: serializePayloadForStorage(protectPayloadForLog(compactClientResponse)),
+        provider: entry.provider ?? null,
+        model: entry.model ?? null,
+        source_format: entry.source_format ?? null,
+        target_format: entry.target_format ?? null,
+        duration_ms: entry.duration_ms ?? 0,
+      })
+      .execute();
+    return;
+  }
+
+  const db = getDbInstance();
   db.prepare(
     `
     INSERT INTO request_detail_logs
@@ -99,8 +134,22 @@ export function saveRequestDetailLog(entry: RequestDetailLog): void {
 }
 
 /** Fetch detailed logs (latest first) */
-export function getRequestDetailLogs(limit = 50, offset = 0): RequestDetailLog[] {
+export async function getRequestDetailLogs(limit = 50, offset = 0): Promise<RequestDetailLog[]> {
   if (!requestDetailLogsTableExists()) return [];
+
+  if (isPostgres()) {
+    await ensurePostgresBootstrap();
+    const kdb = getKyselyDb();
+    const rows = await kdb
+      .selectFrom("request_detail_logs")
+      .selectAll()
+      .orderBy("timestamp", "desc")
+      .limit(limit)
+      .offset(offset)
+      .execute();
+    return rows.map((r) => mapDetailedLogRow(r as unknown as Record<string, unknown>));
+  }
+
   const db = getDbInstance();
   const rows = db
     .prepare(
@@ -116,18 +165,45 @@ export function getRequestDetailLogs(limit = 50, offset = 0): RequestDetailLog[]
 }
 
 /** Get a single detailed log by ID */
-export function getRequestDetailLogById(id: string): RequestDetailLog | null {
+export async function getRequestDetailLogById(id: string): Promise<RequestDetailLog | null> {
   if (!requestDetailLogsTableExists()) return null;
+
+  if (isPostgres()) {
+    await ensurePostgresBootstrap();
+    const kdb = getKyselyDb();
+    const row = await kdb
+      .selectFrom("request_detail_logs")
+      .selectAll()
+      .where("id", "=", id)
+      .executeTakeFirst();
+    return row ? mapDetailedLogRow(row as unknown as Record<string, unknown>) : null;
+  }
+
   const db = getDbInstance();
   const row = db.prepare("SELECT * FROM request_detail_logs WHERE id = ?").get(id) as
-    | Record<string, unknown>
-    | undefined;
+    Record<string, unknown> | undefined;
   return row ? mapDetailedLogRow(row) : null;
 }
 
 /** Get the most recent detailed log for a call log ID */
-export function getRequestDetailLogByCallLogId(callLogId: string): RequestDetailLog | null {
+export async function getRequestDetailLogByCallLogId(
+  callLogId: string
+): Promise<RequestDetailLog | null> {
   if (!requestDetailLogsTableExists()) return null;
+
+  if (isPostgres()) {
+    await ensurePostgresBootstrap();
+    const kdb = getKyselyDb();
+    const row = await kdb
+      .selectFrom("request_detail_logs")
+      .selectAll()
+      .where("call_log_id", "=", callLogId)
+      .orderBy("timestamp", "desc")
+      .limit(1)
+      .executeTakeFirst();
+    return row ? mapDetailedLogRow(row as unknown as Record<string, unknown>) : null;
+  }
+
   const db = getDbInstance();
   const row = db
     .prepare(
@@ -143,8 +219,19 @@ export function getRequestDetailLogByCallLogId(callLogId: string): RequestDetail
 }
 
 /** Get total count of detailed logs */
-export function getRequestDetailLogCount(): number {
+export async function getRequestDetailLogCount(): Promise<number> {
   if (!requestDetailLogsTableExists()) return 0;
+
+  if (isPostgres()) {
+    await ensurePostgresBootstrap();
+    const kdb = getKyselyDb();
+    const row = await kdb
+      .selectFrom("request_detail_logs")
+      .select((eb) => eb.fn.countAll().as("cnt"))
+      .executeTakeFirst();
+    return row ? Number(row.cnt) : 0;
+  }
+
   const db = getDbInstance();
   const row = db.prepare("SELECT COUNT(*) as cnt FROM request_detail_logs").get() as {
     cnt: number;

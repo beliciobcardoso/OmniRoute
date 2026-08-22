@@ -518,8 +518,8 @@ function mapSummaryRow(row: CallLogSummaryRow) {
   };
 }
 
-function buildLegacyPipelinePayloads(id: string) {
-  const detailed = getRequestDetailLogByCallLogId(id);
+async function buildLegacyPipelinePayloads(id: string) {
+  const detailed = await getRequestDetailLogByCallLogId(id);
   if (!detailed) return null;
 
   return {
@@ -851,7 +851,8 @@ export async function getCallLogById(id: string) {
         requestBody: artifactResult.artifact.requestBody ?? null,
         responseBody: artifactResult.artifact.responseBody ?? null,
         error: artifactResult.artifact.error ?? entry.error,
-        pipelinePayloads: artifactResult.artifact.pipeline ?? buildLegacyPipelinePayloads(id),
+        pipelinePayloads:
+          artifactResult.artifact.pipeline ?? (await buildLegacyPipelinePayloads(id)),
         hasPipelineDetails: Boolean(artifactResult.artifact.pipeline) || entry.hasPipelineDetails,
         active: false,
       };
@@ -869,7 +870,7 @@ export async function getCallLogById(id: string) {
   if (detailState === "legacy-inline") {
     const legacyInline = getLegacyInlineDetail(id);
     if (legacyInline) {
-      const legacyPipeline = buildLegacyPipelinePayloads(id);
+      const legacyPipeline = await buildLegacyPipelinePayloads(id);
       return {
         ...entry,
         detailState,
@@ -884,7 +885,7 @@ export async function getCallLogById(id: string) {
 
   const legacyDisk = readLegacyLogFromDisk(entry);
   if (legacyDisk) {
-    const legacyPipeline = buildLegacyPipelinePayloads(id);
+    const legacyPipeline = await buildLegacyPipelinePayloads(id);
     return {
       ...entry,
       detailState,
@@ -898,7 +899,7 @@ export async function getCallLogById(id: string) {
     };
   }
 
-  const legacyPipeline = buildLegacyPipelinePayloads(id);
+  const legacyPipeline = await buildLegacyPipelinePayloads(id);
   return {
     ...entry,
     detailState,
