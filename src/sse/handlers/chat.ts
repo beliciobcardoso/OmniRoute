@@ -1503,12 +1503,12 @@ async function handleSingleModelChat(
           }
           if (runtimeOptions.sessionAffinityKey) {
             try {
-              const affinity = getSessionAccountAffinity(
+              const affinity = await getSessionAccountAffinity(
                 runtimeOptions.sessionAffinityKey,
                 provider
               );
               if (affinity?.connectionId === credentials.connectionId) {
-                deleteSessionAccountAffinity(runtimeOptions.sessionAffinityKey, provider);
+                await deleteSessionAccountAffinity(runtimeOptions.sessionAffinityKey, provider);
               }
             } catch {
               // best-effort: selection also excludes this connection for the current retry.
@@ -1553,12 +1553,12 @@ async function handleSingleModelChat(
           }
           if (runtimeOptions.sessionAffinityKey) {
             try {
-              const affinity = getSessionAccountAffinity(
+              const affinity = await getSessionAccountAffinity(
                 runtimeOptions.sessionAffinityKey,
                 provider
               );
               if (affinity?.connectionId === credentials.connectionId) {
-                deleteSessionAccountAffinity(runtimeOptions.sessionAffinityKey, provider);
+                await deleteSessionAccountAffinity(runtimeOptions.sessionAffinityKey, provider);
               }
             } catch {
               // best-effort: selection also excludes this connection for the current retry.
@@ -1763,7 +1763,7 @@ async function handleSingleModelChat(
         // account is left intact.
         if (runtimeOptions.sessionAffinityKey) {
           try {
-            evictSessionAccountAffinityForConnection(
+            await evictSessionAccountAffinityForConnection(
               runtimeOptions.sessionAffinityKey,
               provider,
               credentials.connectionId

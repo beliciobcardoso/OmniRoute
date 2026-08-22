@@ -2497,7 +2497,7 @@ export async function handleChatCore({
                 // Clear session affinity so next request won't be pinned to the failing account
                 if (codexSessionAffinityKey) {
                   try {
-                    deleteSessionAccountAffinity(codexSessionAffinityKey, "codex");
+                    await deleteSessionAccountAffinity(codexSessionAffinityKey, "codex");
                   } catch {
                     // best-effort
                   }

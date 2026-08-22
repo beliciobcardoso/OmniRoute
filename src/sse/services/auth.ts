@@ -1081,7 +1081,7 @@ export async function getProviderCredentials(
     // #5903: an active session-affinity pin outranks a per-request reset-aware
     // forcedConnectionId (see sessionAffinityPin leaf for the full rationale).
     forcedConnectionId =
-      applySessionAffinityPin({
+      (await applySessionAffinityPin({
         forcedConnectionId,
         options,
         sessionAffinityTtlMs,
@@ -1093,7 +1093,7 @@ export async function getProviderCredentials(
         isCodexScopeUnavailable,
         isQuotaPolicyBlocked: (c) =>
           evaluateQuotaLimitPolicy(provider, c as ProviderConnectionView, requestedModel).blocked,
-      }) ?? forcedConnectionId;
+      })) ?? forcedConnectionId;
 
     if (forcedConnectionId) {
       connections = connections.filter((conn) => conn.id === forcedConnectionId);
@@ -1482,8 +1482,7 @@ export async function getProviderCredentials(
       { fallbackStrategy?: string; stickyRoundRobinLimit?: number }
     >;
     const providerOverride = providerStrategyOverrides[resolvedId] || {};
-    const strategy =
-      providerOverride.fallbackStrategy || settings.fallbackStrategy || "fill-first";
+    const strategy = providerOverride.fallbackStrategy || settings.fallbackStrategy || "fill-first";
 
     let connection;
     const affinityConnection = await selectSessionAffinityConnection(
