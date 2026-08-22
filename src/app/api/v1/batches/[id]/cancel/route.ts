@@ -14,7 +14,7 @@ export async function POST(request: Request, { params }: { params: Promise<{ id:
   const apiKeyId = scope.apiKeyId;
 
   const { id } = await params;
-  const batch = getBatch(id);
+  const batch = await getBatch(id);
 
   if (!batch || (batch.apiKeyId !== null && batch.apiKeyId !== apiKeyId)) {
     return NextResponse.json(
@@ -36,12 +36,12 @@ export async function POST(request: Request, { params }: { params: Promise<{ id:
     return NextResponse.json(formatBatchResponse(batch), { headers: CORS_HEADERS });
   }
 
-  updateBatch(id, {
+  await updateBatch(id, {
     status: "cancelling",
     cancellingAt: Math.floor(Date.now() / 1000),
   });
 
-  const updatedBatch = getBatch(id);
+  const updatedBatch = await getBatch(id);
 
   return NextResponse.json(formatBatchResponse(updatedBatch), { headers: CORS_HEADERS });
 }

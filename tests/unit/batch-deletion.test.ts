@@ -19,20 +19,20 @@ describe("deleteBatch", () => {
       content: Buffer.from("{}"),
     });
 
-    const batch = createBatch({
+    const batch = await createBatch({
       endpoint: "/v1/chat/completions",
       completionWindow: "24h",
       inputFileId: inputFile.id,
       status: "completed",
     });
 
-    assert.ok(getBatch(batch.id));
+    assert.ok(await getBatch(batch.id));
     assert.ok(await getFile(inputFile.id));
 
     const result = await deleteBatch(batch.id);
     assert.strictEqual(result, true);
 
-    assert.strictEqual(getBatch(batch.id), null);
+    assert.strictEqual(await getBatch(batch.id), null);
     assert.strictEqual(await getFile(inputFile.id), null);
   });
 
@@ -61,7 +61,7 @@ describe("deleteBatch", () => {
       content: Buffer.from("error"),
     });
 
-    const batch = createBatch({
+    const batch = await createBatch({
       endpoint: "/v1/chat/completions",
       completionWindow: "24h",
       inputFileId: inputFile.id,
@@ -77,7 +77,7 @@ describe("deleteBatch", () => {
     const result = await deleteBatch(batch.id);
     assert.strictEqual(result, true);
 
-    assert.strictEqual(getBatch(batch.id), null);
+    assert.strictEqual(await getBatch(batch.id), null);
     assert.strictEqual(await getFile(inputFile.id), null);
     assert.strictEqual(await getFile(outputFile.id), null);
     assert.strictEqual(await getFile(errorFile.id), null);
@@ -90,7 +90,7 @@ describe("deleteBatch", () => {
       purpose: "batch",
       content: Buffer.from("x"),
     });
-    const batch = createBatch({
+    const batch = await createBatch({
       endpoint: "/v1/chat/completions",
       completionWindow: "24h",
       inputFileId: f.id,
@@ -101,11 +101,11 @@ describe("deleteBatch", () => {
     await deleteFile(f.id);
 
     assert.strictEqual(await getFile(f.id), null);
-    assert.ok(getBatch(batch.id));
+    assert.ok(await getBatch(batch.id));
 
     const result = await deleteBatch(batch.id);
     assert.strictEqual(result, true);
-    assert.strictEqual(getBatch(batch.id), null);
+    assert.strictEqual(await getBatch(batch.id), null);
   });
 
   it("should delete a batch regardless of status", async () => {
@@ -124,19 +124,23 @@ describe("deleteBatch", () => {
         purpose: "batch",
         content: Buffer.from("x"),
       });
-      const b = createBatch({
+      const b = await createBatch({
         endpoint: "/v1/chat/completions",
         completionWindow: "24h",
         inputFileId: f.id,
         status,
       });
-      assert.ok(getBatch(b.id), `batch with status '${status}' should exist`);
+      assert.ok(await getBatch(b.id), `batch with status '${status}' should exist`);
       assert.strictEqual(
         await deleteBatch(b.id),
         true,
         `deleteBatch for status '${status}' should succeed`
       );
-      assert.strictEqual(getBatch(b.id), null, `batch with status '${status}' should be gone`);
+      assert.strictEqual(
+        await getBatch(b.id),
+        null,
+        `batch with status '${status}' should be gone`
+      );
       assert.strictEqual(await getFile(f.id), null, `file for status '${status}' should be gone`);
     }
   });
@@ -157,7 +161,7 @@ describe("deleteCompletedBatches", () => {
       });
       fileIds.push(inputFile.id);
 
-      const batch = createBatch({
+      const batch = await createBatch({
         endpoint: "/v1/chat/completions",
         completionWindow: "24h",
         inputFileId: inputFile.id,
@@ -173,7 +177,7 @@ describe("deleteCompletedBatches", () => {
       purpose: "batch",
       content: Buffer.from("{}"),
     });
-    const liveBatch = createBatch({
+    const liveBatch = await createBatch({
       endpoint: "/v1/chat/completions",
       completionWindow: "24h",
       inputFileId: liveInput.id,
@@ -181,9 +185,9 @@ describe("deleteCompletedBatches", () => {
     });
 
     // Verify everything exists
-    for (const id of batchIds) assert.ok(getBatch(id), `batch ${id} should exist`);
+    for (const id of batchIds) assert.ok(await getBatch(id), `batch ${id} should exist`);
     for (const id of fileIds) assert.ok(await getFile(id), `file ${id} should exist`);
-    assert.ok(getBatch(liveBatch.id));
+    assert.ok(await getBatch(liveBatch.id));
     assert.ok(await getFile(liveInput.id));
 
     // Delete all completed (may include pre-existing ones from other tests)
@@ -192,11 +196,11 @@ describe("deleteCompletedBatches", () => {
     assert.ok(result.deletedFiles >= 3, `expected >=3, got ${result.deletedFiles}`);
 
     // Verify completed batches and their files are gone
-    for (const id of batchIds) assert.strictEqual(getBatch(id), null);
+    for (const id of batchIds) assert.strictEqual(await getBatch(id), null);
     for (const id of fileIds) assert.strictEqual(await getFile(id), null);
 
     // Verify non-completed batch and its file survive
-    assert.ok(getBatch(liveBatch.id), "non-completed batch should survive");
+    assert.ok(await getBatch(liveBatch.id), "non-completed batch should survive");
     assert.ok(await getFile(liveInput.id), "non-completed batch's file should survive");
   });
 
@@ -214,29 +218,29 @@ describe("deleteCompletedBatches", () => {
       content: Buffer.from("shared"),
     });
 
-    const batchA = createBatch({
+    const batchA = await createBatch({
       endpoint: "/v1/chat/completions",
       completionWindow: "24h",
       inputFileId: sharedFile.id,
       status: "completed",
     });
-    const batchB = createBatch({
+    const batchB = await createBatch({
       endpoint: "/v1/chat/completions",
       completionWindow: "24h",
       inputFileId: sharedFile.id,
       status: "completed",
     });
 
-    assert.ok(getBatch(batchA.id));
-    assert.ok(getBatch(batchB.id));
+    assert.ok(await getBatch(batchA.id));
+    assert.ok(await getBatch(batchB.id));
     assert.ok(await getFile(sharedFile.id));
 
     const result = await deleteCompletedBatches();
     assert.ok(result.deletedBatches >= 2);
     assert.ok(result.deletedFiles >= 1, "shared file should be counted once");
 
-    assert.strictEqual(getBatch(batchA.id), null);
-    assert.strictEqual(getBatch(batchB.id), null);
+    assert.strictEqual(await getBatch(batchA.id), null);
+    assert.strictEqual(await getBatch(batchB.id), null);
     assert.strictEqual(await getFile(sharedFile.id), null);
   });
 });

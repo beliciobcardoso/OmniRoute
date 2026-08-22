@@ -1,6 +1,25 @@
 import { getDbInstance, rowToCamel, objToSnake } from "./core";
 import { deleteFile } from "./files";
+import { resolveDbDriverConfig } from "./driverConfig";
+import { ensurePostgresBootstrap, getKyselyDb } from "./kysely/client";
 import { v4 as uuidv4 } from "uuid";
+
+function isPostgres(): boolean {
+  return resolveDbDriverConfig().driver === "postgres";
+}
+
+// Postgres BIGINT/INTEGER columns come back as JS strings from node-postgres
+// for some numeric columns; coerceNum below already defends against that for
+// batch date fields. checkpoint numeric fields need the same treatment.
+function toInt(value: unknown): number {
+  if (typeof value === "number") return value;
+  if (typeof value === "bigint") return Number(value);
+  if (typeof value === "string" && value.trim().length > 0) {
+    const parsed = Number(value);
+    return Number.isFinite(parsed) ? parsed : 0;
+  }
+  return 0;
+}
 
 function parseBatchRow(row: any): BatchRecord {
   const camel = rowToCamel(row) as any;
@@ -42,6 +61,9 @@ function parseBatchRow(row: any): BatchRecord {
   camel.expiredAt = coerceNum(camel.expiredAt);
   camel.cancellingAt = coerceNum(camel.cancellingAt);
   camel.cancelledAt = coerceNum(camel.cancelledAt);
+  camel.requestCountsTotal = toInt(camel.requestCountsTotal);
+  camel.requestCountsCompleted = toInt(camel.requestCountsCompleted);
+  camel.requestCountsFailed = toInt(camel.requestCountsFailed);
   return camel as BatchRecord;
 }
 
@@ -108,17 +130,17 @@ function parseJsonColumn(value: unknown): any | null {
 function parseBatchItemCheckpoint(row: any): BatchItemCheckpoint {
   return {
     batchId: row.batch_id,
-    lineNumber: Number(row.line_number),
+    lineNumber: toInt(row.line_number),
     customId: row.custom_id ?? null,
     status: row.status,
     result: parseJsonColumn(row.result_json),
     error: parseJsonColumn(row.error_json),
-    createdAt: Number(row.created_at),
-    updatedAt: Number(row.updated_at),
+    createdAt: toInt(row.created_at),
+    updatedAt: toInt(row.updated_at),
   };
 }
 
-export function createBatch(
+export async function createBatch(
   batch: Omit<
     BatchRecord,
     | "id"
@@ -128,8 +150,7 @@ export function createBatch(
     | "requestCountsFailed"
     | "status"
   > & { status?: BatchRecord["status"] }
-): BatchRecord {
-  const db = getDbInstance();
+): Promise<BatchRecord> {
   const id = "batch_" + uuidv4().replaceAll("-", "").substring(0, 24);
   const createdAt = Math.floor(Date.now() / 1000);
   const record: BatchRecord = {
@@ -153,6 +174,14 @@ export function createBatch(
     errors: record.errors ? JSON.stringify(record.errors) : null,
     usage: record.usage ? JSON.stringify(record.usage) : null,
   }) as any;
+
+  if (isPostgres()) {
+    await ensurePostgresBootstrap();
+    await getKyselyDb().insertInto("batches").values(snakeRecord).execute();
+    return record;
+  }
+
+  const db = getDbInstance();
   const keys = Object.keys(snakeRecord);
   const values = Object.values(snakeRecord);
   const placeholders = keys.map(() => "?").join(", ");
@@ -162,15 +191,24 @@ export function createBatch(
   return record;
 }
 
-export function getBatch(id: string): BatchRecord | null {
+export async function getBatch(id: string): Promise<BatchRecord | null> {
+  if (isPostgres()) {
+    await ensurePostgresBootstrap();
+    const row = await getKyselyDb()
+      .selectFrom("batches")
+      .selectAll()
+      .where("id", "=", id)
+      .executeTakeFirst();
+    return row ? parseBatchRow(row) : null;
+  }
+
   const db = getDbInstance();
   const row = db.prepare("SELECT * FROM batches WHERE id = ?").get(id);
   if (!row) return null;
   return parseBatchRow(row);
 }
 
-export function updateBatch(id: string, updates: Partial<BatchRecord>): boolean {
-  const db = getDbInstance();
+export async function updateBatch(id: string, updates: Partial<BatchRecord>): Promise<boolean> {
   const snakeUpdates = objToSnake(updates) as any;
   if (snakeUpdates.metadata && typeof snakeUpdates.metadata !== "string") {
     snakeUpdates.metadata = JSON.stringify(snakeUpdates.metadata);
@@ -185,6 +223,17 @@ export function updateBatch(id: string, updates: Partial<BatchRecord>): boolean 
   const keys = Object.keys(snakeUpdates);
   if (keys.length === 0) return false;
 
+  if (isPostgres()) {
+    await ensurePostgresBootstrap();
+    const result = await getKyselyDb()
+      .updateTable("batches")
+      .set(snakeUpdates)
+      .where("id", "=", id)
+      .executeTakeFirst();
+    return Number(result.numUpdatedRows) > 0;
+  }
+
+  const db = getDbInstance();
   const setClause = keys.map((k) => `${k} = ?`).join(", ");
   const values = Object.values(snakeUpdates);
 
@@ -192,14 +241,37 @@ export function updateBatch(id: string, updates: Partial<BatchRecord>): boolean 
   return result.changes > 0;
 }
 
-export function ensureBatchItemCheckpoints(
+export async function ensureBatchItemCheckpoints(
   batchId: string,
   items: Array<{ lineNumber: number; customId: string | null }>
-): void {
+): Promise<void> {
   if (items.length === 0) return;
 
-  const db = getDbInstance();
   const now = Math.floor(Date.now() / 1000);
+
+  if (isPostgres()) {
+    await ensurePostgresBootstrap();
+    const kdb = getKyselyDb();
+    await kdb
+      .insertInto("batch_item_checkpoints")
+      .values(
+        items.map((item) => ({
+          batch_id: batchId,
+          line_number: item.lineNumber,
+          custom_id: item.customId,
+          status: "pending",
+          result_json: null,
+          error_json: null,
+          created_at: now,
+          updated_at: now,
+        }))
+      )
+      .onConflict((oc) => oc.columns(["batch_id", "line_number"]).doNothing())
+      .execute();
+    return;
+  }
+
+  const db = getDbInstance();
   const insert = db.prepare(`
     INSERT OR IGNORE INTO batch_item_checkpoints (
       batch_id,
@@ -222,7 +294,17 @@ export function ensureBatchItemCheckpoints(
   tx();
 }
 
-export function countBatchItemCheckpoints(batchId: string): number {
+export async function countBatchItemCheckpoints(batchId: string): Promise<number> {
+  if (isPostgres()) {
+    await ensurePostgresBootstrap();
+    const row = await getKyselyDb()
+      .selectFrom("batch_item_checkpoints")
+      .select((eb) => eb.fn.countAll().as("c"))
+      .where("batch_id", "=", batchId)
+      .executeTakeFirst();
+    return row ? toInt(row.c) : 0;
+  }
+
   const db = getDbInstance();
   const row = db
     .prepare("SELECT COUNT(*) AS c FROM batch_item_checkpoints WHERE batch_id = ?")
@@ -230,7 +312,27 @@ export function countBatchItemCheckpoints(batchId: string): number {
   return row ? Number(row.c) : 0;
 }
 
-export function listBatchItemCheckpoints(batchId: string): BatchItemCheckpoint[] {
+export async function listBatchItemCheckpoints(batchId: string): Promise<BatchItemCheckpoint[]> {
+  if (isPostgres()) {
+    await ensurePostgresBootstrap();
+    const rows = await getKyselyDb()
+      .selectFrom("batch_item_checkpoints")
+      .select([
+        "batch_id",
+        "line_number",
+        "custom_id",
+        "status",
+        "result_json",
+        "error_json",
+        "created_at",
+        "updated_at",
+      ])
+      .where("batch_id", "=", batchId)
+      .orderBy("line_number", "asc")
+      .execute();
+    return rows.map((row) => parseBatchItemCheckpoint(row));
+  }
+
   const db = getDbInstance();
   const rows = db
     .prepare(
@@ -245,12 +347,40 @@ export function listBatchItemCheckpoints(batchId: string): BatchItemCheckpoint[]
   return rows.map((row) => parseBatchItemCheckpoint(row));
 }
 
-export function markBatchItemProcessing(
+export async function markBatchItemProcessing(
   batchId: string,
   item: { lineNumber: number; customId: string | null }
-): void {
-  const db = getDbInstance();
+): Promise<void> {
   const now = Math.floor(Date.now() / 1000);
+
+  if (isPostgres()) {
+    await ensurePostgresBootstrap();
+    await getKyselyDb()
+      .insertInto("batch_item_checkpoints")
+      .values({
+        batch_id: batchId,
+        line_number: item.lineNumber,
+        custom_id: item.customId,
+        status: "processing",
+        result_json: null,
+        error_json: null,
+        created_at: now,
+        updated_at: now,
+      })
+      .onConflict((oc) =>
+        oc.columns(["batch_id", "line_number"]).doUpdateSet({
+          custom_id: item.customId,
+          status: "processing",
+          result_json: null,
+          error_json: null,
+          updated_at: now,
+        })
+      )
+      .execute();
+    return;
+  }
+
+  const db = getDbInstance();
   db.prepare(
     `
     INSERT INTO batch_item_checkpoints (
@@ -274,13 +404,32 @@ export function markBatchItemProcessing(
   ).run(batchId, item.lineNumber, item.customId, now, now);
 }
 
-export function markBatchItemResult(
+export async function markBatchItemResult(
   batchId: string,
   item: { lineNumber: number; customId: string | null },
   result: any
-): void {
-  const db = getDbInstance();
+): Promise<void> {
   const now = Math.floor(Date.now() / 1000);
+  const resultJson = JSON.stringify(result);
+
+  if (isPostgres()) {
+    await ensurePostgresBootstrap();
+    await getKyselyDb()
+      .updateTable("batch_item_checkpoints")
+      .set({
+        custom_id: item.customId,
+        status: "completed",
+        result_json: resultJson,
+        error_json: null,
+        updated_at: now,
+      })
+      .where("batch_id", "=", batchId)
+      .where("line_number", "=", item.lineNumber)
+      .execute();
+    return;
+  }
+
+  const db = getDbInstance();
   db.prepare(
     `
     UPDATE batch_item_checkpoints
@@ -291,16 +440,35 @@ export function markBatchItemResult(
         updated_at = ?
     WHERE batch_id = ? AND line_number = ?
   `
-  ).run(item.customId, JSON.stringify(result), now, batchId, item.lineNumber);
+  ).run(item.customId, resultJson, now, batchId, item.lineNumber);
 }
 
-export function markBatchItemError(
+export async function markBatchItemError(
   batchId: string,
   item: { lineNumber: number; customId: string | null },
   error: any
-): void {
-  const db = getDbInstance();
+): Promise<void> {
   const now = Math.floor(Date.now() / 1000);
+  const errorJson = JSON.stringify(error);
+
+  if (isPostgres()) {
+    await ensurePostgresBootstrap();
+    await getKyselyDb()
+      .updateTable("batch_item_checkpoints")
+      .set({
+        custom_id: item.customId,
+        status: "errored",
+        result_json: null,
+        error_json: errorJson,
+        updated_at: now,
+      })
+      .where("batch_id", "=", batchId)
+      .where("line_number", "=", item.lineNumber)
+      .execute();
+    return;
+  }
+
+  const db = getDbInstance();
   db.prepare(
     `
     UPDATE batch_item_checkpoints
@@ -311,12 +479,39 @@ export function markBatchItemError(
         updated_at = ?
     WHERE batch_id = ? AND line_number = ?
   `
-  ).run(item.customId, JSON.stringify(error), now, batchId, item.lineNumber);
+  ).run(item.customId, errorJson, now, batchId, item.lineNumber);
 }
 
-export function listBatches(apiKeyId?: string, limit: number = 20, after?: string): BatchRecord[] {
+export async function listBatches(
+  apiKeyId?: string,
+  limit: number = 20,
+  after?: string
+): Promise<BatchRecord[]> {
+  const afterBatch = after ? await getBatch(after) : null;
+
+  if (isPostgres()) {
+    await ensurePostgresBootstrap();
+    let query = getKyselyDb().selectFrom("batches").selectAll();
+    if (apiKeyId) {
+      query = query.where("api_key_id", "=", apiKeyId);
+    }
+    if (afterBatch) {
+      query = query.where((eb) =>
+        eb.or([
+          eb("created_at", "<", afterBatch.createdAt),
+          eb.and([eb("created_at", "=", afterBatch.createdAt), eb("id", "<", after as string)]),
+        ])
+      );
+    }
+    const rows = await query
+      .orderBy("created_at", "desc")
+      .orderBy("id", "desc")
+      .limit(limit)
+      .execute();
+    return rows.map((row) => parseBatchRow(row));
+  }
+
   const db = getDbInstance();
-  const afterBatch = after ? getBatch(after) : null;
   let rows: any[];
   if (apiKeyId) {
     if (afterBatch) {
@@ -344,7 +539,19 @@ export function listBatches(apiKeyId?: string, limit: number = 20, after?: strin
   return rows.map((row) => parseBatchRow(row));
 }
 
-export function countBatches(apiKeyId?: string): number {
+export async function countBatches(apiKeyId?: string): Promise<number> {
+  if (isPostgres()) {
+    await ensurePostgresBootstrap();
+    let query = getKyselyDb()
+      .selectFrom("batches")
+      .select((eb) => eb.fn.countAll().as("c"));
+    if (apiKeyId) {
+      query = query.where("api_key_id", "=", apiKeyId);
+    }
+    const row = await query.executeTakeFirst();
+    return row ? toInt(row.c) : 0;
+  }
+
   const db = getDbInstance();
   if (apiKeyId) {
     const row = db
@@ -357,7 +564,17 @@ export function countBatches(apiKeyId?: string): number {
   }
 }
 
-export function getPendingBatches(): BatchRecord[] {
+export async function getPendingBatches(): Promise<BatchRecord[]> {
+  if (isPostgres()) {
+    await ensurePostgresBootstrap();
+    const rows = await getKyselyDb()
+      .selectFrom("batches")
+      .selectAll()
+      .where("status", "in", ["validating", "in_progress", "finalizing", "cancelling"])
+      .execute();
+    return rows.map((row) => parseBatchRow(row));
+  }
+
   const db = getDbInstance();
   const rows = db
     .prepare(
@@ -367,7 +584,18 @@ export function getPendingBatches(): BatchRecord[] {
   return rows.map((row) => parseBatchRow(row));
 }
 
-export function getTerminalBatches(): BatchRecord[] {
+export async function getTerminalBatches(): Promise<BatchRecord[]> {
+  if (isPostgres()) {
+    await ensurePostgresBootstrap();
+    const rows = await getKyselyDb()
+      .selectFrom("batches")
+      .selectAll()
+      .where("status", "in", ["completed", "failed", "cancelled", "expired"])
+      .orderBy("created_at", "asc")
+      .execute();
+    return rows.map((row) => parseBatchRow(row));
+  }
+
   const db = getDbInstance();
   const rows = db
     .prepare(
@@ -378,11 +606,16 @@ export function getTerminalBatches(): BatchRecord[] {
 }
 
 export async function deleteBatch(id: string): Promise<boolean> {
-  const db = getDbInstance();
-  const batch = getBatch(id);
+  const batch = await getBatch(id);
   if (!batch) return false;
 
-  db.prepare("DELETE FROM batch_item_checkpoints WHERE batch_id = ?").run(id);
+  if (isPostgres()) {
+    await ensurePostgresBootstrap();
+    await getKyselyDb().deleteFrom("batch_item_checkpoints").where("batch_id", "=", id).execute();
+  } else {
+    const db = getDbInstance();
+    db.prepare("DELETE FROM batch_item_checkpoints WHERE batch_id = ?").run(id);
+  }
 
   // Soft-delete associated files (input, output, error)
   if (batch.inputFileId) {
@@ -407,6 +640,15 @@ export async function deleteBatch(id: string): Promise<boolean> {
     }
   }
 
+  if (isPostgres()) {
+    const result = await getKyselyDb()
+      .deleteFrom("batches")
+      .where("id", "=", id)
+      .executeTakeFirst();
+    return Number(result.numDeletedRows) > 0;
+  }
+
+  const db = getDbInstance();
   const result = db.prepare("DELETE FROM batches WHERE id = ?").run(id);
   return result.changes > 0;
 }
@@ -415,18 +657,27 @@ export async function deleteCompletedBatches(): Promise<{
   deletedBatches: number;
   deletedFiles: number;
 }> {
-  const db = getDbInstance();
-
-  // Collect unique file IDs from all completed batches
-  const rows = db
-    .prepare(
-      "SELECT input_file_id, output_file_id, error_file_id FROM batches WHERE status = 'completed'"
-    )
-    .all() as Array<{
+  let rows: Array<{
     input_file_id: string | null;
     output_file_id: string | null;
     error_file_id: string | null;
   }>;
+
+  if (isPostgres()) {
+    await ensurePostgresBootstrap();
+    rows = await getKyselyDb()
+      .selectFrom("batches")
+      .select(["input_file_id", "output_file_id", "error_file_id"])
+      .where("status", "=", "completed")
+      .execute();
+  } else {
+    const db = getDbInstance();
+    rows = db
+      .prepare(
+        "SELECT input_file_id, output_file_id, error_file_id FROM batches WHERE status = 'completed'"
+      )
+      .all() as typeof rows;
+  }
 
   const fileIds = new Set<string>();
   for (const row of rows) {
@@ -444,6 +695,24 @@ export async function deleteCompletedBatches(): Promise<{
     }
   }
 
+  if (isPostgres()) {
+    const kdb = getKyselyDb();
+    await kdb
+      .deleteFrom("batch_item_checkpoints")
+      .where(
+        "batch_id",
+        "in",
+        kdb.selectFrom("batches").select("id").where("status", "=", "completed")
+      )
+      .execute();
+    const result = await kdb
+      .deleteFrom("batches")
+      .where("status", "=", "completed")
+      .executeTakeFirst();
+    return { deletedBatches: Number(result.numDeletedRows), deletedFiles };
+  }
+
+  const db = getDbInstance();
   db.prepare(
     "DELETE FROM batch_item_checkpoints WHERE batch_id IN (SELECT id FROM batches WHERE status = 'completed')"
   ).run();

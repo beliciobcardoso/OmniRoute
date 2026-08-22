@@ -536,9 +536,9 @@ test("processPendingBatches should respect BATCH_MAX_CONCURRENT (default 1)", as
   await batchProcessor.processPendingBatches();
 
   const statuses = [
-    localDb.getBatch(batchA.id)?.status,
-    localDb.getBatch(batchB.id)?.status,
-    localDb.getBatch(batchC.id)?.status,
+    (await localDb.getBatch(batchA.id))?.status,
+    (await localDb.getBatch(batchB.id))?.status,
+    (await localDb.getBatch(batchC.id))?.status,
   ];
 
   const inProgressCount = statuses.filter((s) => s === "in_progress").length;

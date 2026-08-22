@@ -98,7 +98,7 @@ test("Batch API and Processing", async () => {
   assert.ok(file.id.startsWith("file-"), "File ID should start with file-");
 
   // 2. Create a batch
-  const batch = createBatch({
+  const batch = await createBatch({
     endpoint: "/v1/chat/completions",
     completionWindow: "24h",
     inputFileId: file.id,
@@ -120,7 +120,7 @@ test("Batch API and Processing", async () => {
 
   // Poll for status change
   let maxAttempts = 30;
-  let currentBatch = getBatch(batch.id);
+  let currentBatch = await getBatch(batch.id);
   while (
     maxAttempts > 0 &&
     currentBatch?.status !== "completed" &&
@@ -128,7 +128,7 @@ test("Batch API and Processing", async () => {
     currentBatch?.status !== "cancelled"
   ) {
     await new Promise((resolve) => setTimeout(resolve, 2000));
-    currentBatch = getBatch(batch.id);
+    currentBatch = await getBatch(batch.id);
     const progress = currentBatch?.requestCountsTotal
       ? `${currentBatch.requestCountsCompleted}/${currentBatch.requestCountsTotal}`
       : "not started";
@@ -230,7 +230,7 @@ test("Batch handles and counts failures correctly", async () => {
     });
 
     // 2. Create a batch
-    const batch = createBatch({
+    const batch = await createBatch({
       endpoint: "/v1/chat/completions",
       completionWindow: "24h",
       inputFileId: file.id,
@@ -239,14 +239,14 @@ test("Batch handles and counts failures correctly", async () => {
 
     // 3. Poll for completion
     let maxAttempts = 20;
-    let currentBatch = getBatch(batch.id);
+    let currentBatch = await getBatch(batch.id);
     while (
       maxAttempts > 0 &&
       currentBatch?.status !== "completed" &&
       currentBatch?.status !== "failed"
     ) {
       await new Promise((resolve) => setTimeout(resolve, 1000));
-      currentBatch = getBatch(batch.id);
+      currentBatch = await getBatch(batch.id);
       maxAttempts--;
     }
 
@@ -316,7 +316,7 @@ test("Batch dispatches non-chat endpoints through the matching route handler", a
       apiKeyId: null,
     });
 
-    const batch = createBatch({
+    const batch = await createBatch({
       endpoint: "/v1/embeddings",
       completionWindow: "24h",
       inputFileId: file.id,
@@ -324,14 +324,14 @@ test("Batch dispatches non-chat endpoints through the matching route handler", a
     });
 
     let maxAttempts = 20;
-    let currentBatch = getBatch(batch.id);
+    let currentBatch = await getBatch(batch.id);
     while (
       maxAttempts > 0 &&
       currentBatch?.status !== "completed" &&
       currentBatch?.status !== "failed"
     ) {
       await new Promise((resolve) => setTimeout(resolve, 1000));
-      currentBatch = getBatch(batch.id);
+      currentBatch = await getBatch(batch.id);
       maxAttempts--;
     }
 
@@ -373,7 +373,7 @@ test("Batch rejects input lines whose url does not match the batch endpoint", as
       apiKeyId: null,
     });
 
-    const batch = createBatch({
+    const batch = await createBatch({
       endpoint: "/v1/chat/completions",
       completionWindow: "24h",
       inputFileId: file.id,
@@ -382,7 +382,7 @@ test("Batch rejects input lines whose url does not match the batch endpoint", as
 
     await processPendingBatches();
 
-    const currentBatch = getBatch(batch.id);
+    const currentBatch = await getBatch(batch.id);
     assert.strictEqual(currentBatch?.status, "failed");
     assert.match(
       String(currentBatch?.errors?.[0]?.message || ""),
@@ -417,7 +417,7 @@ test("Batch forces stream: false for all requests", async () => {
       apiKeyId: null,
     });
 
-    const batch = createBatch({
+    const batch = await createBatch({
       endpoint: "/v1/chat/completions",
       completionWindow: "24h",
       inputFileId: file.id,
@@ -425,14 +425,14 @@ test("Batch forces stream: false for all requests", async () => {
     });
 
     let maxAttempts = 20;
-    let currentBatch = getBatch(batch.id);
+    let currentBatch = await getBatch(batch.id);
     while (
       maxAttempts > 0 &&
       currentBatch?.status !== "completed" &&
       currentBatch?.status !== "failed"
     ) {
       await new Promise((resolve) => setTimeout(resolve, 1000));
-      currentBatch = getBatch(batch.id);
+      currentBatch = await getBatch(batch.id);
       maxAttempts--;
     }
 
@@ -472,7 +472,7 @@ test("Batch API response format is spec-compliant", async () => {
   });
 
   // Create a mock batch directly
-  const batch = createBatch({
+  const batch = await createBatch({
     endpoint: "/v1/chat/completions",
     completionWindow: "24h",
     inputFileId: file.id,
@@ -481,7 +481,7 @@ test("Batch API response format is spec-compliant", async () => {
   });
 
   // Mock an update with some counts and usage
-  updateBatch(batch.id, {
+  await updateBatch(batch.id, {
     status: "completed",
     requestCountsTotal: 10,
     requestCountsCompleted: 8,
@@ -496,7 +496,7 @@ test("Batch API response format is spec-compliant", async () => {
     },
   });
 
-  const updatedBatch = getBatch(batch.id)!;
+  const updatedBatch = await getBatch(batch.id)!;
 
   // Test the formatter used in API routes (simulate the route's response)
   function formatBatchResponse(batch: any) {
@@ -565,14 +565,14 @@ test("List batches pagination and response format", async () => {
   const batchOrder: Array<{ createdAt: number; id: string }> = [];
   const baseCreatedAt = Math.floor(Date.now() / 1000) - 10_000;
   for (let i = 0; i < 5; i++) {
-    const b = createBatch({
+    const b = await createBatch({
       endpoint: "/v1/chat/completions",
       completionWindow: "24h",
       inputFileId: file.id,
       apiKeyId: apiKey.id,
       metadata: { index: i },
     });
-    updateBatch(b.id, { createdAt: baseCreatedAt + i });
+    await updateBatch(b.id, { createdAt: baseCreatedAt + i });
     batchOrder.push({ createdAt: baseCreatedAt + i, id: b.id });
   }
 
@@ -581,13 +581,13 @@ test("List batches pagination and response format", async () => {
 
   // 2. Test listBatches logic (direct DB call)
   const { listBatches } = await import("../../src/lib/localDb");
-  const allBatches = listBatches(apiKey.id, 10);
+  const allBatches = await listBatches(apiKey.id, 10);
   assert.strictEqual(allBatches.length, 5);
   assert.strictEqual(allBatches[0].id, batchIds[0]);
 
   // 3. Test pagination logic (as implemented in the route)
   const limit = 2;
-  const batchesPage1 = listBatches(apiKey.id, limit + 1);
+  const batchesPage1 = await listBatches(apiKey.id, limit + 1);
   const hasMore1 = batchesPage1.length > limit;
   const data1 = hasMore1 ? batchesPage1.slice(0, limit) : batchesPage1;
 
@@ -597,7 +597,7 @@ test("List batches pagination and response format", async () => {
   assert.strictEqual(data1[1].id, batchIds[1]);
 
   const after = data1[1].id;
-  const batchesPage2 = listBatches(apiKey.id, limit + 1, after);
+  const batchesPage2 = await listBatches(apiKey.id, limit + 1, after);
   const hasMore2 = batchesPage2.length > limit;
   const data2 = hasMore2 ? batchesPage2.slice(0, limit) : batchesPage2;
 
@@ -607,7 +607,7 @@ test("List batches pagination and response format", async () => {
   assert.strictEqual(data2[1].id, batchIds[3]);
 
   const after2 = data2[1].id;
-  const batchesPage3 = listBatches(apiKey.id, limit + 1, after2);
+  const batchesPage3 = await listBatches(apiKey.id, limit + 1, after2);
   const hasMore3 = batchesPage3.length > limit;
   const data3 = hasMore3 ? batchesPage3.slice(0, limit) : batchesPage3;
 
@@ -642,7 +642,7 @@ test("Batch cleanup honors output_expires_after for output artifacts", async () 
     apiKeyId: apiKey.id,
   });
 
-  const batch = createBatch({
+  const batch = await createBatch({
     endpoint: "/v1/chat/completions",
     completionWindow: "24h",
     inputFileId: inputFile.id,
@@ -651,7 +651,7 @@ test("Batch cleanup honors output_expires_after for output artifacts", async () 
     outputExpiresAfterAnchor: "created_at",
   });
 
-  updateBatch(batch.id, {
+  await updateBatch(batch.id, {
     status: "completed",
     createdAt: now - 3700,
     completedAt: now - 30,
@@ -691,21 +691,21 @@ test("Batch processor recovers orphaned finalizing batches during startup recove
     apiKeyId: apiKey.id,
   });
 
-  const batch = createBatch({
+  const batch = await createBatch({
     endpoint: "/v1/chat/completions",
     completionWindow: "24h",
     inputFileId: inputFile.id,
     apiKeyId: apiKey.id,
   });
 
-  updateBatch(batch.id, {
+  await updateBatch(batch.id, {
     status: "finalizing",
     finalizingAt: Math.floor(Date.now() / 1000),
     requestCountsTotal: 1,
     requestCountsCompleted: 1,
   });
-  ensureBatchItemCheckpoints(batch.id, [{ lineNumber: 1, customId: "req-recovery" }]);
-  markBatchItemResult(
+  await ensureBatchItemCheckpoints(batch.id, [{ lineNumber: 1, customId: "req-recovery" }]);
+  await markBatchItemResult(
     batch.id,
     { lineNumber: 1, customId: "req-recovery" },
     {
@@ -745,7 +745,7 @@ test("Batch processor recovers orphaned finalizing batches during startup recove
     await processPendingBatches();
     await waitForAllBatches();
 
-    const recoveredBatch = getBatch(batch.id);
+    const recoveredBatch = await getBatch(batch.id);
     assert.strictEqual(recoveredBatch?.status, "completed");
     assert.strictEqual(fetchCount, 0);
   } finally {
@@ -805,7 +805,7 @@ test("Batch by-id route exposes ownerless records to anonymous requests", async 
     content: Buffer.from("{}"),
     apiKeyId: null,
   });
-  const batch = createBatch({
+  const batch = await createBatch({
     endpoint: "/v1/chat/completions",
     completionWindow: "24h",
     inputFileId: file.id,
@@ -834,7 +834,7 @@ test("Batch Cancel API", async () => {
     apiKeyId: apiKey.id,
   });
 
-  const batch = createBatch({
+  const batch = await createBatch({
     endpoint: "/v1/chat/completions",
     completionWindow: "24h",
     inputFileId: file.id,
@@ -846,18 +846,18 @@ test("Batch Cancel API", async () => {
 
   // 2. Cancel it
   const cancellingAt = Math.floor(Date.now() / 1000);
-  updateBatch(batch.id, {
+  await updateBatch(batch.id, {
     status: "cancelling",
     cancellingAt,
   });
 
-  const updatedBatch = getBatch(batch.id)!;
+  const updatedBatch = await getBatch(batch.id)!;
   assert.strictEqual(updatedBatch.status, "cancelling");
   assert.strictEqual(updatedBatch.cancellingAt, cancellingAt);
 
   // 3. Test that it can't be cancelled if already terminal
-  updateBatch(batch.id, { status: "completed" });
-  const terminalBatch = getBatch(batch.id)!;
+  await updateBatch(batch.id, { status: "completed" });
+  const terminalBatch = await getBatch(batch.id)!;
   assert.strictEqual(terminalBatch.status, "completed");
 
   // In actual API this would return 400, here we just verify state logic
@@ -897,7 +897,7 @@ test("Batch processor keeps cancelled status for in-flight batches", async () =>
     apiKeyId: apiKey.id,
   });
 
-  const batch = createBatch({
+  const batch = await createBatch({
     endpoint: "/v1/chat/completions",
     completionWindow: "24h",
     inputFileId: file.id,
@@ -905,7 +905,7 @@ test("Batch processor keeps cancelled status for in-flight batches", async () =>
   });
 
   (globalThis as any).fetch = async () => {
-    updateBatch(batch.id, {
+    await updateBatch(batch.id, {
       status: "cancelled",
       cancelledAt: Math.floor(Date.now() / 1000),
     });
@@ -933,7 +933,7 @@ test("Batch processor keeps cancelled status for in-flight batches", async () =>
   try {
     await processPendingBatches();
 
-    let currentBatch = getBatch(batch.id);
+    let currentBatch = await getBatch(batch.id);
     let remainingAttempts = 40;
     while (
       remainingAttempts > 0 &&
@@ -941,7 +941,7 @@ test("Batch processor keeps cancelled status for in-flight batches", async () =>
       !["cancelled", "completed", "failed", "expired"].includes(currentBatch.status)
     ) {
       await new Promise((resolve) => setTimeout(resolve, 50));
-      currentBatch = getBatch(batch.id);
+      currentBatch = await getBatch(batch.id);
       remainingAttempts--;
     }
 
@@ -1185,7 +1185,7 @@ test("Batch dispatches to embeddings handler for /v1/embeddings URL", async () =
       apiKeyId: null,
     });
 
-    const batch = createBatch({
+    const batch = await createBatch({
       endpoint: "/v1/embeddings",
       completionWindow: "24h",
       inputFileId: file.id,
@@ -1193,14 +1193,14 @@ test("Batch dispatches to embeddings handler for /v1/embeddings URL", async () =
     });
 
     let maxAttempts = 20;
-    let currentBatch = getBatch(batch.id);
+    let currentBatch = await getBatch(batch.id);
     while (
       maxAttempts > 0 &&
       currentBatch?.status !== "completed" &&
       currentBatch?.status !== "failed"
     ) {
       await new Promise((resolve) => setTimeout(resolve, 1000));
-      currentBatch = getBatch(batch.id);
+      currentBatch = await getBatch(batch.id);
       maxAttempts--;
     }
 
@@ -1240,46 +1240,49 @@ test("getTerminalBatches returns only terminal statuses ordered oldest first", a
   });
 
   // Create batches in different terminal and non-terminal states
-  const completedBatch = createBatch({
+  const completedBatch = await createBatch({
     endpoint: "/v1/chat/completions",
     completionWindow: "24h",
     inputFileId: file.id,
     apiKeyId: apiKey.id,
   });
-  updateBatch(completedBatch.id, {
+  await updateBatch(completedBatch.id, {
     status: "completed",
     completedAt: Math.floor(Date.now() / 1000),
   });
 
-  const failedBatch = createBatch({
+  const failedBatch = await createBatch({
     endpoint: "/v1/chat/completions",
     completionWindow: "24h",
     inputFileId: file.id,
     apiKeyId: apiKey.id,
   });
-  updateBatch(failedBatch.id, { status: "failed", failedAt: Math.floor(Date.now() / 1000) });
+  await updateBatch(failedBatch.id, { status: "failed", failedAt: Math.floor(Date.now() / 1000) });
 
-  const cancelledBatch = createBatch({
+  const cancelledBatch = await createBatch({
     endpoint: "/v1/chat/completions",
     completionWindow: "24h",
     inputFileId: file.id,
     apiKeyId: apiKey.id,
   });
-  updateBatch(cancelledBatch.id, {
+  await updateBatch(cancelledBatch.id, {
     status: "cancelled",
     cancelledAt: Math.floor(Date.now() / 1000),
   });
 
-  const expiredBatch = createBatch({
+  const expiredBatch = await createBatch({
     endpoint: "/v1/chat/completions",
     completionWindow: "24h",
     inputFileId: file.id,
     apiKeyId: apiKey.id,
   });
-  updateBatch(expiredBatch.id, { status: "expired", expiredAt: Math.floor(Date.now() / 1000) });
+  await updateBatch(expiredBatch.id, {
+    status: "expired",
+    expiredAt: Math.floor(Date.now() / 1000),
+  });
 
   // This one should NOT appear in terminal batches
-  const pendingBatch = createBatch({
+  const pendingBatch = await createBatch({
     endpoint: "/v1/chat/completions",
     completionWindow: "24h",
     inputFileId: file.id,
@@ -1292,7 +1295,7 @@ test("getTerminalBatches returns only terminal statuses ordered oldest first", a
     cancelledBatch.id,
     expiredBatch.id,
   ]);
-  const terminal = getTerminalBatches();
+  const terminal = await getTerminalBatches();
 
   // All returned batches must be terminal
   for (const b of terminal) {

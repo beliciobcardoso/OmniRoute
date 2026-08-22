@@ -102,21 +102,21 @@ describe("File Deletion API", () => {
         mimeType: "application/jsonl",
       });
 
-      const batch = createBatch({
+      const batch = await createBatch({
         endpoint: "/v1/chat/completions",
         completionWindow: "24h",
         inputFileId: inputFile.id,
       });
 
       // Verify batch and file exist
-      let batchData = getBatch(batch.id);
+      let batchData = await getBatch(batch.id);
       assert(batchData !== null);
       let fileList = await listFiles({ limit: 1000 });
       assert(fileList.some((f) => f.id === inputFile.id));
 
       // Simulate batch completion (completed 31 days ago)
       const thirtyOneDaysAgo = Math.floor(Date.now() / 1000) - 31 * 24 * 60 * 60;
-      updateBatch(batch.id, {
+      await updateBatch(batch.id, {
         status: "completed",
         completedAt: thirtyOneDaysAgo,
       });
@@ -139,7 +139,7 @@ describe("File Deletion API", () => {
         mimeType: "application/jsonl",
       });
 
-      const batch = createBatch({
+      const batch = await createBatch({
         endpoint: "/v1/chat/completions",
         completionWindow: "24h",
         inputFileId: inputFile.id,
@@ -147,7 +147,7 @@ describe("File Deletion API", () => {
 
       // Simulate batch completion (completed 15 days ago)
       const fifteenDaysAgo = Math.floor(Date.now() / 1000) - 15 * 24 * 60 * 60;
-      updateBatch(batch.id, {
+      await updateBatch(batch.id, {
         status: "completed",
         completedAt: fifteenDaysAgo,
       });

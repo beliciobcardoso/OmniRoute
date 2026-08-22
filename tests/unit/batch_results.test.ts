@@ -79,7 +79,7 @@ test("Batch processor produces output file for successful items", async () => {
       apiKeyId: null,
     });
 
-    const batch = createBatch({
+    const batch = await createBatch({
       endpoint: "/v1/embeddings",
       completionWindow: "24h",
       inputFileId: file.id,
@@ -90,14 +90,14 @@ test("Batch processor produces output file for successful items", async () => {
     await processPendingBatches();
 
     let maxAttempts = 30;
-    let currentBatch = getBatch(batch.id);
+    let currentBatch = await getBatch(batch.id);
     while (
       maxAttempts > 0 &&
       currentBatch?.status !== "completed" &&
       currentBatch?.status !== "failed"
     ) {
       await new Promise((resolve) => setTimeout(resolve, 500));
-      currentBatch = getBatch(batch.id);
+      currentBatch = await getBatch(batch.id);
       maxAttempts--;
     }
 
