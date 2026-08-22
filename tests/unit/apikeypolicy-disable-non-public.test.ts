@@ -262,7 +262,7 @@ test("disableNonPublicModels=true + existing combo name → not rejected by publ
   }
 
   if (comboDb && typeof comboDb.createCombo === "function") {
-    comboDb.createCombo({ name: "test-combo-dnp", targets: [] });
+    await comboDb.createCombo({ name: "test-combo-dnp", targets: [] });
     apiKeysDb.clearApiKeyCaches();
 
     const result2 = await policy.enforceApiKeyPolicy(makeRequest(created.key), "test-combo-dnp");
