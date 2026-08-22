@@ -166,7 +166,7 @@ test("deleteGroup throws when a pool still references the group", async () => {
   const group = await groupsDb.createGroup("Group With Pool");
 
   // Create a pool referencing this group.
-  poolsDb.createPool({
+  await poolsDb.createPool({
     connectionId: "conn-in-group",
     name: "Blocking Pool",
     groupId: group.id,

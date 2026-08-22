@@ -4,7 +4,7 @@
  * Verifies the quota sharing improvements from fix/quota-sharing-improvements:
  *   1. computeBurnRateFromWindow() produces correct non-zero output
  *   2. storeRateLimitHeaders() + fetchAnthropicSaturation() round-trip
- *   3. upsertAllocations() normalizes zero weights to equal distribution
+ *   3. await upsertAllocations() normalizes zero weights to equal distribution
  *   4. poolUsageWithDimensions() returns real burn rate data
  *   5. QuotaStore interface includes poolUsageWithDimensions()
  */
@@ -96,7 +96,7 @@ test("computeBurnRateFromWindow: rate is consumption / elapsed (not / full windo
 // ─── Fix 3: Weight normalization ──────────────────────────────────────────────
 
 test("upsertAllocations: normalizes zero weights to equal distribution", async () => {
-  const pool = poolsDb.createPool({
+  const pool = await poolsDb.createPool({
     connectionId: "conn-weight-test",
     name: "Weight Test Pool",
     allocations: [
@@ -107,14 +107,14 @@ test("upsertAllocations: normalizes zero weights to equal distribution", async (
   });
 
   // Call upsertAllocations with all-zero weights
-  poolsDb.upsertAllocations(pool.id, [
+  await poolsDb.upsertAllocations(pool.id, [
     { apiKeyId: "key-x", weight: 0, policy: "hard" },
     { apiKeyId: "key-y", weight: 0, policy: "hard" },
     { apiKeyId: "key-z", weight: 0, policy: "hard" },
   ]);
 
   // Read back — weights should be normalized to ~33.33 each
-  const updated = poolsDb.getPool(pool.id);
+  const updated = await poolsDb.getPool(pool.id);
   assert.ok(updated, "pool should exist");
   assert.equal(updated!.allocations.length, 3);
 
@@ -127,17 +127,17 @@ test("upsertAllocations: normalizes zero weights to equal distribution", async (
 });
 
 test("upsertAllocations: preserves non-zero weights", async () => {
-  const pool = poolsDb.createPool({
+  const pool = await poolsDb.createPool({
     connectionId: "conn-weight-preserve",
     name: "Weight Preserve Pool",
   });
 
-  poolsDb.upsertAllocations(pool.id, [
+  await poolsDb.upsertAllocations(pool.id, [
     { apiKeyId: "key-a", weight: 70, policy: "hard" },
     { apiKeyId: "key-b", weight: 30, policy: "soft" },
   ]);
 
-  const updated = poolsDb.getPool(pool.id);
+  const updated = await poolsDb.getPool(pool.id);
   assert.ok(updated);
   assert.equal(updated!.allocations[0].weight, 70);
   assert.equal(updated!.allocations[1].weight, 30);
@@ -146,9 +146,8 @@ test("upsertAllocations: preserves non-zero weights", async () => {
 // ─── Fix 4: storeRateLimitHeaders + Anthropic saturation ─────────────────────
 
 test("storeRateLimitHeaders: stores headers and getSaturation reads them", async () => {
-  const { storeRateLimitHeaders, _clearSaturationCache } = await import(
-    "../../src/lib/quota/saturationSignals.ts"
-  );
+  const { storeRateLimitHeaders, _clearSaturationCache } =
+    await import("../../src/lib/quota/saturationSignals.ts");
 
   _clearSaturationCache();
 
@@ -170,9 +169,8 @@ test("storeRateLimitHeaders: stores headers and getSaturation reads them", async
 });
 
 test("storeRateLimitHeaders: ignores non-Anthropic headers gracefully", async () => {
-  const { storeRateLimitHeaders, _clearSaturationCache, getSaturation } = await import(
-    "../../src/lib/quota/saturationSignals.ts"
-  );
+  const { storeRateLimitHeaders, _clearSaturationCache, getSaturation } =
+    await import("../../src/lib/quota/saturationSignals.ts");
 
   _clearSaturationCache();
 
@@ -196,12 +194,10 @@ test("poolUsageWithDimensions: returns non-null burn rate for token dimensions",
   const { SqliteQuotaStore } = await import("../../src/lib/quota/sqliteQuotaStore.ts");
   const store = new SqliteQuotaStore();
 
-  const pool = poolsDb.createPool({
+  const pool = await poolsDb.createPool({
     connectionId: "conn-burn-rate",
     name: "Burn Rate Pool",
-    allocations: [
-      { apiKeyId: "key-br-1", weight: 100, policy: "hard" },
-    ],
+    allocations: [{ apiKeyId: "key-br-1", weight: 100, policy: "hard" }],
   });
 
   const dim = { poolId: pool.id, unit: "tokens" as const, window: "hourly" as const };
@@ -226,12 +222,10 @@ test("poolUsageWithDimensions: no burn rate when consumedTotal is 0", async () =
   const { SqliteQuotaStore } = await import("../../src/lib/quota/sqliteQuotaStore.ts");
   const store = new SqliteQuotaStore();
 
-  const pool = poolsDb.createPool({
+  const pool = await poolsDb.createPool({
     connectionId: "conn-no-burn",
     name: "No Burn Pool",
-    allocations: [
-      { apiKeyId: "key-nb-1", weight: 100, policy: "hard" },
-    ],
+    allocations: [{ apiKeyId: "key-nb-1", weight: 100, policy: "hard" }],
   });
 
   const snapshot = await store.poolUsageWithDimensions(pool.id, [
@@ -248,7 +242,11 @@ test("QuotaStore interface: poolUsageWithDimensions is on the interface", async 
   // We verify at runtime that both implementations have it.
   const { SqliteQuotaStore } = await import("../../src/lib/quota/sqliteQuotaStore.ts");
   const sqlite = new SqliteQuotaStore();
-  assert.equal(typeof sqlite.poolUsageWithDimensions, "function", "SqliteQuotaStore must have poolUsageWithDimensions");
+  assert.equal(
+    typeof sqlite.poolUsageWithDimensions,
+    "function",
+    "SqliteQuotaStore must have poolUsageWithDimensions"
+  );
 
   // Redis store (just check the prototype)
   const { RedisQuotaStore } = await import("../../src/lib/quota/redisQuotaStore.ts");

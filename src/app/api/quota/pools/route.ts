@@ -26,7 +26,7 @@ export async function GET(request: Request): Promise<Response> {
   if (authError) return authError;
 
   try {
-    const pools = listPools();
+    const pools = await listPools();
     return NextResponse.json({ pools });
   } catch (err) {
     const message = err instanceof Error ? err.message : "Failed to list pools";
@@ -45,7 +45,7 @@ export async function POST(request: Request): Promise<Response> {
       return NextResponse.json(buildErrorBody(400, parsed.error.message), { status: 400 });
     }
 
-    const pool = createPool(parsed.data);
+    const pool = await createPool(parsed.data);
     const ctx = getAuditRequestContext(request);
     logAuditEvent({
       action: "quota.pool.created",

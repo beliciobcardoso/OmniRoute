@@ -131,7 +131,7 @@ export class SqliteQuotaStore implements QuotaStore {
    */
   async poolUsage(poolId: string): Promise<PoolUsageSnapshot> {
     const nowMs = Date.now();
-    const pool = getPool(poolId);
+    const pool = await getPool(poolId);
 
     if (!pool) {
       return {
@@ -166,7 +166,7 @@ export class SqliteQuotaStore implements QuotaStore {
     planDimensions: Array<{ unit: string; window: string; limit: number }>
   ): Promise<PoolUsageSnapshot> {
     const nowMs = Date.now();
-    const pool = getPool(poolId);
+    const pool = await getPool(poolId);
 
     if (!pool) {
       return {

@@ -56,10 +56,8 @@ test.after(async () => {
 
 // ── D1.1: Migration file ────────────────────────────────────────────────────
 
-test("migration 086 file exists and contains quota_pool_connections DDL", () => {
-  const migrationPath = path.resolve(
-    "src/lib/db/migrations/087_quota_pool_connections.sql"
-  );
+test("migration 086 file exists and contains quota_pool_connections DDL", async () => {
+  const migrationPath = path.resolve("src/lib/db/migrations/087_quota_pool_connections.sql");
   assert.ok(fs.existsSync(migrationPath), `migration file not found: ${migrationPath}`);
 
   const sql = fs.readFileSync(migrationPath, "utf8");
@@ -79,8 +77,8 @@ test("migration 086 file exists and contains quota_pool_connections DDL", () => 
 
 // ── D1.2: createPool with connectionIds ────────────────────────────────────
 
-test("createPool with connectionIds: [a, b] → connectionIds.length === 2, connectionId === a", () => {
-  const pool = poolsDb.createPool({
+test("createPool with connectionIds: [a, b] → connectionIds.length === 2, connectionId === a", async () => {
+  const pool = await poolsDb.createPool({
     connectionId: "conn-a",
     name: "Multi-conn Pool",
     connectionIds: ["conn-a", "conn-b"],
@@ -94,14 +92,14 @@ test("createPool with connectionIds: [a, b] → connectionIds.length === 2, conn
   assert.equal(pool.connectionIds[0], "conn-a", "first connectionId should be the primary");
 });
 
-test("getPool reflects both connectionIds after multi-connection create", () => {
-  const created = poolsDb.createPool({
+test("getPool reflects both connectionIds after multi-connection create", async () => {
+  const created = await poolsDb.createPool({
     connectionId: "p-a",
     name: "Pool ABC",
     connectionIds: ["p-a", "p-b", "p-c"],
   });
 
-  const found = poolsDb.getPool(created.id)!;
+  const found = await poolsDb.getPool(created.id)!;
   assert.ok(found, "pool should be found");
   assert.equal(found.connectionId, "p-a");
   assert.equal(found.connectionIds.length, 3);
@@ -110,14 +108,14 @@ test("getPool reflects both connectionIds after multi-connection create", () => 
 
 // ── D1.3: updatePool replacing connectionIds ────────────────────────────────
 
-test("updatePool with new connectionIds replaces the join rows", () => {
-  const pool = poolsDb.createPool({
+test("updatePool with new connectionIds replaces the join rows", async () => {
+  const pool = await poolsDb.createPool({
     connectionId: "old-a",
     name: "Updatable Pool",
     connectionIds: ["old-a", "old-b"],
   });
 
-  const updated = poolsDb.updatePool(pool.id, {
+  const updated = await poolsDb.updatePool(pool.id, {
     connectionIds: ["new-x", "new-y"],
   });
 
@@ -130,21 +128,21 @@ test("updatePool with new connectionIds replaces the join rows", () => {
   assert.ok(!updated!.connectionIds.includes("old-b"), "old-b should be removed");
 
   // Re-read from DB to confirm persistence.
-  const reread = poolsDb.getPool(pool.id)!;
+  const reread = await poolsDb.getPool(pool.id)!;
   assert.equal(reread.connectionId, "new-x");
   assert.deepEqual([...reread.connectionIds].sort(), ["new-x", "new-y"].sort());
 });
 
-test("updatePool without connectionIds leaves join rows untouched", () => {
-  const pool = poolsDb.createPool({
+test("updatePool without connectionIds leaves join rows untouched", async () => {
+  const pool = await poolsDb.createPool({
     connectionId: "stable-a",
     name: "Stable Pool",
     connectionIds: ["stable-a", "stable-b"],
   });
 
-  poolsDb.updatePool(pool.id, { name: "Renamed Pool" });
+  await poolsDb.updatePool(pool.id, { name: "Renamed Pool" });
 
-  const reread = poolsDb.getPool(pool.id)!;
+  const reread = await poolsDb.getPool(pool.id)!;
   assert.equal(reread.name, "Renamed Pool");
   assert.equal(reread.connectionIds.length, 2, "connectionIds should be unchanged");
   assert.ok(reread.connectionIds.includes("stable-a"));
@@ -153,23 +151,23 @@ test("updatePool without connectionIds leaves join rows untouched", () => {
 
 // ── D1.4: deletePool removes join rows ────────────────────────────────────
 
-test("deletePool removes quota_pool_connections rows", () => {
-  const pool = poolsDb.createPool({
+test("deletePool removes quota_pool_connections rows", async () => {
+  const pool = await poolsDb.createPool({
     connectionId: "del-a",
     name: "To Delete",
     connectionIds: ["del-a", "del-b"],
   });
 
-  const deleted = poolsDb.deletePool(pool.id);
+  const deleted = await poolsDb.deletePool(pool.id);
   assert.equal(deleted, true, "deletePool should return true");
 
   // Pool should be gone.
-  assert.equal(poolsDb.getPool(pool.id), null, "pool should be null after deletion");
+  assert.equal(await poolsDb.getPool(pool.id), null, "pool should be null after deletion");
 
   // The join rows are cleaned up — no ghost references.
   // We verify indirectly: creating a new pool with the same connection IDs should work
   // without PK conflicts in quota_pool_connections.
-  const newPool = poolsDb.createPool({
+  const newPool = await poolsDb.createPool({
     connectionId: "del-a",
     name: "Reused conn",
     connectionIds: ["del-a", "del-b"],
@@ -179,8 +177,8 @@ test("deletePool removes quota_pool_connections rows", () => {
 
 // ── D1.5: Back-compat — single connectionId, no connectionIds arg ──────────
 
-test("pool created with single connectionId (legacy) returns connectionIds === [connectionId]", () => {
-  const pool = poolsDb.createPool({
+test("pool created with single connectionId (legacy) returns connectionIds === [connectionId]", async () => {
+  const pool = await poolsDb.createPool({
     connectionId: "legacy-conn",
     name: "Legacy Pool",
   });
@@ -188,19 +186,19 @@ test("pool created with single connectionId (legacy) returns connectionIds === [
   assert.equal(pool.connectionId, "legacy-conn");
   assert.deepEqual(pool.connectionIds, ["legacy-conn"]);
 
-  const found = poolsDb.getPool(pool.id)!;
+  const found = await poolsDb.getPool(pool.id)!;
   assert.deepEqual(found.connectionIds, ["legacy-conn"]);
 });
 
-test("listPools returns connectionIds on every pool", () => {
-  poolsDb.createPool({ connectionId: "lc-1", name: "Pool 1" });
-  poolsDb.createPool({
+test("listPools returns connectionIds on every pool", async () => {
+  await poolsDb.createPool({ connectionId: "lc-1", name: "Pool 1" });
+  await poolsDb.createPool({
     connectionId: "lc-2",
     name: "Pool 2",
     connectionIds: ["lc-2", "lc-3"],
   });
 
-  const pools = poolsDb.listPools();
+  const pools = await poolsDb.listPools();
   assert.equal(pools.length, 2);
 
   const p1 = pools.find((p) => p.name === "Pool 1")!;

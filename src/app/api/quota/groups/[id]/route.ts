@@ -48,7 +48,7 @@ export async function PATCH(request: Request, { params }: RouteParams): Promise<
     // Re-sync combos for all pools in the group — combo names embed the group
     // slug, so they must be refreshed after a rename. Dynamic import mirrors
     // quotaPools.ts::syncQuotaCombosGuarded pattern; failures are non-fatal.
-    const pools = getPoolsByGroup(id);
+    const pools = await getPoolsByGroup(id);
     for (const pool of pools) {
       try {
         const { syncQuotaCombos } = await import("@/lib/quota/quotaCombos");

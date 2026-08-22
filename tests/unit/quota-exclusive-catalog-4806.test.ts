@@ -85,7 +85,7 @@ test("#4806 quota-exclusive key lists its qtSd/* virtual models in GET /v1/model
   const connId = (conn as Record<string, unknown>).id as string;
   assert.ok(connId, "connection should have an id");
 
-  const pool = poolsDb.createPool({ connectionId: connId, name: "Times", groupId: group.id });
+  const pool = await poolsDb.createPool({ connectionId: connId, name: "Times", groupId: group.id });
   await syncQuotaCombos(pool.id); // mint the hidden qtSd/times/glm/* combos
 
   // Make the key "quota exclusive" by scoping it to the pool.
@@ -130,7 +130,7 @@ test("#4806 quota-exclusive key does NOT see qtSd/* of a group it is not allocat
     name: "quota-4806-glm-a",
     apiKey: "sk-glm-4806-a",
   });
-  const poolA = poolsDb.createPool({
+  const poolA = await poolsDb.createPool({
     connectionId: (connA as Record<string, unknown>).id as string,
     name: "Alpha",
     groupId: groupA.id,
@@ -145,7 +145,7 @@ test("#4806 quota-exclusive key does NOT see qtSd/* of a group it is not allocat
     name: "quota-4806-codex-b",
     apiKey: "sk-codex-4806-b",
   });
-  const poolB = poolsDb.createPool({
+  const poolB = await poolsDb.createPool({
     connectionId: (connB as Record<string, unknown>).id as string,
     name: "Beta",
     groupId: groupB.id,

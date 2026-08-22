@@ -70,40 +70,40 @@ async function listQuotaCombos(): Promise<Array<{ name: string }>> {
 
 // ── Schema tests ──────────────────────────────────────────────────────────
 
-test("PoolUpdateSchema accepts groupId and connectionIds together with name", () => {
+test("PoolUpdateSchema accepts groupId and connectionIds together with name", async () => {
   const result = PoolUpdateSchema.safeParse({ name: "P", groupId: "g1", connectionIds: ["c1"] });
   assert.ok(result.success, `Expected success, got: ${JSON.stringify(result.error)}`);
   assert.equal(result.data?.groupId, "g1");
   assert.deepEqual(result.data?.connectionIds, ["c1"]);
 });
 
-test("PoolUpdateSchema.data.groupId equals the parsed value", () => {
+test("PoolUpdateSchema.data.groupId equals the parsed value", async () => {
   const result = PoolUpdateSchema.safeParse({ groupId: "my-group" });
   assert.ok(result.success);
   assert.equal(result.data?.groupId, "my-group");
 });
 
-test("PoolUpdateSchema.data.connectionIds deep-equals the input array", () => {
+test("PoolUpdateSchema.data.connectionIds deep-equals the input array", async () => {
   const result = PoolUpdateSchema.safeParse({ connectionIds: ["conn-x", "conn-y"] });
   assert.ok(result.success);
   assert.deepEqual(result.data?.connectionIds, ["conn-x", "conn-y"]);
 });
 
-test("PoolUpdateSchema rejects connectionIds with empty string element", () => {
+test("PoolUpdateSchema rejects connectionIds with empty string element", async () => {
   const result = PoolUpdateSchema.safeParse({ connectionIds: [""] });
   assert.equal(result.success, false, "Empty string element should be rejected");
 });
 
-test("PoolUpdateSchema rejects connectionIds as empty array", () => {
+test("PoolUpdateSchema rejects connectionIds as empty array", async () => {
   const result = PoolUpdateSchema.safeParse({ connectionIds: [] });
   assert.equal(result.success, false, "Empty connectionIds array should be rejected");
 });
 
-test("PoolUpdateSchema accepts empty object (no-op still works)", () => {
+test("PoolUpdateSchema accepts empty object (no-op still works)", async () => {
   assert.ok(PoolUpdateSchema.safeParse({}).success);
 });
 
-test("PoolUpdateSchema accepts only groupId (partial update)", () => {
+test("PoolUpdateSchema accepts only groupId (partial update)", async () => {
   const result = PoolUpdateSchema.safeParse({ groupId: "grp-abc" });
   assert.ok(result.success);
   assert.equal(result.data?.groupId, "grp-abc");
@@ -136,7 +136,7 @@ test("updatePool with new connectionIds triggers combo re-sync (openrouter → b
   const idB = (connB as Record<string, unknown>).id as string;
 
   // Create pool initially pointing to openrouter
-  const pool = poolsDb.createPool({
+  const pool = await poolsDb.createPool({
     connectionId: idA,
     name: "Pool Switch Test",
     groupId: group.id,
@@ -153,7 +153,7 @@ test("updatePool with new connectionIds triggers combo re-sync (openrouter → b
   assert.ok(orBefore.length > 0, `Expected openrouter combos before switch, got 0`);
 
   // Now update the pool to point to baidu
-  const updated = poolsDb.updatePool(pool.id, { connectionIds: [idB] });
+  const updated = await poolsDb.updatePool(pool.id, { connectionIds: [idB] });
   assert.ok(updated, "updatePool should return the updated pool");
   assert.equal(updated!.connectionId, idB, "primary connectionId should now be baidu conn");
 
@@ -173,7 +173,7 @@ test("updatePool with new connectionIds triggers combo re-sync (openrouter → b
   );
 
   // The pool's primary connection should now reflect baidu
-  const reread = poolsDb.getPool(pool.id)!;
+  const reread = await poolsDb.getPool(pool.id)!;
   assert.equal(reread.connectionId, idB, "pool.connectionId must be baidu conn after update");
   assert.deepEqual(reread.connectionIds, [idB], "pool.connectionIds must contain only baidu conn");
 });
@@ -197,7 +197,11 @@ test("PATCH route sequence (remove→update→sync) prunes OLD-provider combos o
   });
   const idB = (connB as Record<string, unknown>).id as string;
 
-  const pool = poolsDb.createPool({ connectionId: idA, name: "Route Switch", groupId: group.id });
+  const pool = await poolsDb.createPool({
+    connectionId: idA,
+    name: "Route Switch",
+    groupId: group.id,
+  });
   await syncQuotaCombos(pool.id);
   assert.ok(
     (await listQuotaCombos()).some((c) => parseQuotaModelName(c.name)?.provider === "openrouter"),
@@ -206,7 +210,7 @@ test("PATCH route sequence (remove→update→sync) prunes OLD-provider combos o
 
   // Mirror the PATCH route's connection/group-change path exactly:
   await removeQuotaCombosForPool(pool.id); // pool still has OLD (openrouter) provider here
-  poolsDb.updatePool(pool.id, { connectionIds: [idB] });
+  await poolsDb.updatePool(pool.id, { connectionIds: [idB] });
   await syncQuotaCombos(pool.id); // pool now has NEW (baidu) provider
 
   const after = await listQuotaCombos();
@@ -228,7 +232,7 @@ test("updatePool with groupId persists the new group assignment", async () => {
   const groupA = await createGroup("GroupAlpha");
   const groupB = await createGroup("GroupBeta");
 
-  const pool = poolsDb.createPool({
+  const pool = await poolsDb.createPool({
     connectionId: "gc-conn-1",
     name: "Group Reassign Pool",
     groupId: groupA.id,
@@ -236,25 +240,25 @@ test("updatePool with groupId persists the new group assignment", async () => {
 
   assert.equal(pool.groupId, groupA.id, "pool should start in groupA");
 
-  const updated = poolsDb.updatePool(pool.id, { groupId: groupB.id });
+  const updated = await poolsDb.updatePool(pool.id, { groupId: groupB.id });
   assert.ok(updated, "updatePool should return updated pool");
   assert.equal(updated!.groupId, groupB.id, "pool should now be in groupB");
 
   // Re-read from DB to confirm persistence
-  const reread = poolsDb.getPool(pool.id)!;
+  const reread = await poolsDb.getPool(pool.id)!;
   assert.equal(reread.groupId, groupB.id, "persisted groupId should be groupB");
 });
 
-test("updatePool without connectionIds leaves connection membership untouched", () => {
-  const pool = poolsDb.createPool({
+test("updatePool without connectionIds leaves connection membership untouched", async () => {
+  const pool = await poolsDb.createPool({
     connectionId: "stable-conn",
     name: "Stable Conn Pool",
     connectionIds: ["stable-conn", "stable-conn-2"],
   });
 
-  poolsDb.updatePool(pool.id, { name: "Renamed" });
+  await poolsDb.updatePool(pool.id, { name: "Renamed" });
 
-  const reread = poolsDb.getPool(pool.id)!;
+  const reread = await poolsDb.getPool(pool.id)!;
   assert.equal(reread.name, "Renamed");
   assert.equal(reread.connectionIds.length, 2, "connectionIds should be unchanged");
   assert.ok(reread.connectionIds.includes("stable-conn"));
@@ -265,7 +269,7 @@ test("PoolUpdateSchema path: groupId flows through to updatePool (schema→db ro
   const groupX = await createGroup("XGroup");
   const groupY = await createGroup("YGroup");
 
-  const pool = poolsDb.createPool({
+  const pool = await poolsDb.createPool({
     connectionId: "grp-rt-conn",
     name: "Round Trip Pool",
     groupId: groupX.id,
@@ -275,13 +279,13 @@ test("PoolUpdateSchema path: groupId flows through to updatePool (schema→db ro
   const parsed = PoolUpdateSchema.safeParse({ groupId: groupY.id });
   assert.ok(parsed.success);
 
-  const updated = poolsDb.updatePool(pool.id, parsed.data!);
+  const updated = await poolsDb.updatePool(pool.id, parsed.data!);
   assert.ok(updated);
   assert.equal(updated!.groupId, groupY.id);
 });
 
-test("PoolUpdateSchema path: connectionIds flows through to updatePool (schema→db round-trip)", () => {
-  const pool = poolsDb.createPool({
+test("PoolUpdateSchema path: connectionIds flows through to updatePool (schema→db round-trip)", async () => {
+  const pool = await poolsDb.createPool({
     connectionId: "rt-conn-old",
     name: "ConnIds Round Trip Pool",
   });
@@ -289,7 +293,7 @@ test("PoolUpdateSchema path: connectionIds flows through to updatePool (schema�
   const parsed = PoolUpdateSchema.safeParse({ connectionIds: ["rt-conn-new"] });
   assert.ok(parsed.success);
 
-  const updated = poolsDb.updatePool(pool.id, parsed.data!);
+  const updated = await poolsDb.updatePool(pool.id, parsed.data!);
   assert.ok(updated);
   assert.equal(updated!.connectionId, "rt-conn-new");
   assert.deepEqual(updated!.connectionIds, ["rt-conn-new"]);

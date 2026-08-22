@@ -93,7 +93,7 @@ test("G1: two pools in same group → combos named qtSd/<group>/provider/model (
     apiKey: "sk-g1-or",
   });
   const idA = (connA as Record<string, unknown>).id as string;
-  const poolA = poolsDb.createPool({
+  const poolA = await poolsDb.createPool({
     connectionId: idA,
     name: "OpenRouter Pool G1",
     groupId: group.id,
@@ -107,7 +107,7 @@ test("G1: two pools in same group → combos named qtSd/<group>/provider/model (
     apiKey: "sk-g1-baidu",
   });
   const idB = (connB as Record<string, unknown>).id as string;
-  const poolB = poolsDb.createPool({
+  const poolB = await poolsDb.createPool({
     connectionId: idB,
     name: "Baidu Pool G1",
     groupId: group.id,
@@ -165,7 +165,7 @@ test("G2: re-syncing pool A (openrouter) does not delete pool B (baidu) combos i
     apiKey: "sk-g2-or",
   });
   const idA = (connA as Record<string, unknown>).id as string;
-  const poolA = poolsDb.createPool({
+  const poolA = await poolsDb.createPool({
     connectionId: idA,
     name: "OpenRouter Pool G2",
     groupId: group.id,
@@ -179,7 +179,7 @@ test("G2: re-syncing pool A (openrouter) does not delete pool B (baidu) combos i
     apiKey: "sk-g2-baidu",
   });
   const idB = (connB as Record<string, unknown>).id as string;
-  const poolB = poolsDb.createPool({
+  const poolB = await poolsDb.createPool({
     connectionId: idB,
     name: "Baidu Pool G2",
     groupId: group.id,
@@ -234,7 +234,7 @@ test("G3: pool in default 'group-demo' group produces combos under groupdemo slu
     apiKey: "sk-g3-glm",
   });
   const connId = (conn as Record<string, unknown>).id as string;
-  const pool = poolsDb.createPool({
+  const pool = await poolsDb.createPool({
     connectionId: connId,
     name: "Default Group Pool",
     // no groupId → defaults to "group-demo"
@@ -275,7 +275,7 @@ test("G4: stale same-group same-provider combo is pruned on re-sync", async () =
     apiKey: "sk-g4-or",
   });
   const connId = (conn as Record<string, unknown>).id as string;
-  const pool = poolsDb.createPool({
+  const pool = await poolsDb.createPool({
     connectionId: connId,
     name: "PrunePool G4",
     groupId: group.id,

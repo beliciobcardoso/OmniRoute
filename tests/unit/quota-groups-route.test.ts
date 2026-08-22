@@ -36,14 +36,14 @@ const schemasSrc = readFileSync(SCHEMAS_PATH, "utf8");
 
 // ── Both routes: auth guard ───────────────────────────────────────────────────
 
-test("groups/route.ts: imports requireManagementAuth", () => {
+test("groups/route.ts: imports requireManagementAuth", async () => {
   assert.ok(
     listSrc.includes("requireManagementAuth"),
-    "route must import and call requireManagementAuth",
+    "route must import and call requireManagementAuth"
   );
 });
 
-test("groups/route.ts: GET calls requireManagementAuth before data access", () => {
+test("groups/route.ts: GET calls requireManagementAuth before data access", async () => {
   const getIdx = listSrc.indexOf("export async function GET");
   assert.ok(getIdx >= 0, "GET handler must exist");
   const postIdx = listSrc.indexOf("export async function POST");
@@ -55,17 +55,17 @@ test("groups/route.ts: GET calls requireManagementAuth before data access", () =
   assert.ok(authIdx < dataIdx, "auth check must come before listGroups call");
 });
 
-test("groups/route.ts: GET returns early when authError is truthy", () => {
+test("groups/route.ts: GET returns early when authError is truthy", async () => {
   const getIdx = listSrc.indexOf("export async function GET");
   const postIdx = listSrc.indexOf("export async function POST");
   const getBody = postIdx >= 0 ? listSrc.slice(getIdx, postIdx) : listSrc.slice(getIdx);
   assert.ok(
     getBody.includes("if (authError) return authError"),
-    "GET must return authError immediately — 401 without auth",
+    "GET must return authError immediately — 401 without auth"
   );
 });
 
-test("groups/route.ts: POST calls requireManagementAuth before data access", () => {
+test("groups/route.ts: POST calls requireManagementAuth before data access", async () => {
   const postIdx = listSrc.indexOf("export async function POST");
   assert.ok(postIdx >= 0, "POST handler must exist");
   const postBody = listSrc.slice(postIdx);
@@ -76,16 +76,16 @@ test("groups/route.ts: POST calls requireManagementAuth before data access", () 
   assert.ok(authIdx < jsonIdx, "auth check must come before request.json()");
 });
 
-test("groups/route.ts: POST returns early when authError is truthy", () => {
+test("groups/route.ts: POST returns early when authError is truthy", async () => {
   const postIdx = listSrc.indexOf("export async function POST");
   const postBody = listSrc.slice(postIdx);
   assert.ok(
     postBody.includes("if (authError) return authError"),
-    "POST must return authError immediately — 401 without auth",
+    "POST must return authError immediately — 401 without auth"
   );
 });
 
-test("groups/[id]/route.ts: PATCH calls requireManagementAuth before data access", () => {
+test("groups/[id]/route.ts: PATCH calls requireManagementAuth before data access", async () => {
   const patchIdx = idSrc.indexOf("export async function PATCH");
   assert.ok(patchIdx >= 0, "PATCH handler must exist");
   const deleteIdx = idSrc.indexOf("export async function DELETE");
@@ -97,14 +97,14 @@ test("groups/[id]/route.ts: PATCH calls requireManagementAuth before data access
   assert.ok(authIdx < jsonIdx, "auth check must come before request.json()");
 });
 
-test("groups/[id]/route.ts: PATCH returns early when authError is truthy", () => {
+test("groups/[id]/route.ts: PATCH returns early when authError is truthy", async () => {
   const patchIdx = idSrc.indexOf("export async function PATCH");
   const deleteIdx = idSrc.indexOf("export async function DELETE");
   const patchBody = deleteIdx >= 0 ? idSrc.slice(patchIdx, deleteIdx) : idSrc.slice(patchIdx);
   assert.ok(patchBody.includes("if (authError) return authError"), "PATCH must return authError");
 });
 
-test("groups/[id]/route.ts: DELETE calls requireManagementAuth before data access", () => {
+test("groups/[id]/route.ts: DELETE calls requireManagementAuth before data access", async () => {
   const deleteIdx = idSrc.indexOf("export async function DELETE");
   assert.ok(deleteIdx >= 0, "DELETE handler must exist");
   const deleteBody = idSrc.slice(deleteIdx);
@@ -115,126 +115,128 @@ test("groups/[id]/route.ts: DELETE calls requireManagementAuth before data acces
   assert.ok(authIdx < dataIdx, "auth check must come before deleteGroup call");
 });
 
-test("groups/[id]/route.ts: DELETE returns early when authError is truthy", () => {
+test("groups/[id]/route.ts: DELETE returns early when authError is truthy", async () => {
   const deleteIdx = idSrc.indexOf("export async function DELETE");
   const deleteBody = idSrc.slice(deleteIdx);
   assert.ok(
     deleteBody.includes("if (authError) return authError"),
-    "DELETE must return authError — 401 without auth",
+    "DELETE must return authError — 401 without auth"
   );
 });
 
 // ── Error sanitization ────────────────────────────────────────────────────────
 
-test("groups/route.ts: uses buildErrorBody from @omniroute/open-sse/utils/error", () => {
+test("groups/route.ts: uses buildErrorBody from @omniroute/open-sse/utils/error", async () => {
   assert.ok(listSrc.includes("buildErrorBody"), "route must use buildErrorBody — Hard Rule #12");
   assert.ok(
     listSrc.includes("@omniroute/open-sse/utils/error"),
-    "route must import buildErrorBody from @omniroute/open-sse/utils/error",
+    "route must import buildErrorBody from @omniroute/open-sse/utils/error"
   );
 });
 
-test("groups/route.ts: does NOT put raw err.stack in response (no stack leak)", () => {
+test("groups/route.ts: does NOT put raw err.stack in response (no stack leak)", async () => {
   assert.ok(!listSrc.includes("err.stack"), "route must not leak err.stack in response");
 });
 
-test("groups/[id]/route.ts: uses buildErrorBody from @omniroute/open-sse/utils/error", () => {
+test("groups/[id]/route.ts: uses buildErrorBody from @omniroute/open-sse/utils/error", async () => {
   assert.ok(idSrc.includes("buildErrorBody"), "route must use buildErrorBody — Hard Rule #12");
   assert.ok(
     idSrc.includes("@omniroute/open-sse/utils/error"),
-    "route must import buildErrorBody from @omniroute/open-sse/utils/error",
+    "route must import buildErrorBody from @omniroute/open-sse/utils/error"
   );
 });
 
-test("groups/[id]/route.ts: does NOT put raw err.stack in response (no stack leak)", () => {
+test("groups/[id]/route.ts: does NOT put raw err.stack in response (no stack leak)", async () => {
   assert.ok(!idSrc.includes("err.stack"), "route must not leak err.stack in response");
 });
 
 // ── Response shapes ───────────────────────────────────────────────────────────
 
-test("groups/route.ts: GET returns { groups } shape", () => {
+test("groups/route.ts: GET returns { groups } shape", async () => {
   assert.ok(
     listSrc.includes("{ groups }") || listSrc.includes("{groups}") || listSrc.includes("groups:"),
-    "GET must return { groups } in the response body",
+    "GET must return { groups } in the response body"
   );
 });
 
-test("groups/route.ts: POST returns { group } shape with status 201", () => {
+test("groups/route.ts: POST returns { group } shape with status 201", async () => {
   const postIdx = listSrc.indexOf("export async function POST");
   const postBody = listSrc.slice(postIdx);
   assert.ok(
     postBody.includes("{ group }") || postBody.includes("{group}") || postBody.includes("group:"),
-    "POST must return { group } in the response body",
+    "POST must return { group } in the response body"
   );
   assert.ok(postBody.includes("201"), "POST must return HTTP 201 on success");
 });
 
-test("groups/[id]/route.ts: PATCH returns { group } shape", () => {
+test("groups/[id]/route.ts: PATCH returns { group } shape", async () => {
   const patchIdx = idSrc.indexOf("export async function PATCH");
   const deleteIdx = idSrc.indexOf("export async function DELETE");
   const patchBody = deleteIdx >= 0 ? idSrc.slice(patchIdx, deleteIdx) : idSrc.slice(patchIdx);
   assert.ok(
-    patchBody.includes("{ group }") || patchBody.includes("{group}") || patchBody.includes("group:"),
-    "PATCH must return { group } in the response body",
+    patchBody.includes("{ group }") ||
+      patchBody.includes("{group}") ||
+      patchBody.includes("group:"),
+    "PATCH must return { group } in the response body"
   );
 });
 
 // ── POST: Zod validation ──────────────────────────────────────────────────────
 
-test("groups/route.ts: POST uses GroupCreateSchema for Zod validation", () => {
+test("groups/route.ts: POST uses GroupCreateSchema for Zod validation", async () => {
   assert.ok(
     listSrc.includes("GroupCreateSchema"),
-    "route must import and use GroupCreateSchema for POST body validation",
+    "route must import and use GroupCreateSchema for POST body validation"
   );
 });
 
-test("groups/route.ts: POST returns 400 on invalid body", () => {
+test("groups/route.ts: POST returns 400 on invalid body", async () => {
   const postIdx = listSrc.indexOf("export async function POST");
   const postBody = listSrc.slice(postIdx);
   assert.ok(postBody.includes("400"), "POST must return 400 for invalid body");
   assert.ok(
     postBody.includes("safeParse") || postBody.includes(".parse("),
-    "POST must use safeParse or parse for validation",
+    "POST must use safeParse or parse for validation"
   );
 });
 
 // ── PATCH: Zod validation + rename + combo re-sync ───────────────────────────
 
-test("groups/[id]/route.ts: PATCH uses GroupRenameSchema for Zod validation", () => {
+test("groups/[id]/route.ts: PATCH uses GroupRenameSchema for Zod validation", async () => {
   assert.ok(
     idSrc.includes("GroupRenameSchema"),
-    "PATCH route must import and use GroupRenameSchema",
+    "PATCH route must import and use GroupRenameSchema"
   );
 });
 
-test("groups/[id]/route.ts: PATCH calls renameGroup", () => {
+test("groups/[id]/route.ts: PATCH calls renameGroup", async () => {
   const patchIdx = idSrc.indexOf("export async function PATCH");
   const deleteIdx = idSrc.indexOf("export async function DELETE");
   const patchBody = deleteIdx >= 0 ? idSrc.slice(patchIdx, deleteIdx) : idSrc.slice(patchIdx);
   assert.ok(patchBody.includes("renameGroup("), "PATCH must call renameGroup");
 });
 
-test("groups/[id]/route.ts: PATCH re-syncs combos via syncQuotaCombos (dynamic import)", () => {
+test("groups/[id]/route.ts: PATCH re-syncs combos via syncQuotaCombos (dynamic import)", async () => {
   const patchIdx = idSrc.indexOf("export async function PATCH");
   const deleteIdx = idSrc.indexOf("export async function DELETE");
   const patchBody = deleteIdx >= 0 ? idSrc.slice(patchIdx, deleteIdx) : idSrc.slice(patchIdx);
   assert.ok(
     patchBody.includes("syncQuotaCombos"),
-    "PATCH must call syncQuotaCombos to re-sync combos after rename",
+    "PATCH must call syncQuotaCombos to re-sync combos after rename"
   );
 });
 
-test("groups/[id]/route.ts: PATCH fetches pools via getPoolsByGroup for combo re-sync", () => {
+test("groups/[id]/route.ts: PATCH fetches pools via getPoolsByGroup for combo re-sync", async () => {
   const patchIdx = idSrc.indexOf("export async function PATCH");
   const deleteIdx = idSrc.indexOf("export async function DELETE");
   const patchBody = deleteIdx >= 0 ? idSrc.slice(patchIdx, deleteIdx) : idSrc.slice(patchIdx);
   assert.ok(
-    patchBody.includes("getPoolsByGroup("),
-    "PATCH must call getPoolsByGroup to enumerate pools for combo re-sync",
+    patchBody.includes("await getPoolsByGroup("),
+    "PATCH must call getPoolsByGroup to enumerate pools for combo re-sync"
   );
 });
 
-test("groups/[id]/route.ts: PATCH returns 404 when renameGroup returns false", () => {
+test("groups/[id]/route.ts: PATCH returns 404 when renameGroup returns false", async () => {
   const patchIdx = idSrc.indexOf("export async function PATCH");
   const deleteIdx = idSrc.indexOf("export async function DELETE");
   const patchBody = deleteIdx >= 0 ? idSrc.slice(patchIdx, deleteIdx) : idSrc.slice(patchIdx);
@@ -243,32 +245,32 @@ test("groups/[id]/route.ts: PATCH returns 404 when renameGroup returns false", (
 
 // ── DELETE: 409 on protected / in-use groups ──────────────────────────────────
 
-test("groups/[id]/route.ts: DELETE maps deleteGroup throws to 409 Conflict", () => {
+test("groups/[id]/route.ts: DELETE maps deleteGroup throws to 409 Conflict", async () => {
   const deleteIdx = idSrc.indexOf("export async function DELETE");
   const deleteBody = idSrc.slice(deleteIdx);
   assert.ok(
     deleteBody.includes("409"),
-    "DELETE must return 409 when deleteGroup throws (protected group or pools exist)",
+    "DELETE must return 409 when deleteGroup throws (protected group or pools exist)"
   );
 });
 
-test("groups/[id]/route.ts: DELETE catches deleteGroup throw and uses buildErrorBody for 409", () => {
+test("groups/[id]/route.ts: DELETE catches deleteGroup throw and uses buildErrorBody for 409", async () => {
   const deleteIdx = idSrc.indexOf("export async function DELETE");
   const deleteBody = idSrc.slice(deleteIdx);
   // The 409 must go through buildErrorBody — not a raw Error message
   assert.ok(
     deleteBody.includes("buildErrorBody(409"),
-    "DELETE 409 response must use buildErrorBody(409, ...) — Hard Rule #12",
+    "DELETE 409 response must use buildErrorBody(409, ...) — Hard Rule #12"
   );
 });
 
-test("groups/[id]/route.ts: DELETE returns 204 on successful delete", () => {
+test("groups/[id]/route.ts: DELETE returns 204 on successful delete", async () => {
   const deleteIdx = idSrc.indexOf("export async function DELETE");
   const deleteBody = idSrc.slice(deleteIdx);
   assert.ok(deleteBody.includes("204"), "DELETE must return 204 on success");
 });
 
-test("groups/[id]/route.ts: DELETE returns 404 when group not found", () => {
+test("groups/[id]/route.ts: DELETE returns 404 when group not found", async () => {
   const deleteIdx = idSrc.indexOf("export async function DELETE");
   const deleteBody = idSrc.slice(deleteIdx);
   assert.ok(deleteBody.includes("404"), "DELETE must return 404 when group does not exist");
@@ -276,69 +278,69 @@ test("groups/[id]/route.ts: DELETE returns 404 when group not found", () => {
 
 // ── Params: Next 16 async params pattern ─────────────────────────────────────
 
-test("groups/[id]/route.ts: reads id via await params (Next 16 pattern)", () => {
+test("groups/[id]/route.ts: reads id via await params (Next 16 pattern)", async () => {
   assert.ok(
     idSrc.includes("await params"),
-    "route must use await params — Next 16 async params pattern",
+    "route must use await params — Next 16 async params pattern"
   );
 });
 
-test("groups/[id]/route.ts: RouteParams typed as Promise<{ id: string }>", () => {
+test("groups/[id]/route.ts: RouteParams typed as Promise<{ id: string }>", async () => {
   assert.ok(
     idSrc.includes("Promise<") && idSrc.includes("id: string"),
-    "params type must be Promise<{ id: string }> — matching pools/[id] pattern",
+    "params type must be Promise<{ id: string }> — matching pools/[id] pattern"
   );
 });
 
 // ── force-dynamic ─────────────────────────────────────────────────────────────
 
-test("groups/route.ts: has dynamic = 'force-dynamic' export", () => {
+test("groups/route.ts: has dynamic = 'force-dynamic' export", async () => {
   assert.ok(
     listSrc.includes('dynamic = "force-dynamic"') || listSrc.includes("dynamic = 'force-dynamic'"),
-    "route must export dynamic = 'force-dynamic'",
+    "route must export dynamic = 'force-dynamic'"
   );
 });
 
-test("groups/[id]/route.ts: has dynamic = 'force-dynamic' export", () => {
+test("groups/[id]/route.ts: has dynamic = 'force-dynamic' export", async () => {
   assert.ok(
     idSrc.includes('dynamic = "force-dynamic"') || idSrc.includes("dynamic = 'force-dynamic'"),
-    "route must export dynamic = 'force-dynamic'",
+    "route must export dynamic = 'force-dynamic'"
   );
 });
 
 // ── Schemas: GroupCreateSchema and GroupRenameSchema ─────────────────────────
 
-test("shared/schemas/quota.ts: exports GroupCreateSchema", () => {
+test("shared/schemas/quota.ts: exports GroupCreateSchema", async () => {
   assert.ok(
     schemasSrc.includes("export const GroupCreateSchema"),
-    "quota.ts must export GroupCreateSchema",
+    "quota.ts must export GroupCreateSchema"
   );
 });
 
-test("shared/schemas/quota.ts: GroupCreateSchema requires name (min 1)", () => {
+test("shared/schemas/quota.ts: GroupCreateSchema requires name (min 1)", async () => {
   assert.ok(
     schemasSrc.includes("GroupCreateSchema") && schemasSrc.includes("min(1)"),
-    "GroupCreateSchema must enforce min(1) on name",
+    "GroupCreateSchema must enforce min(1) on name"
   );
 });
 
-test("shared/schemas/quota.ts: exports GroupRenameSchema", () => {
+test("shared/schemas/quota.ts: exports GroupRenameSchema", async () => {
   assert.ok(
     schemasSrc.includes("export const GroupRenameSchema"),
-    "quota.ts must export GroupRenameSchema",
+    "quota.ts must export GroupRenameSchema"
   );
 });
 
 // ── Import correctness ────────────────────────────────────────────────────────
 
-test("groups/route.ts: imports listGroups and createGroup from @/lib/localDb", () => {
+test("groups/route.ts: imports listGroups and createGroup from @/lib/localDb", async () => {
   assert.ok(
     listSrc.includes("listGroups") && listSrc.includes("createGroup"),
-    "route must import listGroups and createGroup",
+    "route must import listGroups and createGroup"
   );
 });
 
-test("groups/[id]/route.ts: imports renameGroup, deleteGroup, getGroup, getPoolsByGroup", () => {
+test("groups/[id]/route.ts: imports renameGroup, deleteGroup, getGroup, getPoolsByGroup", async () => {
   assert.ok(idSrc.includes("renameGroup"), "route must import renameGroup");
   assert.ok(idSrc.includes("deleteGroup"), "route must import deleteGroup");
   assert.ok(idSrc.includes("getGroup"), "route must import getGroup");
@@ -347,11 +349,11 @@ test("groups/[id]/route.ts: imports renameGroup, deleteGroup, getGroup, getPools
 
 // ── GroupDemo: listGroups result includes group-demo ──────────────────────────
 
-test("groups/route.ts: listGroups() is called in GET (will include GroupDemo in real DB)", () => {
+test("groups/route.ts: listGroups() is called in GET (will include GroupDemo in real DB)", async () => {
   // Source-scan: the call is present; the seed group-demo row is guaranteed
   // by the migration, so a real GET would always include it.
   assert.ok(
     listSrc.includes("listGroups()"),
-    "GET must call listGroups() — which includes the seeded GroupDemo row",
+    "GET must call listGroups() — which includes the seeded GroupDemo row"
   );
 });

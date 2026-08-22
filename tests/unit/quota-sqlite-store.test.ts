@@ -54,7 +54,7 @@ test.after(async () => {
   }
 });
 
-test("sqliteQuotaStore public surface excludes removed singleton reset helper", () => {
+test("sqliteQuotaStore public surface excludes removed singleton reset helper", async () => {
   assert.equal(Object.hasOwn(sqliteQuotaStoreModule, "resetSqliteQuotaStore"), false);
   assert.equal(typeof sqliteQuotaStoreModule.getSqliteQuotaStore, "function");
   assert.equal(typeof sqliteQuotaStoreModule.SqliteQuotaStore, "function");
@@ -180,7 +180,7 @@ test("sqliteQuotaStore: poolUsageWithDimensions returns correct shape", async ()
   const store = new SqliteQuotaStore();
 
   // Create a real pool with allocations
-  const pool = poolsDb.createPool({
+  const pool = await poolsDb.createPool({
     connectionId: "conn-pool-usage",
     name: "Test Pool",
     allocations: [

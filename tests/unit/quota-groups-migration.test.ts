@@ -56,7 +56,9 @@ test.after(async () => {
 // Helper to get a raw DB handle for inspection / seeding.
 function getDb() {
   return core.getDbInstance() as unknown as {
-    prepare: <TRow = unknown>(sql: string) => {
+    prepare: <TRow = unknown>(
+      sql: string
+    ) => {
       all: (...params: unknown[]) => TRow[];
       get: (...params: unknown[]) => TRow | undefined;
       run: (...params: unknown[]) => { changes: number };
@@ -66,16 +68,13 @@ function getDb() {
 
 // ── B1.1: Migration file content ─────────────────────────────────────────────
 
-test("migration 087 file exists", () => {
+test("migration 087 file exists", async () => {
   const migrationPath = path.resolve("src/lib/db/migrations/088_quota_groups.sql");
   assert.ok(fs.existsSync(migrationPath), `migration file not found: ${migrationPath}`);
 });
 
-test("migration 087 contains quota_groups CREATE TABLE", () => {
-  const sql = fs.readFileSync(
-    path.resolve("src/lib/db/migrations/088_quota_groups.sql"),
-    "utf8"
-  );
+test("migration 087 contains quota_groups CREATE TABLE", async () => {
+  const sql = fs.readFileSync(path.resolve("src/lib/db/migrations/088_quota_groups.sql"), "utf8");
   assert.ok(sql.includes("quota_groups"), "migration SQL should reference quota_groups");
   assert.ok(
     sql.includes("CREATE TABLE IF NOT EXISTS quota_groups"),
@@ -83,37 +82,25 @@ test("migration 087 contains quota_groups CREATE TABLE", () => {
   );
 });
 
-test("migration 087 seeds group-demo", () => {
-  const sql = fs.readFileSync(
-    path.resolve("src/lib/db/migrations/088_quota_groups.sql"),
-    "utf8"
-  );
-  assert.ok(
-    sql.includes("group-demo"),
-    "migration SQL should insert the 'group-demo' seed row"
-  );
+test("migration 087 seeds group-demo", async () => {
+  const sql = fs.readFileSync(path.resolve("src/lib/db/migrations/088_quota_groups.sql"), "utf8");
+  assert.ok(sql.includes("group-demo"), "migration SQL should insert the 'group-demo' seed row");
   assert.ok(
     sql.includes("INSERT OR IGNORE INTO quota_groups"),
     "migration SQL should use INSERT OR IGNORE for idempotency"
   );
 });
 
-test("migration 087 adds group_id column to quota_pools", () => {
-  const sql = fs.readFileSync(
-    path.resolve("src/lib/db/migrations/088_quota_groups.sql"),
-    "utf8"
-  );
+test("migration 087 adds group_id column to quota_pools", async () => {
+  const sql = fs.readFileSync(path.resolve("src/lib/db/migrations/088_quota_groups.sql"), "utf8");
   assert.ok(
     sql.includes("ALTER TABLE quota_pools ADD COLUMN group_id"),
     "migration SQL should ALTER TABLE quota_pools to add group_id"
   );
 });
 
-test("migration 087 contains backfill UPDATE for existing pools", () => {
-  const sql = fs.readFileSync(
-    path.resolve("src/lib/db/migrations/088_quota_groups.sql"),
-    "utf8"
-  );
+test("migration 087 contains backfill UPDATE for existing pools", async () => {
+  const sql = fs.readFileSync(path.resolve("src/lib/db/migrations/088_quota_groups.sql"), "utf8");
   assert.ok(
     sql.includes("UPDATE quota_pools SET group_id = 'group-demo'"),
     "migration SQL should backfill existing pools to group-demo"
@@ -126,7 +113,7 @@ test("migration 087 contains backfill UPDATE for existing pools", () => {
 
 // ── B1.2: Schema after migration ──────────────────────────────────────────────
 
-test("after migrations run, quota_groups has a group-demo row named GroupDemo", () => {
+test("after migrations run, quota_groups has a group-demo row named GroupDemo", async () => {
   // Trigger DB initialisation (runs all migrations including 087).
   const db = getDb();
 
@@ -141,7 +128,7 @@ test("after migrations run, quota_groups has a group-demo row named GroupDemo", 
   assert.equal(row!.name, "GroupDemo");
 });
 
-test("quota_pools has a group_id column after migration", () => {
+test("quota_pools has a group_id column after migration", async () => {
   const db = getDb();
   const cols = db
     .prepare<{ name: string }>("PRAGMA table_info(quota_pools)")
@@ -152,11 +139,11 @@ test("quota_pools has a group_id column after migration", () => {
 
 // ── B1.3: createPool defaults ─────────────────────────────────────────────────
 
-test("createPool without groupId → pool.groupId === 'group-demo'", () => {
+test("createPool without groupId → pool.groupId === 'group-demo'", async () => {
   // Ensure migrations have run.
   getDb();
 
-  const pool = poolsDb.createPool({
+  const pool = await poolsDb.createPool({
     connectionId: "conn-1",
     name: "Default Group Pool",
   });
@@ -164,18 +151,18 @@ test("createPool without groupId → pool.groupId === 'group-demo'", () => {
   assert.equal(pool.groupId, "group-demo", "groupId should default to 'group-demo'");
 
   // Re-read from DB to confirm persistence.
-  const reread = poolsDb.getPool(pool.id);
+  const reread = await poolsDb.getPool(pool.id);
   assert.ok(reread, "pool should be findable after creation");
   assert.equal(reread!.groupId, "group-demo", "persisted groupId should be 'group-demo'");
 });
 
-test("createPool with explicit groupId persists the given group", () => {
+test("createPool with explicit groupId persists the given group", async () => {
   const db = getDb();
 
   // Seed a custom group first (raw SQL, as quotaGroups module is not yet implemented).
   db.prepare("INSERT OR IGNORE INTO quota_groups (id, name) VALUES ('g1', 'Group One')").run();
 
-  const pool = poolsDb.createPool({
+  const pool = await poolsDb.createPool({
     connectionId: "conn-g1",
     name: "G1 Pool",
     groupId: "g1",
@@ -183,21 +170,21 @@ test("createPool with explicit groupId persists the given group", () => {
 
   assert.equal(pool.groupId, "g1", "groupId should be 'g1'");
 
-  const reread = poolsDb.getPool(pool.id);
+  const reread = await poolsDb.getPool(pool.id);
   assert.ok(reread, "pool should be findable after creation");
   assert.equal(reread!.groupId, "g1", "persisted groupId should be 'g1'");
 });
 
 // ── B1.4: listPools surfaces groupId ─────────────────────────────────────────
 
-test("listPools returns groupId on every pool", () => {
+test("listPools returns groupId on every pool", async () => {
   const db = getDb();
   db.prepare("INSERT OR IGNORE INTO quota_groups (id, name) VALUES ('g2', 'Group Two')").run();
 
-  poolsDb.createPool({ connectionId: "lp-1", name: "Pool Default" });
-  poolsDb.createPool({ connectionId: "lp-2", name: "Pool G2", groupId: "g2" });
+  await poolsDb.createPool({ connectionId: "lp-1", name: "Pool Default" });
+  await poolsDb.createPool({ connectionId: "lp-2", name: "Pool G2", groupId: "g2" });
 
-  const pools = poolsDb.listPools();
+  const pools = await poolsDb.listPools();
   assert.equal(pools.length, 2);
 
   const pDef = pools.find((p) => p.name === "Pool Default")!;
@@ -209,17 +196,17 @@ test("listPools returns groupId on every pool", () => {
 
 // ── B1.5: updatePool groupId ──────────────────────────────────────────────────
 
-test("updatePool with groupId updates the group assignment", () => {
+test("updatePool with groupId updates the group assignment", async () => {
   const db = getDb();
   db.prepare("INSERT OR IGNORE INTO quota_groups (id, name) VALUES ('g3', 'Group Three')").run();
 
-  const pool = poolsDb.createPool({ connectionId: "up-1", name: "Update Group Pool" });
+  const pool = await poolsDb.createPool({ connectionId: "up-1", name: "Update Group Pool" });
   assert.equal(pool.groupId, "group-demo");
 
-  const updated = poolsDb.updatePool(pool.id, { groupId: "g3" });
+  const updated = await poolsDb.updatePool(pool.id, { groupId: "g3" });
   assert.ok(updated, "updatePool should return the updated pool");
   assert.equal(updated!.groupId, "g3", "groupId should be updated to 'g3'");
 
-  const reread = poolsDb.getPool(pool.id);
+  const reread = await poolsDb.getPool(pool.id);
   assert.equal(reread!.groupId, "g3", "persisted groupId should be 'g3'");
 });

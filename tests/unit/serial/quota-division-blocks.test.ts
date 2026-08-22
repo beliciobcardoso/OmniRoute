@@ -85,7 +85,7 @@ await test("quota-division-blocks: countable-unit enforcement (block + allow)", 
     );
 
     // Create pool: 2 allocations at 50/50 hard
-    const pool = quotaPools.createPool({
+    const pool = await quotaPools.createPool({
       connectionId: CONN,
       name: "Block Pool A",
       allocations: [
@@ -130,7 +130,7 @@ await test("quota-division-blocks: countable-unit enforcement (block + allow)", 
     );
 
     // Create pool: distinct from Scenario A (different poolId + connection)
-    const pool = quotaPools.createPool({
+    const pool = await quotaPools.createPool({
       connectionId: CONN,
       name: "Allow Pool B",
       allocations: [

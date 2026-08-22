@@ -31,7 +31,7 @@ export async function GET(request: Request, { params }: RouteParams): Promise<Re
     const { id } = await params;
 
     // 1. Get pool — 404 if not found
-    const pool = getPool(id);
+    const pool = await getPool(id);
     if (!pool) {
       return NextResponse.json(buildErrorBody(404, "Pool not found"), { status: 404 });
     }

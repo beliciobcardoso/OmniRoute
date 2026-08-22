@@ -66,7 +66,7 @@ export async function enforceQuotaShare(input: EnforceInput): Promise<EnforceDec
     allocation: import("@/lib/db/quotaPools").PoolAllocation;
   }>;
   try {
-    allocations = listAllocationsForApiKey(input.apiKeyId);
+    allocations = await listAllocationsForApiKey(input.apiKeyId);
   } catch {
     // DB not available or migration not run — fail-open
     return { kind: "allow" };
@@ -83,7 +83,7 @@ export async function enforceQuotaShare(input: EnforceInput): Promise<EnforceDec
   for (const { poolId, allocation } of allocations) {
     let p: import("@/lib/db/quotaPools").QuotaPool | null = null;
     try {
-      p = getPool(poolId);
+      p = await getPool(poolId);
     } catch {
       continue;
     }
@@ -295,7 +295,7 @@ export async function recordConsumption(input: RecordConsumptionInput): Promise<
     allocation: import("@/lib/db/quotaPools").PoolAllocation;
   }>;
   try {
-    allocations = listAllocationsForApiKey(input.apiKeyId);
+    allocations = await listAllocationsForApiKey(input.apiKeyId);
   } catch {
     return; // DB not available — silent no-op
   }
@@ -307,7 +307,7 @@ export async function recordConsumption(input: RecordConsumptionInput): Promise<
   for (const { poolId: pid } of allocations) {
     let p: import("@/lib/db/quotaPools").QuotaPool | null = null;
     try {
-      p = getPool(pid);
+      p = await getPool(pid);
     } catch {
       continue;
     }

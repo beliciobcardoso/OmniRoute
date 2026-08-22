@@ -94,14 +94,14 @@ export async function resolveQuotaKeyScope(
   // Deduplicate: a key in 2 pools of the same group expands once.
   const groupIdSet = new Set<string>();
   for (const poolId of allowedQuotas) {
-    const pool = getPool(poolId);
+    const pool = await getPool(poolId);
     if (!pool) continue;
     groupIdSet.add(pool.groupId);
   }
 
   // For each distinct group, aggregate ALL pools in that group.
   for (const groupId of groupIdSet) {
-    const groupPools = getPoolsByGroup(groupId);
+    const groupPools = await getPoolsByGroup(groupId);
     // Group-level "anyValidConnection" gate: include the group slug only when
     // at least one pool in the group has a usable connection.
     let groupHasValidConnection = false;

@@ -71,7 +71,7 @@ test("createPool with two different-provider connections throws /single provider
   const idA = (a as any).id as string;
   const idB = (b as any).id as string;
 
-  assert.throws(
+  await assert.rejects(
     () =>
       poolsDb.createPool({
         connectionId: idA,
@@ -101,7 +101,7 @@ test("createPool with two same-provider connections succeeds with connectionIds.
   const idA = (a as any).id as string;
   const idC = (c as any).id as string;
 
-  const pool = poolsDb.createPool({
+  const pool = await poolsDb.createPool({
     connectionId: idA,
     connectionIds: [idA, idC],
     name: "SameType",
@@ -132,13 +132,13 @@ test("updatePool replacing connectionIds with mixed providers throws /single pro
   const idB = (b as any).id as string;
 
   // Create a valid single-connection pool first.
-  const pool = poolsDb.createPool({
+  const pool = await poolsDb.createPool({
     connectionId: idA,
     name: "StartSingle",
   });
 
   // Try updating to mixed-provider set → should throw.
-  assert.throws(
+  await assert.rejects(
     () => poolsDb.updatePool(pool.id, { connectionIds: [idA, idB] }),
     /same provider|single provider/i
   );
@@ -163,12 +163,12 @@ test("updatePool replacing connectionIds with same-provider connections succeeds
   const idA = (a as any).id as string;
   const idC = (c as any).id as string;
 
-  const pool = poolsDb.createPool({
+  const pool = await poolsDb.createPool({
     connectionId: idA,
     name: "StartSingle",
   });
 
-  const updated = poolsDb.updatePool(pool.id, { connectionIds: [idA, idC] });
+  const updated = await poolsDb.updatePool(pool.id, { connectionIds: [idA, idC] });
 
   assert.ok(updated, "updatePool should return updated pool");
   assert.equal(updated!.connectionIds.length, 2, "should have 2 connectionIds after update");

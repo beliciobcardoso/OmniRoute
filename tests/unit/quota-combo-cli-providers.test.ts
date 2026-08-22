@@ -59,7 +59,7 @@ test("syncQuotaCombos generates qtSd/ combos for a CLI provider (codex) via REGI
     apiKey: "sk-codex",
   });
   const connId = (conn as Record<string, unknown>).id as string;
-  const pool = poolsDb.createPool({ connectionId: connId, name: "Codex Quota" });
+  const pool = await poolsDb.createPool({ connectionId: connId, name: "Codex Quota" });
 
   await syncQuotaCombos(pool.id);
 

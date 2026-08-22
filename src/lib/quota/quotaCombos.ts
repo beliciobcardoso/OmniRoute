@@ -63,7 +63,7 @@ async function resolvePoolForSync(poolId: string): Promise<{
     groupName: string;
   };
 } | null> {
-  const pool = getPool(poolId);
+  const pool = await getPool(poolId);
   if (!pool) return null;
 
   // Defensive: ensure connectionIds is always a non-empty array.
