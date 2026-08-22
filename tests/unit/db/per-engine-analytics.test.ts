@@ -46,8 +46,8 @@ test.after(() => {
 
 // ─── tests ────────────────────────────────────────────────────────────────────
 
-test("getPerEngineAnalytics returns runs=0 and zeroed metrics for unknown engine", () => {
-  const result = getPerEngineAnalytics("unknown-engine");
+test("getPerEngineAnalytics returns runs=0 and zeroed metrics for unknown engine", async () => {
+  const result = await getPerEngineAnalytics("unknown-engine");
   assert.equal(result.engineId, "unknown-engine");
   assert.equal(result.runs, 0);
   assert.equal(result.tokensSaved, 0);
@@ -55,7 +55,7 @@ test("getPerEngineAnalytics returns runs=0 and zeroed metrics for unknown engine
   assert.equal(result.days, 7);
 });
 
-test("getPerEngineAnalytics returns correct aggregation for headroom rows only", () => {
+test("getPerEngineAnalytics returns correct aggregation for headroom rows only", async () => {
   const now = new Date().toISOString();
 
   // 2 headroom rows: original=1000/compressed=800/saved=200 and original=500/compressed=350/saved=150
@@ -86,7 +86,7 @@ test("getPerEngineAnalytics returns correct aggregation for headroom rows only",
     tokens_saved: 200,
   });
 
-  const result = getPerEngineAnalytics("headroom");
+  const result = await getPerEngineAnalytics("headroom");
 
   assert.equal(result.engineId, "headroom");
   assert.equal(result.runs, 2, "should count only the 2 headroom rows");
@@ -100,7 +100,7 @@ test("getPerEngineAnalytics returns correct aggregation for headroom rows only",
   assert.equal(result.days, 7);
 });
 
-test("getPerEngineAnalytics excludes rows outside the days window", () => {
+test("getPerEngineAnalytics excludes rows outside the days window", async () => {
   const recent = new Date().toISOString();
   // 30 days ago — outside the default 7-day window
   const old = new Date(Date.now() - 30 * 86400_000).toISOString();
@@ -122,12 +122,12 @@ test("getPerEngineAnalytics excludes rows outside the days window", () => {
     tokens_saved: 1000,
   });
 
-  const result = getPerEngineAnalytics("headroom", 7);
+  const result = await getPerEngineAnalytics("headroom", 7);
   assert.equal(result.runs, 1, "should only count the recent row within 7 days");
   assert.equal(result.tokensSaved, 200);
 });
 
-test("getPerEngineAnalytics falls back to mode column when engine is null (COALESCE behaviour)", () => {
+test("getPerEngineAnalytics falls back to mode column when engine is null (COALESCE behaviour)", async () => {
   const now = new Date().toISOString();
 
   // Insert a row where engine is explicitly omitted — insertCompressionAnalyticsRow
@@ -140,12 +140,12 @@ test("getPerEngineAnalytics falls back to mode column when engine is null (COALE
   ).run(now, "caveman", 600, 400, 200);
 
   // COALESCE(engine, mode) = 'caveman' for the row above
-  const result = getPerEngineAnalytics("caveman");
+  const result = await getPerEngineAnalytics("caveman");
   assert.equal(result.runs, 1, "COALESCE fallback should match engine=NULL, mode=caveman");
   assert.equal(result.tokensSaved, 200);
 });
 
-test("getPerEngineAnalytics accepts custom days parameter", () => {
-  const result = getPerEngineAnalytics("headroom", 30);
+test("getPerEngineAnalytics accepts custom days parameter", async () => {
+  const result = await getPerEngineAnalytics("headroom", 30);
   assert.equal(result.days, 30);
 });

@@ -1,4 +1,12 @@
+import { sql } from "kysely";
+
 import { getDbInstance } from "./core";
+import { resolveDbDriverConfig } from "./driverConfig";
+import { ensurePostgresBootstrap, getKyselyDb } from "./kysely/client";
+
+function isPostgres(): boolean {
+  return resolveDbDriverConfig().driver === "postgres";
+}
 
 export interface CompressionAnalyticsRow {
   id?: number;
@@ -124,7 +132,45 @@ function ensureCompressionAnalyticsColumns(): void {
   columnsEnsuredForDb = db;
 }
 
-export function insertCompressionAnalyticsRow(row: CompressionAnalyticsRow): void {
+export async function insertCompressionAnalyticsRow(row: CompressionAnalyticsRow): Promise<void> {
+  if (isPostgres()) {
+    await ensurePostgresBootstrap();
+    const kdb = getKyselyDb();
+    await kdb
+      .insertInto("compression_analytics")
+      .values({
+        timestamp: row.timestamp,
+        combo_id: row.combo_id ?? null,
+        compression_combo_id: row.compression_combo_id ?? null,
+        engine: row.engine ?? row.mode,
+        provider: row.provider ?? null,
+        mode: row.mode,
+        original_tokens: row.original_tokens,
+        compressed_tokens: row.compressed_tokens,
+        tokens_saved: row.tokens_saved,
+        duration_ms: row.duration_ms ?? null,
+        request_id: row.request_id ?? null,
+        actual_prompt_tokens: row.actual_prompt_tokens ?? null,
+        actual_completion_tokens: row.actual_completion_tokens ?? null,
+        actual_total_tokens: row.actual_total_tokens ?? null,
+        actual_cache_read_tokens: row.actual_cache_read_tokens ?? null,
+        actual_cache_write_tokens: row.actual_cache_write_tokens ?? null,
+        estimated_usd_saved: row.estimated_usd_saved ?? null,
+        mcp_description_tokens_saved: row.mcp_description_tokens_saved ?? 0,
+        multimodal_skip_count: row.multimodal_skip_count ?? 0,
+        receipt_source: row.receipt_source ?? null,
+        validation_fallback: row.validation_fallback ? 1 : 0,
+        output_mode: row.output_mode ?? null,
+        rtk_raw_output_pointer: row.rtk_raw_output_pointer ?? null,
+        rtk_raw_output_bytes: row.rtk_raw_output_bytes ?? null,
+        rtk_raw_output_pointers: row.rtk_raw_output_pointers ?? null,
+        rtk_raw_output_total_bytes: row.rtk_raw_output_total_bytes ?? null,
+        skip_reason: row.skip_reason ?? null,
+      })
+      .execute();
+    return;
+  }
+
   const db = getDbInstance();
   ensureCompressionAnalyticsColumns();
   db.prepare(
@@ -183,17 +229,17 @@ export function insertCompressionAnalyticsRow(row: CompressionAnalyticsRow): voi
  *
  * Best-effort: a zero/absent receipt is a no-op (context editing did not fire).
  */
-export function recordContextEditingTelemetry(
+export async function recordContextEditingTelemetry(
   requestId: string | null | undefined,
   telemetry:
     | { clearedInputTokens?: number; clearedToolUses?: number; editCount?: number }
     | null
     | undefined,
   provider: string | null = "claude"
-): void {
+): Promise<void> {
   const cleared = telemetry?.clearedInputTokens ?? 0;
   if (!Number.isFinite(cleared) || cleared <= 0) return;
-  insertCompressionAnalyticsRow({
+  await insertCompressionAnalyticsRow({
     timestamp: new Date().toISOString(),
     provider,
     mode: "context-editing",
@@ -227,8 +273,31 @@ function ensureCompressionEngineBreakdownTable(): void {
   breakdownTableEnsuredForDb = db;
 }
 
-export function insertCompressionEngineBreakdown(rows: CompressionEngineBreakdownRow[]): void {
+export async function insertCompressionEngineBreakdown(
+  rows: CompressionEngineBreakdownRow[]
+): Promise<void> {
   if (!rows.length) return;
+
+  if (isPostgres()) {
+    await ensurePostgresBootstrap();
+    const kdb = getKyselyDb();
+    await kdb
+      .insertInto("compression_engine_breakdown")
+      .values(
+        rows.map((r) => ({
+          timestamp: r.timestamp,
+          request_id: r.request_id ?? null,
+          engine: r.engine,
+          original_tokens: r.original_tokens,
+          compressed_tokens: r.compressed_tokens,
+          tokens_saved: r.tokens_saved,
+          duration_ms: r.duration_ms ?? null,
+        }))
+      )
+      .execute();
+    return;
+  }
+
   const db = getDbInstance();
   ensureCompressionEngineBreakdownTable();
   const stmt = db.prepare(
@@ -252,11 +321,11 @@ export function insertCompressionEngineBreakdown(rows: CompressionEngineBreakdow
   insertAll(rows);
 }
 
-export function attachCompressionUsageReceipt(
+export async function attachCompressionUsageReceipt(
   requestId: string | null | undefined,
   usage: Record<string, unknown> | null | undefined,
   source: "provider" | "estimated" | "stream" = "provider"
-): void {
+): Promise<void> {
   if (!requestId || !usage || typeof usage !== "object") return;
   const promptTokens = toFiniteInt(usage.prompt_tokens);
   const completionTokens = toFiniteInt(usage.completion_tokens);
@@ -273,6 +342,32 @@ export function attachCompressionUsageReceipt(
     usage.cache_creation_input_tokens ?? promptDetails.cache_creation_tokens
   );
   if (promptTokens === null && completionTokens === null && totalTokens <= 0) return;
+
+  if (isPostgres()) {
+    await ensurePostgresBootstrap();
+    const kdb = getKyselyDb();
+    const latestIdRow = await kdb
+      .selectFrom("compression_analytics")
+      .select("id")
+      .where("request_id", "=", requestId)
+      .orderBy("id", "desc")
+      .limit(1)
+      .executeTakeFirst();
+    if (!latestIdRow) return;
+    await kdb
+      .updateTable("compression_analytics")
+      .set({
+        actual_prompt_tokens: promptTokens,
+        actual_completion_tokens: completionTokens,
+        actual_total_tokens: totalTokens,
+        actual_cache_read_tokens: cacheReadTokens,
+        actual_cache_write_tokens: cacheWriteTokens,
+        receipt_source: source,
+      })
+      .where("id", "=", latestIdRow.id)
+      .execute();
+    return;
+  }
 
   const db = getDbInstance();
   ensureCompressionAnalyticsColumns();
@@ -320,11 +415,51 @@ function appendCondition(whereClause: string, condition: string): string {
 
 type EngineAggRow = { runs: number; original: number; compressed: number; saved: number };
 
-export function getPerEngineAnalytics(engineId: string, days = 7) {
+export async function getPerEngineAnalytics(engineId: string, days = 7) {
+  const since = new Date(Date.now() - days * 86400_000).toISOString();
+
+  if (isPostgres()) {
+    await ensurePostgresBootstrap();
+    const kdb = getKyselyDb();
+
+    const breakdownResult = await sql<EngineAggRow>`
+      SELECT COUNT(*) AS runs,
+             COALESCE(SUM(original_tokens), 0) AS original,
+             COALESCE(SUM(compressed_tokens), 0) AS compressed,
+             COALESCE(SUM(tokens_saved), 0) AS saved
+      FROM compression_engine_breakdown
+      WHERE engine = ${engineId} AND timestamp >= ${since}
+    `.execute(kdb);
+    const breakdown = breakdownResult.rows[0];
+
+    const legacyResult = await sql<EngineAggRow>`
+      SELECT COUNT(*) AS runs,
+             COALESCE(SUM(original_tokens), 0) AS original,
+             COALESCE(SUM(compressed_tokens), 0) AS compressed,
+             COALESCE(SUM(tokens_saved), 0) AS saved
+      FROM compression_analytics
+      WHERE COALESCE(engine, mode) = ${engineId} AND timestamp >= ${since}
+        AND (
+          request_id IS NULL
+          OR request_id NOT IN (
+            SELECT request_id FROM compression_engine_breakdown WHERE request_id IS NOT NULL
+          )
+        )
+    `.execute(kdb);
+    const legacy = legacyResult.rows[0];
+
+    const runs = Number(breakdown.runs) + Number(legacy.runs);
+    const original = Number(breakdown.original) + Number(legacy.original);
+    const compressed = Number(breakdown.compressed) + Number(legacy.compressed);
+    const tokensSaved = Math.max(0, Number(breakdown.saved) + Number(legacy.saved));
+    const avgSavingsPercent =
+      original > 0 ? Math.round(((original - compressed) / original) * 1000) / 10 : 0;
+    return { engineId, runs, tokensSaved, avgSavingsPercent, days };
+  }
+
   const db = getDbInstance();
   ensureCompressionAnalyticsColumns();
   ensureCompressionEngineBreakdownTable();
-  const since = new Date(Date.now() - days * 86400_000).toISOString();
 
   // (1) Per-engine contributions from stacked runs (one breakdown row per engine).
   const breakdown = db
@@ -367,10 +502,237 @@ export function getPerEngineAnalytics(engineId: string, days = 7) {
   return { engineId, runs, tokensSaved, avgSavingsPercent, days };
 }
 
-export function getCompressionAnalyticsSummary(since?: string): CompressionAnalyticsSummary {
-  const db = getDbInstance();
-  ensureCompressionAnalyticsColumns();
+async function getCompressionAnalyticsSummaryPostgres(
+  cutoff: string | null
+): Promise<CompressionAnalyticsSummary> {
+  await ensurePostgresBootstrap();
+  const kdb = getKyselyDb();
+  // timestamp is TEXT (ISO-8601); COALESCE(cutoff, '') makes the "no cutoff" case a
+  // no-op predicate (every timestamp sorts >= '') without branching the SQL text.
+  const cutoffFrag = sql`COALESCE(${cutoff}, '')`;
 
+  const scalarResult = await sql<{
+    total: string;
+    totalsaved: string;
+    avgpct: number;
+    avgdur: number;
+  }>`
+    SELECT
+      COUNT(*) as total,
+      COALESCE(SUM(tokens_saved), 0) as totalSaved,
+      COALESCE(AVG(CASE WHEN original_tokens > 0 THEN CAST(tokens_saved AS DOUBLE PRECISION) / original_tokens * 100 ELSE 0 END), 0) as avgPct,
+      COALESCE(AVG(duration_ms), 0) as avgDur
+    FROM compression_analytics
+    WHERE timestamp >= ${cutoffFrag} AND skip_reason IS NULL
+  `.execute(kdb);
+  const scalar = scalarResult.rows[0];
+
+  const modeRowsResult = await sql<{ mode: string; cnt: string; saved: string; avgpct: number }>`
+    SELECT mode, COUNT(*) as cnt, COALESCE(SUM(tokens_saved), 0) as saved,
+      COALESCE(AVG(CASE WHEN original_tokens > 0 THEN CAST(tokens_saved AS DOUBLE PRECISION) / original_tokens * 100 ELSE 0 END), 0) as avgPct
+    FROM compression_analytics
+    WHERE timestamp >= ${cutoffFrag} AND skip_reason IS NULL
+    GROUP BY mode
+  `.execute(kdb);
+
+  const skipModeRowsResult = await sql<{ mode: string; cnt: string }>`
+    SELECT mode, COUNT(*) as cnt
+    FROM compression_analytics
+    WHERE timestamp >= ${cutoffFrag} AND skip_reason IS NOT NULL
+    GROUP BY mode
+  `.execute(kdb);
+
+  const byMode: Record<
+    string,
+    { count: number; tokensSaved: number; avgSavingsPct: number; skipped: number }
+  > = {};
+  for (const r of modeRowsResult.rows) {
+    byMode[r.mode] = {
+      count: Number(r.cnt),
+      tokensSaved: Number(r.saved),
+      avgSavingsPct: Math.round(r.avgpct),
+      skipped: 0,
+    };
+  }
+  for (const r of skipModeRowsResult.rows) {
+    if (byMode[r.mode]) byMode[r.mode].skipped = Number(r.cnt);
+    else byMode[r.mode] = { count: 0, tokensSaved: 0, avgSavingsPct: 0, skipped: Number(r.cnt) };
+  }
+
+  const engineRowsResult = await sql<{
+    engine: string;
+    cnt: string;
+    saved: string;
+    avgpct: number;
+  }>`
+    SELECT COALESCE(engine, mode) as engine, COUNT(*) as cnt, COALESCE(SUM(tokens_saved), 0) as saved,
+      COALESCE(AVG(CASE WHEN original_tokens > 0 THEN CAST(tokens_saved AS DOUBLE PRECISION) / original_tokens * 100 ELSE 0 END), 0) as avgPct
+    FROM compression_analytics
+    WHERE timestamp >= ${cutoffFrag} AND skip_reason IS NULL
+    GROUP BY COALESCE(engine, mode)
+  `.execute(kdb);
+
+  const byEngine: Record<string, { count: number; tokensSaved: number; avgSavingsPct: number }> =
+    {};
+  for (const r of engineRowsResult.rows) {
+    byEngine[r.engine] = {
+      count: Number(r.cnt),
+      tokensSaved: Number(r.saved),
+      avgSavingsPct: Math.round(r.avgpct),
+    };
+  }
+
+  const comboRowsResult = await sql<{
+    compressioncomboid: string | null;
+    cnt: string;
+    saved: string;
+  }>`
+    SELECT compression_combo_id as compressionComboId, COUNT(*) as cnt,
+      COALESCE(SUM(tokens_saved), 0) as saved
+    FROM compression_analytics
+    WHERE timestamp >= ${cutoffFrag} AND skip_reason IS NULL AND compression_combo_id IS NOT NULL
+    GROUP BY compression_combo_id ORDER BY cnt DESC
+  `.execute(kdb);
+
+  const byCompressionCombo: Record<string, { count: number; tokensSaved: number }> = {};
+  for (const r of comboRowsResult.rows) {
+    const key = r.compressioncomboid ?? "unknown";
+    byCompressionCombo[key] = { count: Number(r.cnt), tokensSaved: Number(r.saved) };
+  }
+
+  const provRowsResult = await sql<{ provider: string | null; cnt: string; saved: string }>`
+    SELECT provider, COUNT(*) as cnt, COALESCE(SUM(tokens_saved), 0) as saved
+    FROM compression_analytics
+    WHERE timestamp >= ${cutoffFrag} AND skip_reason IS NULL
+    GROUP BY provider ORDER BY cnt DESC
+  `.execute(kdb);
+
+  const byProvider: Record<string, { count: number; tokensSaved: number }> = {};
+  for (const r of provRowsResult.rows) {
+    const key = r.provider ?? "unknown";
+    byProvider[key] = { count: Number(r.cnt), tokensSaved: Number(r.saved) };
+  }
+
+  const last24hMap = new Map<string, { hour: string; count: number; tokensSaved: number }>();
+  const now = new Date();
+  for (let i = 23; i >= 0; i--) {
+    const d = new Date(now.getTime() - i * 60 * 60 * 1000);
+    const hourStr = d.toISOString().substring(0, 14) + "00:00Z";
+    last24hMap.set(hourStr, { hour: hourStr, count: 0, tokensSaved: 0 });
+  }
+
+  const hourRowsResult = await sql<{ hour: string; cnt: string; saved: string }>`
+    SELECT to_char(timestamp::timestamptz, 'YYYY-MM-DD"T"HH24:00:00"Z"') as hour,
+      COUNT(*) as cnt, COALESCE(SUM(tokens_saved), 0) as saved
+    FROM compression_analytics
+    WHERE timestamp >= ${new Date(now.getTime() - 24 * 60 * 60 * 1000).toISOString()} AND skip_reason IS NULL
+    GROUP BY hour ORDER BY hour ASC
+  `.execute(kdb);
+
+  for (const r of hourRowsResult.rows) {
+    if (last24hMap.has(r.hour)) {
+      last24hMap.set(r.hour, { hour: r.hour, count: Number(r.cnt), tokensSaved: Number(r.saved) });
+    }
+  }
+  const last24h = Array.from(last24hMap.values());
+
+  const receiptRowsResult = await sql<{
+    source: string | null;
+    cnt: string;
+    prompt: string;
+    completion: string;
+    total: string;
+    cacheread: string;
+    cachewrite: string;
+    usdsaved: number;
+  }>`
+    SELECT receipt_source as source, COUNT(*) as cnt,
+      COALESCE(SUM(actual_prompt_tokens), 0) as prompt,
+      COALESCE(SUM(actual_completion_tokens), 0) as completion,
+      COALESCE(SUM(actual_total_tokens), 0) as total,
+      COALESCE(SUM(actual_cache_read_tokens), 0) as cacheRead,
+      COALESCE(SUM(actual_cache_write_tokens), 0) as cacheWrite,
+      COALESCE(SUM(estimated_usd_saved), 0) as usdSaved
+    FROM compression_analytics
+    WHERE timestamp >= ${cutoffFrag} AND skip_reason IS NULL AND receipt_source IS NOT NULL
+    GROUP BY receipt_source
+  `.execute(kdb);
+
+  const realUsage = {
+    requestsWithReceipts: 0,
+    promptTokens: 0,
+    completionTokens: 0,
+    totalTokens: 0,
+    cacheReadTokens: 0,
+    cacheWriteTokens: 0,
+    estimatedUsdSaved: 0,
+    bySource: {} as Record<string, number>,
+  };
+  for (const row of receiptRowsResult.rows) {
+    const source = row.source ?? "unknown";
+    realUsage.requestsWithReceipts += Number(row.cnt);
+    realUsage.promptTokens += Number(row.prompt);
+    realUsage.completionTokens += Number(row.completion);
+    realUsage.totalTokens += Number(row.total);
+    realUsage.cacheReadTokens += Number(row.cacheread);
+    realUsage.cacheWriteTokens += Number(row.cachewrite);
+    realUsage.estimatedUsdSaved += Number(row.usdsaved);
+    realUsage.bySource[source] = Number(row.cnt);
+  }
+
+  const fallbackResult = await sql<{ cnt: string }>`
+    SELECT COUNT(*) as cnt
+    FROM compression_analytics
+    WHERE timestamp >= ${cutoffFrag} AND skip_reason IS NULL AND validation_fallback = 1
+  `.execute(kdb);
+  const fallbackRow = fallbackResult.rows[0];
+
+  const mcpDescriptionResult = await sql<{ cnt: string; saved: string }>`
+    SELECT COUNT(*) as cnt, COALESCE(SUM(mcp_description_tokens_saved), 0) as saved
+    FROM compression_analytics
+    WHERE timestamp >= ${cutoffFrag} AND skip_reason IS NULL AND mcp_description_tokens_saved > 0
+  `.execute(kdb);
+  const mcpDescriptionRow = mcpDescriptionResult.rows[0];
+
+  const skipReasonRowsResult = await sql<{ reason: string | null; cnt: string }>`
+    SELECT skip_reason as reason, COUNT(*) as cnt
+    FROM compression_analytics
+    WHERE timestamp >= ${cutoffFrag} AND skip_reason IS NOT NULL
+    GROUP BY skip_reason
+  `.execute(kdb);
+
+  const bySkipReason: Record<string, number> = {};
+  let totalSkipped = 0;
+  for (const r of skipReasonRowsResult.rows) {
+    const key = r.reason ?? "unknown";
+    bySkipReason[key] = Number(r.cnt);
+    totalSkipped += Number(r.cnt);
+  }
+
+  return {
+    totalRequests: Number(scalar?.total ?? 0),
+    totalTokensSaved: Number(scalar?.totalsaved ?? 0),
+    avgSavingsPct: Math.round(scalar?.avgpct ?? 0),
+    avgDurationMs: Math.round(scalar?.avgdur ?? 0),
+    byMode,
+    byEngine,
+    byCompressionCombo,
+    byProvider,
+    last24h,
+    totalSkipped,
+    bySkipReason,
+    validationFallbacks: Number(fallbackRow?.cnt ?? 0),
+    realUsage,
+    mcpDescriptionCompression: {
+      snapshots: Number(mcpDescriptionRow?.cnt ?? 0),
+      estimatedTokensSaved: Number(mcpDescriptionRow?.saved ?? 0),
+    },
+  };
+}
+
+export async function getCompressionAnalyticsSummary(
+  since?: string
+): Promise<CompressionAnalyticsSummary> {
   let cutoff: string | null = null;
   if (since === "24h") {
     cutoff = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
@@ -379,6 +741,13 @@ export function getCompressionAnalyticsSummary(since?: string): CompressionAnaly
   } else if (since === "30d") {
     cutoff = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000).toISOString();
   }
+
+  if (isPostgres()) {
+    return getCompressionAnalyticsSummaryPostgres(cutoff);
+  }
+
+  const db = getDbInstance();
+  ensureCompressionAnalyticsColumns();
 
   const whereClause = cutoff ? "WHERE timestamp >= ?" : "";
   const params = cutoff ? [cutoff] : [];
@@ -646,7 +1015,35 @@ export interface LatestCompressionAnalyticsRun {
   validation_fallback: number | null;
 }
 
-export function getLatestCompressionAnalyticsRun(): LatestCompressionAnalyticsRun | undefined {
+export async function getLatestCompressionAnalyticsRun(): Promise<
+  LatestCompressionAnalyticsRun | undefined
+> {
+  if (isPostgres()) {
+    await ensurePostgresBootstrap();
+    const kdb = getKyselyDb();
+    const row = await kdb
+      .selectFrom("compression_analytics")
+      .select([
+        "id",
+        "timestamp",
+        "combo_id",
+        "compression_combo_id",
+        "mode",
+        "original_tokens",
+        "compressed_tokens",
+        "tokens_saved",
+        "duration_ms",
+        "request_id",
+        "engine",
+        "validation_fallback",
+      ])
+      .orderBy("timestamp", "desc")
+      .orderBy("id", "desc")
+      .limit(1)
+      .executeTakeFirst();
+    return row as LatestCompressionAnalyticsRun | undefined;
+  }
+
   const db = getDbInstance();
   return db
     .prepare(

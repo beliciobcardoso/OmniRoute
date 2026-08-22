@@ -19,7 +19,7 @@ export function attachCompressionUsageReceiptAfterAnalytics(
     try {
       if (pendingWrite) await pendingWrite;
       const { attachCompressionUsageReceipt } = await import("@/lib/db/compressionAnalytics.ts");
-      attachCompressionUsageReceipt(skillRequestId, usage, source);
+      await attachCompressionUsageReceipt(skillRequestId, usage, source);
     } catch {
       // Compression analytics are best-effort and must never affect responses.
     }

@@ -44,43 +44,43 @@ test.after(() => {
   else process.env.DATA_DIR = originalDataDir;
 });
 
-test("records a context-editing row reflected in byEngine analytics", () => {
-  recordContextEditingTelemetry(
+test("records a context-editing row reflected in byEngine analytics", async () => {
+  await recordContextEditingTelemetry(
     "req-1",
     { editCount: 1, clearedInputTokens: 50000, clearedToolUses: 8 },
     "claude"
   );
-  const summary = getCompressionAnalyticsSummary();
+  const summary = await getCompressionAnalyticsSummary();
   assert.ok(summary.byEngine["context-editing"], "byEngine has a context-editing bucket");
   assert.equal(summary.byEngine["context-editing"].count, 1);
   assert.equal(summary.byEngine["context-editing"].tokensSaved, 50000);
   assert.equal(summary.totalTokensSaved, 50000);
 });
 
-test("is a no-op when nothing was cleared (clearedInputTokens <= 0)", () => {
-  recordContextEditingTelemetry("req-2", {
+test("is a no-op when nothing was cleared (clearedInputTokens <= 0)", async () => {
+  await recordContextEditingTelemetry("req-2", {
     editCount: 1,
     clearedInputTokens: 0,
     clearedToolUses: 0,
   });
-  const summary = getCompressionAnalyticsSummary();
+  const summary = await getCompressionAnalyticsSummary();
   assert.equal(summary.totalRequests, 0, "no row written");
   assert.equal(summary.byEngine["context-editing"], undefined);
 });
 
-test("is a no-op for null/undefined telemetry", () => {
-  recordContextEditingTelemetry("req-3", null as never);
-  recordContextEditingTelemetry("req-4", undefined as never);
-  assert.equal(getCompressionAnalyticsSummary().totalRequests, 0);
+test("is a no-op for null/undefined telemetry", async () => {
+  await recordContextEditingTelemetry("req-3", null as never);
+  await recordContextEditingTelemetry("req-4", undefined as never);
+  assert.equal((await getCompressionAnalyticsSummary()).totalRequests, 0);
 });
 
-test("uses a suffixed request_id so it never collides with the usage-receipt UPDATE", () => {
-  recordContextEditingTelemetry(
+test("uses a suffixed request_id so it never collides with the usage-receipt UPDATE", async () => {
+  await recordContextEditingTelemetry(
     "abc123",
     { editCount: 1, clearedInputTokens: 1000, clearedToolUses: 1 },
     "claude"
   );
-  const latest = getLatestCompressionAnalyticsRun();
+  const latest = await getLatestCompressionAnalyticsRun();
   assert.ok(latest);
   assert.equal(latest.engine, "context-editing");
   assert.equal(latest.mode, "context-editing");
@@ -91,18 +91,18 @@ test("uses a suffixed request_id so it never collides with the usage-receipt UPD
   );
 });
 
-test("aggregates multiple context-editing rows", () => {
-  recordContextEditingTelemetry("r1", {
+test("aggregates multiple context-editing rows", async () => {
+  await recordContextEditingTelemetry("r1", {
     editCount: 1,
     clearedInputTokens: 1000,
     clearedToolUses: 1,
   });
-  recordContextEditingTelemetry("r2", {
+  await recordContextEditingTelemetry("r2", {
     editCount: 2,
     clearedInputTokens: 2500,
     clearedToolUses: 3,
   });
-  const summary = getCompressionAnalyticsSummary();
+  const summary = await getCompressionAnalyticsSummary();
   assert.equal(summary.byEngine["context-editing"].count, 2);
   assert.equal(summary.byEngine["context-editing"].tokensSaved, 3500);
 });

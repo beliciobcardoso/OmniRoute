@@ -23,6 +23,7 @@ export const POSTGRES_BOOTSTRAP_TABLES = [
   "command_code_auth_sessions",
   "community_servers",
   "compression_analytics",
+  "compression_engine_breakdown",
   "compression_cache_stats",
   "compression_combo_assignments",
   "compression_combos",

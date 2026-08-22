@@ -27,7 +27,7 @@ export function recordContextEditingTelemetryHook(args: {
       const tele = extractContextEditingTelemetry(responseBody);
       if (tele) {
         const { recordContextEditingTelemetry } = await import("@/lib/db/compressionAnalytics");
-        recordContextEditingTelemetry(skillRequestId, tele, provider);
+        await recordContextEditingTelemetry(skillRequestId, tele, provider);
         log?.debug?.(
           "CONTEXT_EDITING",
           `cleared ${tele.clearedInputTokens} input tokens / ${tele.clearedToolUses} tool uses (${tele.editCount} edits)`

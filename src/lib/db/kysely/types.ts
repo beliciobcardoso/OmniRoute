@@ -369,6 +369,22 @@ export interface CompressionAnalyticsTable {
   output_mode: string | null;
   compression_combo_id: string | null;
   engine: string | null;
+  rtk_raw_output_pointer: string | null;
+  rtk_raw_output_bytes: number | null;
+  rtk_raw_output_pointers: string | null;
+  rtk_raw_output_total_bytes: number | null;
+  skip_reason: string | null;
+}
+
+export interface CompressionEngineBreakdownTable {
+  id: Generated<number>;
+  timestamp: string;
+  request_id: string | null;
+  engine: string;
+  original_tokens: Generated<number>;
+  compressed_tokens: Generated<number>;
+  tokens_saved: Generated<number>;
+  duration_ms: number | null;
 }
 
 export interface CompressionCacheStatsTable {
@@ -1402,6 +1418,7 @@ export interface Database {
   command_code_auth_sessions: CommandCodeAuthSessionsTable;
   community_servers: CommunityServersTable;
   compression_analytics: CompressionAnalyticsTable;
+  compression_engine_breakdown: CompressionEngineBreakdownTable;
   compression_cache_stats: CompressionCacheStatsTable;
   compression_combo_assignments: CompressionComboAssignmentsTable;
   compression_run_telemetry: CompressionRunTelemetryTable;

@@ -224,7 +224,7 @@ test("chatCore integration: disabled prompt compression leaves combo override re
     assert.ok(capturedBody, "Fetch should have been called");
     assert.deepEqual(capturedBody.messages, body.messages);
 
-    const summary = compressionAnalyticsDb.getCompressionAnalyticsSummary();
+    const summary = await compressionAnalyticsDb.getCompressionAnalyticsSummary();
     assert.equal(summary.totalRequests, 0, "Disabled compression should not record analytics");
   } finally {
     globalThis.fetch = originalFetch;
@@ -688,11 +688,9 @@ test("chatCore integration: assigned compression combo applies language packs an
     assert.match(firstMessage?.content ?? "", /OmniRoute Output Styles/);
     assert.match(firstMessage?.content ?? "", /Responda conciso/);
 
-    for (
-      let attempt = 0;
-      attempt < 100 && compressionAnalyticsDb.getCompressionAnalyticsSummary().totalRequests === 0;
-      attempt += 1
-    ) {
+    for (let attempt = 0; attempt < 100; attempt += 1) {
+      const summary = await compressionAnalyticsDb.getCompressionAnalyticsSummary();
+      if (summary.totalRequests !== 0) break;
       await new Promise((resolve) => setTimeout(resolve, 20));
     }
   } finally {
@@ -783,14 +781,14 @@ test("chatCore integration: default stacked compression combo applies for unassi
     assert.match(firstMessage?.content ?? "", /OmniRoute Output Styles/);
     assert.match(firstMessage?.content ?? "", /Responda conciso/);
 
-    let summary = compressionAnalyticsDb.getCompressionAnalyticsSummary();
+    let summary = await compressionAnalyticsDb.getCompressionAnalyticsSummary();
     for (
       let attempt = 0;
       attempt < 100 && !summary.byCompressionCombo[compressionCombo.id];
       attempt += 1
     ) {
       await new Promise((resolve) => setTimeout(resolve, 20));
-      summary = compressionAnalyticsDb.getCompressionAnalyticsSummary();
+      summary = await compressionAnalyticsDb.getCompressionAnalyticsSummary();
     }
 
     assert.equal(summary.byCompressionCombo[compressionCombo.id].count, 1);
@@ -873,7 +871,7 @@ test.skip("chatCore integration: seeded default combo runs RTK before Caveman", 
     const toolContent = capturedBody.messages?.[0]?.content ?? "";
     assert.match(toolContent, /rtk:dropped 7 repeated lines/);
 
-    let summary = compressionAnalyticsDb.getCompressionAnalyticsSummary();
+    let summary = await compressionAnalyticsDb.getCompressionAnalyticsSummary();
     for (
       let attempt = 0;
       attempt < 100 &&
@@ -882,7 +880,7 @@ test.skip("chatCore integration: seeded default combo runs RTK before Caveman", 
       attempt += 1
     ) {
       await new Promise((resolve) => setTimeout(resolve, 20));
-      summary = compressionAnalyticsDb.getCompressionAnalyticsSummary();
+      summary = await compressionAnalyticsDb.getCompressionAnalyticsSummary();
     }
 
     assert.equal(summary.totalRequests, 1);
@@ -949,7 +947,7 @@ test("chatCore integration: modular compression records analytics row best-effor
 
     assert.ok(result.success, "Request should succeed");
 
-    let summary = compressionAnalyticsDb.getCompressionAnalyticsSummary();
+    let summary = await compressionAnalyticsDb.getCompressionAnalyticsSummary();
     for (
       let attempt = 0;
       attempt < 100 &&
@@ -957,7 +955,7 @@ test("chatCore integration: modular compression records analytics row best-effor
       attempt += 1
     ) {
       await new Promise((resolve) => setTimeout(resolve, 20));
-      summary = compressionAnalyticsDb.getCompressionAnalyticsSummary();
+      summary = await compressionAnalyticsDb.getCompressionAnalyticsSummary();
     }
 
     assert.equal(summary.totalRequests, 1);

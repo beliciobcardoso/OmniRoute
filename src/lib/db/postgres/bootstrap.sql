@@ -342,8 +342,26 @@ CREATE TABLE IF NOT EXISTS compression_analytics (
   validation_fallback BIGINT DEFAULT 0,
   output_mode TEXT,
   compression_combo_id TEXT,
-  engine TEXT
+  engine TEXT,
+  rtk_raw_output_pointer TEXT,
+  rtk_raw_output_bytes BIGINT,
+  rtk_raw_output_pointers TEXT,
+  rtk_raw_output_total_bytes BIGINT,
+  skip_reason TEXT
 );
+
+CREATE TABLE IF NOT EXISTS compression_engine_breakdown (
+  id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  timestamp TEXT NOT NULL,
+  request_id TEXT,
+  engine TEXT NOT NULL,
+  original_tokens BIGINT NOT NULL DEFAULT 0,
+  compressed_tokens BIGINT NOT NULL DEFAULT 0,
+  tokens_saved BIGINT NOT NULL DEFAULT 0,
+  duration_ms BIGINT
+);
+CREATE INDEX IF NOT EXISTS idx_ceb_engine_ts ON compression_engine_breakdown(engine, timestamp);
+CREATE INDEX IF NOT EXISTS idx_ceb_request ON compression_engine_breakdown(request_id);
 
 CREATE TABLE IF NOT EXISTS compression_cache_stats (
   id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,

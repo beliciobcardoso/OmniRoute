@@ -360,7 +360,7 @@ function handleInternalEventRequest(req: IncomingMessage, res: ServerResponse): 
 async function seedLatestCompressionRunFromDb(): Promise<void> {
   try {
     const { getLatestCompressionAnalyticsRun } = await import("@/lib/db/compressionAnalytics");
-    const row = getLatestCompressionAnalyticsRun();
+    const row = await getLatestCompressionAnalyticsRun();
     if (!row) return;
 
     const originalTokens = Number(row.original_tokens) || 0;
