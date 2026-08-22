@@ -26,6 +26,40 @@ import {
   toStringOrNull,
   toNumberOrZero,
 } from "./providers/columns";
+import { sql } from "kysely";
+import { resolveDbDriverConfig } from "./driverConfig";
+import { ensurePostgresBootstrap, getKyselyDb } from "./kysely/client";
+import type { SqliteBoolean } from "./kysely/types";
+
+function isPostgres(): boolean {
+  return resolveDbDriverConfig().driver === "postgres";
+}
+
+// Postgres BIGINT columns come back from node-postgres as JS strings (to
+// avoid silent precision loss above 2^53). SQLite's better-sqlite3 driver
+// already returns these as native numbers, so this normalization is a no-op
+// there — safe to apply unconditionally after rowToCamel().
+const PROVIDER_CONNECTION_NUMERIC_FIELDS = [
+  "priority",
+  "backoffLevel",
+  "healthCheckInterval",
+  "expiresIn",
+  "globalPriority",
+  "consecutiveUseCount",
+  "maxConcurrent",
+] as const;
+
+function normalizeConnectionNumerics<T extends JsonRecord>(row: T): T {
+  for (const field of PROVIDER_CONNECTION_NUMERIC_FIELDS) {
+    const value = (row as JsonRecord)[field];
+    if (value !== null && value !== undefined) {
+      if (typeof value === "string" || typeof value === "bigint") {
+        (row as JsonRecord)[field] = Number(value);
+      }
+    }
+  }
+  return row;
+}
 
 type JsonRecord = Record<string, unknown>;
 
@@ -42,8 +76,35 @@ interface DbLike {
 // ──────────────── Provider Connections ────────────────
 
 export async function getProviderConnections(filter: JsonRecord = {}) {
+  if (isPostgres()) {
+    await ensurePostgresBootstrap();
+    const kdb = getKyselyDb();
+    let query = kdb.selectFrom("provider_connections").selectAll();
+    if (filter.provider) {
+      query = query.where("provider", "=", filter.provider as string);
+    }
+    if (filter.isActive !== undefined) {
+      query = query.where("is_active", "=", Boolean(filter.isActive) as unknown as SqliteBoolean);
+    }
+    if (filter.authType) {
+      query = query.where("auth_type", "=", filter.authType as string);
+    }
+    const rows = await query.orderBy("priority", "asc").orderBy("updated_at", "desc").execute();
+    return rows.map((r) => {
+      const camelRow = normalizeConnectionNumerics(rowToCamel(r) as JsonRecord);
+      return decryptConnectionFields(
+        withNullableRateLimitOverrides(
+          withNullableQuotaWindowThresholds(
+            withNullableMaxConcurrent(cleanNulls(camelRow), camelRow),
+            camelRow
+          ),
+          camelRow
+        )
+      );
+    });
+  }
   const db = getDbInstance() as unknown as DbLike;
-  let sql = "SELECT * FROM provider_connections";
+  let sqlText = "SELECT * FROM provider_connections";
   const conditions: string[] = [];
   const params: Record<string, unknown> = {};
 
@@ -61,11 +122,11 @@ export async function getProviderConnections(filter: JsonRecord = {}) {
   }
 
   if (conditions.length > 0) {
-    sql += " WHERE " + conditions.join(" AND ");
+    sqlText += " WHERE " + conditions.join(" AND ");
   }
-  sql += " ORDER BY priority ASC, updated_at DESC";
+  sqlText += " ORDER BY priority ASC, updated_at DESC";
 
-  const rows = db.prepare(sql).all(params);
+  const rows = db.prepare(sqlText).all(params);
   return rows.map((r) => {
     const camelRow = rowToCamel(r);
     return decryptConnectionFields(
@@ -81,11 +142,22 @@ export async function getProviderConnections(filter: JsonRecord = {}) {
 }
 
 export async function getProviderConnectionById(id: string) {
-  const db = getDbInstance() as unknown as DbLike;
-  const row = db.prepare("SELECT * FROM provider_connections WHERE id = ?").get(id);
+  let row: unknown;
+  if (isPostgres()) {
+    await ensurePostgresBootstrap();
+    const kdb = getKyselyDb();
+    row = await kdb
+      .selectFrom("provider_connections")
+      .selectAll()
+      .where("id", "=", id)
+      .executeTakeFirst();
+  } else {
+    const db = getDbInstance() as unknown as DbLike;
+    row = db.prepare("SELECT * FROM provider_connections WHERE id = ?").get(id);
+  }
   if (!row) return null;
 
-  const camelRow = rowToCamel(row);
+  const camelRow = normalizeConnectionNumerics(rowToCamel(row) as JsonRecord);
   return decryptConnectionFields(
     withNullableRateLimitOverrides(
       withNullableQuotaWindowThresholds(
@@ -133,7 +205,41 @@ function findExistingCookieConnection(
   return null;
 }
 
+async function findExistingCookieConnectionPg(
+  kdb: ReturnType<typeof getKyselyDb>,
+  provider: unknown,
+  name: unknown,
+  normalizedProviderSpecificData: unknown
+): Promise<JsonRecord | null> {
+  if (name) {
+    const byName = await kdb
+      .selectFrom("provider_connections")
+      .selectAll()
+      .where("provider", "=", provider as string)
+      .where("auth_type", "=", "cookie")
+      .where("name", "=", name as string)
+      .executeTakeFirst();
+    if (byName) return byName as JsonRecord;
+  }
+  const newCredKey = webSessionCredentialKey(normalizedProviderSpecificData);
+  if (!newCredKey) return null;
+  const cookieRows = await kdb
+    .selectFrom("provider_connections")
+    .selectAll()
+    .where("provider", "=", provider as string)
+    .where("auth_type", "=", "cookie")
+    .execute();
+  for (const row of cookieRows) {
+    const psd = parseProviderSpecificData((row as JsonRecord).provider_specific_data);
+    if (psd && webSessionCredentialKey(psd) === newCredKey) return row as JsonRecord;
+  }
+  return null;
+}
+
 export async function createProviderConnection(data: JsonRecord) {
+  if (isPostgres()) {
+    return createProviderConnectionPg(data);
+  }
   const db = getDbInstance() as unknown as DbLike;
   const now = new Date().toISOString();
   const normalizedProviderSpecificData = normalizeProviderSpecificData(
@@ -393,6 +499,237 @@ export async function createProviderConnection(data: JsonRecord) {
   );
 }
 
+async function createProviderConnectionPg(data: JsonRecord) {
+  await ensurePostgresBootstrap();
+  const kdb = getKyselyDb();
+  const now = new Date().toISOString();
+  const normalizedProviderSpecificData = normalizeProviderSpecificData(
+    toStringOrNull(data.provider),
+    data.providerSpecificData
+  );
+
+  let existing: JsonRecord | null = null;
+
+  if (data.authType === "oauth" && data.email) {
+    const providerSpecificData = toRecord(data.providerSpecificData);
+    const workspaceId = toStringOrNull(providerSpecificData.workspaceId);
+    if (data.provider === "codex" && workspaceId) {
+      existing =
+        ((await kdb
+          .selectFrom("provider_connections")
+          .selectAll()
+          .where("provider", "=", data.provider as string)
+          .where("auth_type", "=", "oauth")
+          .where(sql<string>`(provider_specific_data::jsonb ->> 'workspaceId')`, "=", workspaceId)
+          .where("email", "=", data.email as string)
+          .executeTakeFirst()) as JsonRecord | undefined) || null;
+
+      if (!existing) {
+        existing =
+          ((await kdb
+            .selectFrom("provider_connections")
+            .selectAll()
+            .where("provider", "=", data.provider as string)
+            .where("auth_type", "=", "oauth")
+            .where(sql<string>`(provider_specific_data::jsonb ->> 'workspaceId')`, "=", workspaceId)
+            .where((eb) => eb.or([eb("email", "is", null), eb("email", "=", "")]))
+            .executeTakeFirst()) as JsonRecord | undefined) || null;
+      }
+    } else if (data.provider === "codex") {
+      const chatgptUserId = toStringOrNull(providerSpecificData.chatgptUserId);
+      if (chatgptUserId) {
+        existing =
+          ((await kdb
+            .selectFrom("provider_connections")
+            .selectAll()
+            .where("provider", "=", data.provider as string)
+            .where("auth_type", "=", "oauth")
+            .where(
+              sql<string>`(provider_specific_data::jsonb ->> 'chatgptUserId')`,
+              "=",
+              chatgptUserId
+            )
+            .where("email", "=", data.email as string)
+            .executeTakeFirst()) as JsonRecord | undefined) || null;
+      }
+    } else {
+      const incomingUsername = toStringOrNull(providerSpecificData.username);
+      const emailMatches = (await kdb
+        .selectFrom("provider_connections")
+        .selectAll()
+        .where("provider", "=", data.provider as string)
+        .where("auth_type", "=", "oauth")
+        .where("email", "=", data.email as string)
+        .execute()) as JsonRecord[];
+      existing =
+        emailMatches.find((row) => {
+          const existingUsername = toStringOrNull(
+            parseProviderSpecificData(row.provider_specific_data)?.username
+          );
+          if (incomingUsername && existingUsername) {
+            return incomingUsername === existingUsername;
+          }
+          if (incomingUsername || existingUsername) return false;
+          return true;
+        }) || null;
+    }
+  } else if (data.authType === "apikey") {
+    if (data.name) {
+      existing =
+        ((await kdb
+          .selectFrom("provider_connections")
+          .selectAll()
+          .where("provider", "=", data.provider as string)
+          .where("auth_type", "=", "apikey")
+          .where("name", "=", data.name as string)
+          .executeTakeFirst()) as JsonRecord | undefined) || null;
+    }
+    const newApiKey = typeof data.apiKey === "string" ? data.apiKey.trim() : "";
+    if (!existing && newApiKey) {
+      const apiKeyRows = (await kdb
+        .selectFrom("provider_connections")
+        .selectAll()
+        .where("provider", "=", data.provider as string)
+        .where("auth_type", "=", "apikey")
+        .execute()) as JsonRecord[];
+      for (const row of apiKeyRows) {
+        const decrypted = decryptConnectionFields(toRecord(rowToCamel(row)));
+        if (toStringOrNull(decrypted.apiKey)?.trim() === newApiKey) {
+          existing = row;
+          break;
+        }
+      }
+    }
+  } else if (data.authType === "cookie") {
+    existing = await findExistingCookieConnectionPg(
+      kdb,
+      data.provider,
+      data.name,
+      normalizedProviderSpecificData
+    );
+  }
+  // access_token: intentionally never deduped — mirrors the SQLite path.
+
+  if (existing) {
+    const existingId = toStringOrNull(existing.id);
+    if (!existingId) return null;
+    const merged: JsonRecord = {
+      ...normalizeConnectionNumerics(toRecord(rowToCamel(existing))),
+      ...data,
+      updatedAt: now,
+    };
+    merged.providerSpecificData = normalizeProviderSpecificData(
+      toStringOrNull(merged.provider),
+      merged.providerSpecificData
+    );
+    await _updateConnectionRowPg(kdb, existingId, merged);
+    return withNullableRateLimitOverrides(
+      withNullableQuotaWindowThresholds(
+        withNullableMaxConcurrent(cleanNulls(merged), merged),
+        merged
+      ),
+      merged
+    );
+  }
+
+  let connectionName = data.name || null;
+  if (!connectionName && (data.authType === "oauth" || data.authType === "access_token")) {
+    if (data.email) {
+      connectionName = data.email as string;
+    } else if (data.displayName) {
+      connectionName = data.displayName as string;
+    }
+  }
+
+  let connectionPriority = data.priority;
+  if (!connectionPriority) {
+    const max = await kdb
+      .selectFrom("provider_connections")
+      .select((eb) => eb.fn.max("priority").as("maxP"))
+      .where("provider", "=", data.provider as string)
+      .executeTakeFirst();
+    const maxPriority = toNumberOrZero(toRecord(max).maxP);
+    connectionPriority = maxPriority + 1;
+  }
+
+  const connection: Record<string, unknown> = {
+    id: uuidv4(),
+    provider: data.provider,
+    authType: data.authType || "oauth",
+    name: connectionName,
+    priority: connectionPriority,
+    isActive: data.isActive !== undefined ? data.isActive : true,
+    createdAt: now,
+    updatedAt: now,
+    proxyEnabled: normalizeBooleanColumn(data.proxyEnabled, true),
+    perKeyProxyEnabled: normalizeBooleanColumn(data.perKeyProxyEnabled, false),
+  };
+
+  const optionalFields = [
+    "displayName",
+    "email",
+    "globalPriority",
+    "defaultModel",
+    "accessToken",
+    "refreshToken",
+    "expiresAt",
+    "tokenType",
+    "scope",
+    "idToken",
+    "projectId",
+    "apiKey",
+    "testStatus",
+    "lastTested",
+    "lastError",
+    "lastErrorAt",
+    "lastErrorType",
+    "lastErrorSource",
+    "rateLimitedUntil",
+    "expiresIn",
+    "errorCode",
+    "consecutiveUseCount",
+    "rateLimitProtection",
+    "group",
+    "maxConcurrent",
+    "proxyEnabled",
+    "perKeyProxyEnabled",
+    "quotaWindowThresholds",
+    "rateLimitOverrides",
+    "healthCheckInterval",
+  ];
+  for (const field of optionalFields) {
+    if (data[field] !== undefined && data[field] !== null) {
+      connection[field] = data[field];
+    }
+  }
+  if (normalizedProviderSpecificData && Object.keys(normalizedProviderSpecificData).length > 0) {
+    connection.providerSpecificData = normalizedProviderSpecificData;
+  }
+  if ("quotaWindowThresholds" in connection) {
+    connection.quotaWindowThresholds = sanitizeQuotaWindowThresholds(
+      connection.quotaWindowThresholds
+    );
+  }
+  if ("rateLimitOverrides" in connection) {
+    connection.rateLimitOverrides = sanitizeRateLimitOverrides(connection.rateLimitOverrides);
+  }
+
+  await _insertConnectionRowPg(kdb, encryptConnectionFields({ ...connection }));
+  const providerId = toStringOrNull(data.provider);
+  if (providerId) {
+    await _reorderConnectionsPg(kdb, providerId);
+  }
+  invalidateDbCache("connections");
+
+  return withNullableRateLimitOverrides(
+    withNullableQuotaWindowThresholds(
+      withNullableMaxConcurrent(cleanNulls(connection), connection),
+      connection
+    ),
+    connection
+  );
+}
+
 function _insertConnectionRow(db: DbLike, conn: JsonRecord) {
   db.prepare(
     `
@@ -468,6 +805,124 @@ function _insertConnectionRow(db: DbLike, conn: JsonRecord) {
     createdAt: conn.createdAt,
     updatedAt: conn.updatedAt,
   });
+}
+
+async function _insertConnectionRowPg(kdb: ReturnType<typeof getKyselyDb>, conn: JsonRecord) {
+  await kdb
+    .insertInto("provider_connections")
+    .values({
+      id: conn.id as string,
+      provider: conn.provider as string,
+      auth_type: (conn.authType as string) || null,
+      name: (conn.name as string) || null,
+      email: (conn.email as string) || null,
+      priority: (conn.priority as number) || 0,
+      is_active: (conn.isActive !== false) as unknown as SqliteBoolean,
+      access_token: (conn.accessToken as string) || null,
+      refresh_token: (conn.refreshToken as string) || null,
+      expires_at: (conn.expiresAt as string) || null,
+      token_expires_at: (conn.tokenExpiresAt as string) || null,
+      scope: (conn.scope as string) || null,
+      project_id: (conn.projectId as string) || null,
+      test_status: (conn.testStatus as string) || null,
+      error_code: (conn.errorCode as string) || null,
+      last_error: (conn.lastError as string) || null,
+      last_error_at: (conn.lastErrorAt as string) || null,
+      last_error_type: (conn.lastErrorType as string) || null,
+      last_error_source: (conn.lastErrorSource as string) || null,
+      backoff_level: (conn.backoffLevel as number) || 0,
+      rate_limited_until: (conn.rateLimitedUntil as string) || null,
+      health_check_interval: (conn.healthCheckInterval as number) ?? null,
+      last_health_check_at: (conn.lastHealthCheckAt as string) || null,
+      last_tested: (conn.lastTested as string) || null,
+      api_key: (conn.apiKey as string) || null,
+      id_token: (conn.idToken as string) || null,
+      provider_specific_data: conn.providerSpecificData
+        ? JSON.stringify(conn.providerSpecificData)
+        : null,
+      expires_in: (conn.expiresIn as number) || null,
+      display_name: (conn.displayName as string) || null,
+      global_priority: (conn.globalPriority as number) || null,
+      default_model: (conn.defaultModel as string) || null,
+      token_type: (conn.tokenType as string) || null,
+      consecutive_use_count: (conn.consecutiveUseCount as number) || 0,
+      rate_limit_protection: (conn.rateLimitProtection === true ||
+        conn.rateLimitProtection === 1) as unknown as SqliteBoolean,
+      last_used_at: (conn.lastUsedAt as string) || null,
+      group: (conn.group as string) || null,
+      max_concurrent: (conn.maxConcurrent as number) ?? null,
+      proxy_enabled: normalizeBooleanColumn(conn.proxyEnabled, true) as unknown as SqliteBoolean,
+      per_key_proxy_enabled: normalizeBooleanColumn(
+        conn.perKeyProxyEnabled,
+        false
+      ) as unknown as SqliteBoolean,
+      quota_window_thresholds_json: serializeJsonField(conn.quotaWindowThresholds),
+      rate_limit_overrides_json: serializeJsonField(conn.rateLimitOverrides),
+      created_at: conn.createdAt as string,
+      updated_at: conn.updatedAt as string,
+    })
+    .execute();
+}
+
+async function _updateConnectionRowPg(
+  kdb: ReturnType<typeof getKyselyDb>,
+  id: string,
+  data: JsonRecord
+) {
+  const now = (data.updatedAt as string) || new Date().toISOString();
+  await kdb
+    .updateTable("provider_connections")
+    .set({
+      provider: data.provider as string,
+      auth_type: (data.authType as string) || null,
+      name: (data.name as string) || null,
+      email: (data.email as string) || null,
+      priority: (data.priority as number) || 0,
+      is_active: (data.isActive !== false) as unknown as SqliteBoolean,
+      access_token: (data.accessToken as string) || null,
+      refresh_token: (data.refreshToken as string) || null,
+      expires_at: (data.expiresAt as string) || null,
+      token_expires_at: (data.tokenExpiresAt as string) || null,
+      scope: (data.scope as string) || null,
+      project_id: (data.projectId as string) || null,
+      test_status: (data.testStatus as string) || null,
+      error_code: (data.errorCode as string) || null,
+      last_error: (data.lastError as string) || null,
+      last_error_at: (data.lastErrorAt as string) || null,
+      last_error_type: (data.lastErrorType as string) || null,
+      last_error_source: (data.lastErrorSource as string) || null,
+      backoff_level: (data.backoffLevel as number) || 0,
+      rate_limited_until: (data.rateLimitedUntil as string) || null,
+      health_check_interval: (data.healthCheckInterval as number) ?? null,
+      last_health_check_at: (data.lastHealthCheckAt as string) || null,
+      last_tested: (data.lastTested as string) || null,
+      api_key: (data.apiKey as string) || null,
+      id_token: (data.idToken as string) || null,
+      provider_specific_data: data.providerSpecificData
+        ? JSON.stringify(data.providerSpecificData)
+        : null,
+      expires_in: (data.expiresIn as number) || null,
+      display_name: (data.displayName as string) || null,
+      global_priority: (data.globalPriority as number) || null,
+      default_model: (data.defaultModel as string) || null,
+      token_type: (data.tokenType as string) || null,
+      consecutive_use_count: (data.consecutiveUseCount as number) || 0,
+      rate_limit_protection: (data.rateLimitProtection === true ||
+        data.rateLimitProtection === 1) as unknown as SqliteBoolean,
+      last_used_at: (data.lastUsedAt as string) || null,
+      group: (data.group as string) || null,
+      max_concurrent: (data.maxConcurrent as number) ?? null,
+      quota_window_thresholds_json: serializeJsonField(data.quotaWindowThresholds),
+      proxy_enabled: normalizeBooleanColumn(data.proxyEnabled, true) as unknown as SqliteBoolean,
+      per_key_proxy_enabled: normalizeBooleanColumn(
+        data.perKeyProxyEnabled,
+        false
+      ) as unknown as SqliteBoolean,
+      rate_limit_overrides_json: serializeJsonField(data.rateLimitOverrides),
+      updated_at: now,
+    })
+    .where("id", "=", id)
+    .execute();
 }
 
 function _updateConnectionRow(db: DbLike, id: string, data: JsonRecord) {
@@ -548,6 +1003,52 @@ function _updateConnectionRow(db: DbLike, id: string, data: JsonRecord) {
 }
 
 export async function updateProviderConnection(id: string, data: JsonRecord) {
+  if (isPostgres()) {
+    await ensurePostgresBootstrap();
+    const kdb = getKyselyDb();
+    const existing = await kdb
+      .selectFrom("provider_connections")
+      .selectAll()
+      .where("id", "=", id)
+      .executeTakeFirst();
+    if (!existing) return null;
+
+    const merged: JsonRecord = {
+      ...normalizeConnectionNumerics(toRecord(rowToCamel(existing))),
+      ...data,
+      updatedAt: new Date().toISOString(),
+    };
+    merged.providerSpecificData = normalizeProviderSpecificData(
+      toStringOrNull(merged.provider),
+      merged.providerSpecificData
+    );
+    if ("quotaWindowThresholds" in merged) {
+      merged.quotaWindowThresholds = sanitizeQuotaWindowThresholds(merged.quotaWindowThresholds);
+    }
+    if ("rateLimitOverrides" in merged) {
+      merged.rateLimitOverrides = sanitizeRateLimitOverrides(merged.rateLimitOverrides);
+    }
+    await _updateConnectionRowPg(kdb, id, encryptConnectionFields({ ...merged }));
+    invalidateDbCache("connections");
+    bumpProxyConfigGeneration();
+
+    if (data.priority !== undefined) {
+      const existingRecord = toRecord(existing);
+      const providerId =
+        typeof existingRecord.provider === "string"
+          ? existingRecord.provider
+          : String(existingRecord.provider || "");
+      await _reorderConnectionsPg(kdb, providerId);
+    }
+
+    return withNullableRateLimitOverrides(
+      withNullableQuotaWindowThresholds(
+        withNullableMaxConcurrent(cleanNulls(merged), merged),
+        merged
+      ),
+      merged
+    );
+  }
   const db = getDbInstance() as unknown as DbLike;
   const existing = db.prepare("SELECT * FROM provider_connections WHERE id = ?").get(id);
   if (!existing) return null;
@@ -616,9 +1117,38 @@ export async function clearConnectionErrorIfUnchanged(
     rateLimitedUntil: string | null | undefined;
   }
 ): Promise<boolean> {
+  if (isPostgres()) {
+    await ensurePostgresBootstrap();
+    const kdb = getKyselyDb();
+    const result = await kdb
+      .updateTable("provider_connections")
+      .set({
+        test_status: "active",
+        last_error: null,
+        last_error_at: null,
+        last_error_type: null,
+        last_error_source: null,
+        error_code: null,
+        rate_limited_until: null,
+        backoff_level: 0,
+        updated_at: new Date().toISOString(),
+      })
+      .where("id", "=", id)
+      .where(sql<string>`coalesce(test_status, '')`, "=", expected.testStatus ?? "")
+      .where(sql<string>`coalesce(last_error_at, '')`, "=", expected.lastErrorAt ?? "")
+      .where(sql<string>`coalesce(rate_limited_until, '')`, "=", expected.rateLimitedUntil ?? "")
+      .executeTakeFirst();
+    const applied = Number(result.numUpdatedRows ?? 0) > 0;
+    if (applied) {
+      invalidateDbCache("connections");
+      bumpProxyConfigGeneration();
+    }
+    return applied;
+  }
   const db = getDbInstance() as unknown as DbLike;
-  const result = db.prepare(
-    `
+  const result = db
+    .prepare(
+      `
     UPDATE provider_connections SET
       test_status = 'active',
       last_error = NULL,
@@ -634,13 +1164,14 @@ export async function clearConnectionErrorIfUnchanged(
       AND IFNULL(last_error_at, '') = ?
       AND IFNULL(rate_limited_until, '') = ?
     `
-  ).run(
-    new Date().toISOString(),
-    id,
-    expected.testStatus ?? "",
-    expected.lastErrorAt ?? "",
-    expected.rateLimitedUntil ?? ""
-  );
+    )
+    .run(
+      new Date().toISOString(),
+      id,
+      expected.testStatus ?? "",
+      expected.lastErrorAt ?? "",
+      expected.rateLimitedUntil ?? ""
+    );
   const applied = (result.changes ?? 0) > 0;
   if (applied) {
     backupDbFile("pre-write");
@@ -651,6 +1182,23 @@ export async function clearConnectionErrorIfUnchanged(
 }
 
 export async function deleteProviderConnection(id: string) {
+  if (isPostgres()) {
+    await ensurePostgresBootstrap();
+    const kdb = getKyselyDb();
+    const existing = await kdb
+      .selectFrom("provider_connections")
+      .select("provider")
+      .where("id", "=", id)
+      .executeTakeFirst();
+    if (!existing) return false;
+
+    await kdb.deleteFrom("quota_snapshots").where("connection_id", "=", id).execute();
+    await kdb.deleteFrom("provider_connections").where("id", "=", id).execute();
+    bumpProxyConfigGeneration();
+    await _reorderConnectionsPg(kdb, existing.provider as string);
+    invalidateDbCache("connections");
+    return true;
+  }
   const db = getDbInstance() as unknown as DbLike;
   const existing = db.prepare("SELECT provider FROM provider_connections WHERE id = ?").get(id);
   if (!existing) return false;
@@ -671,6 +1219,20 @@ export async function deleteProviderConnection(id: string) {
 
 export async function deleteProviderConnections(ids: string[]): Promise<number> {
   if (ids.length === 0) return 0;
+  if (isPostgres()) {
+    await ensurePostgresBootstrap();
+    const kdb = getKyselyDb();
+    const deletedCount = await kdb.transaction().execute(async (trx) => {
+      await trx.deleteFrom("quota_snapshots").where("connection_id", "in", ids).execute();
+      const result = await trx
+        .deleteFrom("provider_connections")
+        .where("id", "in", ids)
+        .executeTakeFirst();
+      return Number(result.numDeletedRows ?? 0);
+    });
+    invalidateDbCache("connections");
+    return deletedCount;
+  }
   const db = getDbInstance();
 
   const deletedCount = db.transaction(() => {
@@ -688,6 +1250,24 @@ export async function deleteProviderConnections(ids: string[]): Promise<number> 
 }
 
 export async function deleteProviderConnectionsByProvider(providerId: string) {
+  if (isPostgres()) {
+    await ensurePostgresBootstrap();
+    const kdb = getKyselyDb();
+    const connectionRows = await kdb
+      .selectFrom("provider_connections")
+      .select("id")
+      .where("provider", "=", providerId)
+      .execute();
+    const connectionIds = connectionRows.map((r) => r.id).filter((id): id is string => !!id);
+    if (connectionIds.length > 0) {
+      await kdb.deleteFrom("quota_snapshots").where("connection_id", "in", connectionIds).execute();
+    }
+    const result = await kdb
+      .deleteFrom("provider_connections")
+      .where("provider", "=", providerId)
+      .executeTakeFirst();
+    return Number(result.numDeletedRows ?? 0);
+  }
   const db = getDbInstance() as unknown as DbLike;
   const connectionIds = db
     .prepare("SELECT id FROM provider_connections WHERE provider = ?")
@@ -711,6 +1291,11 @@ export async function deleteProviderConnectionsByProvider(providerId: string) {
 }
 
 export async function reorderProviderConnections(providerId: string) {
+  if (isPostgres()) {
+    await ensurePostgresBootstrap();
+    await _reorderConnectionsPg(getKyselyDb(), providerId);
+    return;
+  }
   const db = getDbInstance() as unknown as DbLike;
   _reorderConnections(db, providerId);
 }
@@ -729,11 +1314,40 @@ function _reorderConnections(db: DbLike, providerId: string) {
   });
 }
 
+async function _reorderConnectionsPg(kdb: ReturnType<typeof getKyselyDb>, providerId: string) {
+  const rows = await kdb
+    .selectFrom("provider_connections")
+    .select(["id"])
+    .where("provider", "=", providerId)
+    .orderBy("priority", "asc")
+    .orderBy("updated_at", "desc")
+    .execute();
+  for (let index = 0; index < rows.length; index++) {
+    await kdb
+      .updateTable("provider_connections")
+      .set({ priority: index + 1 })
+      .where("id", "=", rows[index].id as string)
+      .execute();
+  }
+}
+
 export async function cleanupProviderConnections() {
   return 0;
 }
 
 export async function getDistinctGroups(): Promise<string[]> {
+  if (isPostgres()) {
+    await ensurePostgresBootstrap();
+    const kdb = getKyselyDb();
+    const rows = await kdb
+      .selectFrom("provider_connections")
+      .select("group")
+      .where("group", "is not", null)
+      .distinct()
+      .orderBy("group", "asc")
+      .execute();
+    return rows.map((r) => String(r.group ?? "")).filter(Boolean);
+  }
   const db = getDbInstance() as unknown as DbLike;
   const rows = db
     .prepare(
