@@ -6,7 +6,17 @@
 import { randomUUID, randomInt } from "crypto";
 import { getDbInstance } from "./core";
 import { backupDbFile } from "./backup";
-import { pickByLatency } from "./proxyLatency";
+import { pickByLatency, pickByLatencyAsync } from "./proxyLatency";
+import { sql, type Kysely, type Transaction } from "kysely";
+import type { Database } from "./kysely/types";
+import { resolveDbDriverConfig } from "./driverConfig";
+import { ensurePostgresBootstrap, getKyselyDb } from "./kysely/client";
+
+type KyselyOrTrx = Kysely<Database> | Transaction<Database>;
+
+function isPostgres(): boolean {
+  return resolveDbDriverConfig().driver === "postgres";
+}
 import type {
   JsonRecord,
   ProxyScope,
@@ -104,6 +114,80 @@ function clearLegacyProxyForAssignment(
   if (!shouldWrite) return "absent";
 
   writeProxyConfig.run(mapKey, JSON.stringify(map));
+  return "cleared";
+}
+
+async function clearLegacyProxyForAssignmentPg(
+  trx: KyselyOrTrx,
+  assignment: ProxyAssignmentPayload
+): Promise<LegacyProxyClearStatus> {
+  const normalizedScope = normalizeScope(assignment.scope);
+  const scopeId = normalizeAssignmentScopeId(normalizedScope, assignment.scopeId);
+  const level = toLegacyProxyLevel(normalizedScope);
+
+  const writeProxyConfig = async (key: string, value: string) => {
+    await trx
+      .insertInto("key_value")
+      .values({ namespace: "proxyConfig", key, value })
+      .onConflict((oc) =>
+        oc.columns(["namespace", "key"]).doUpdateSet({ value: (eb) => eb.ref("excluded.value") })
+      )
+      .execute();
+  };
+
+  if (level === "global") {
+    const row = await trx
+      .selectFrom("key_value")
+      .select("value")
+      .where("namespace", "=", "proxyConfig")
+      .where("key", "=", "global")
+      .executeTakeFirst();
+    if (!row) return "absent";
+
+    try {
+      if (typeof row.value === "string" && JSON.parse(row.value) === null) return "absent";
+    } catch {
+      // Malformed global proxy config still needs to be overwritten with null.
+    }
+
+    await writeProxyConfig("global", JSON.stringify(null));
+    return "cleared";
+  }
+
+  if (!scopeId) return "absent";
+
+  const mapKey = `${level}s`;
+  const row = await trx
+    .selectFrom("key_value")
+    .select("value")
+    .where("namespace", "=", "proxyConfig")
+    .where("key", "=", mapKey)
+    .executeTakeFirst();
+  if (!row) return "absent";
+
+  let map: JsonRecord = {};
+  let shouldWrite = false;
+  if (typeof row.value === "string") {
+    try {
+      const parsed = JSON.parse(row.value);
+      if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+        map = parsed as JsonRecord;
+      } else {
+        shouldWrite = true;
+      }
+    } catch {
+      shouldWrite = true;
+    }
+  }
+
+  if (Object.prototype.hasOwnProperty.call(map, scopeId)) {
+    delete map[scopeId];
+    shouldWrite = true;
+  }
+
+  if (!shouldWrite) return "absent";
+
+  await writeProxyConfig(mapKey, JSON.stringify(map));
   return "cleared";
 }
 
@@ -232,20 +316,172 @@ function getAssignmentRow(
   return row ? mapAssignmentRow(row) : null;
 }
 
+// NULL-safe equality on scope_id: SQLite's `IS ?` accepts a NULL-bound param
+// directly; Postgres only accepts the bare `IS NULL` keyword, so branch here
+// instead of trying to bind NULL through a typed "=" operator.
+function scopeIdEq(eb: any, scopeIdFilter: string | null) {
+  return scopeIdFilter === null ? eb("scope_id", "is", null) : eb("scope_id", "=", scopeIdFilter);
+}
+
+async function insertProxyRowPg(kdb: KyselyOrTrx, id: string, payload: ProxyPayload, now: string) {
+  await kdb
+    .insertInto("proxy_registry")
+    .values({
+      id,
+      name: payload.name,
+      type: payload.type,
+      host: payload.host,
+      port: Number(payload.port),
+      username: payload.username || "",
+      password: payload.password || "",
+      region: payload.region || null,
+      notes: payload.notes || null,
+      status: payload.status || "active",
+      source: payload.source || "manual",
+      family: payload.family || "auto",
+      created_at: now,
+      updated_at: now,
+    })
+    .execute();
+}
+
+async function updateProxyRowPg(
+  kdb: KyselyOrTrx,
+  id: string,
+  existing: ProxyRegistryRecord,
+  payload: Partial<ProxyPayload>,
+  now: string
+) {
+  const incomingUsername =
+    typeof payload.username === "string" ? payload.username.trim() : undefined;
+  const incomingPassword =
+    typeof payload.password === "string" ? payload.password.trim() : undefined;
+
+  const merged = {
+    ...existing,
+    ...payload,
+    username: incomingUsername === undefined ? existing.username : incomingUsername,
+    password: incomingPassword === undefined ? existing.password : incomingPassword,
+    updatedAt: now,
+  };
+
+  await kdb
+    .updateTable("proxy_registry")
+    .set({
+      name: merged.name,
+      type: merged.type,
+      host: merged.host,
+      port: Number(merged.port),
+      username: merged.username || "",
+      password: merged.password || "",
+      region: merged.region || null,
+      notes: merged.notes || null,
+      status: merged.status || "active",
+      source: merged.source || "manual",
+      family: merged.family || "auto",
+      updated_at: merged.updatedAt,
+    })
+    .where("id", "=", id)
+    .execute();
+}
+
+async function replaceScopeWithSingleProxyPg(
+  kdb: KyselyOrTrx,
+  normalizedScope: string,
+  normalizedScopeId: string | null,
+  proxyId: string,
+  now: string
+) {
+  await kdb
+    .deleteFrom("proxy_assignments")
+    .where("scope", "=", normalizedScope)
+    .where((eb) => scopeIdEq(eb, normalizedScopeId))
+    .execute();
+  await kdb
+    .insertInto("proxy_assignments")
+    .values({
+      proxy_id: proxyId,
+      scope: normalizedScope,
+      scope_id: normalizedScopeId,
+      position: 0,
+      created_at: now,
+      updated_at: now,
+    })
+    .execute();
+}
+
+async function upsertAssignmentRowPg(
+  kdb: KyselyOrTrx,
+  assignment: ProxyAssignmentPayload,
+  proxyId: string,
+  now: string
+) {
+  const normalizedScope = normalizeScope(assignment.scope);
+  const normalizedScopeId = normalizeAssignmentScopeId(normalizedScope, assignment.scopeId);
+  if (normalizedScope !== "global" && !normalizedScopeId) {
+    throw new Error("scopeId is required for non-global proxy assignments");
+  }
+  await replaceScopeWithSingleProxyPg(kdb, normalizedScope, normalizedScopeId, proxyId, now);
+}
+
+async function getAssignmentRowPg(kdb: KyselyOrTrx, scope: string, scopeId?: string | null) {
+  const normalizedScope = normalizeScope(scope);
+  const normalizedScopeId = normalizeAssignmentScopeId(normalizedScope, scopeId);
+  const row = await kdb
+    .selectFrom("proxy_assignments")
+    .select(["id", "proxy_id", "scope", "scope_id", "position", "created_at", "updated_at"])
+    .where("scope", "=", normalizedScope)
+    .where((eb) => scopeIdEq(eb, normalizedScopeId))
+    .executeTakeFirst();
+  return row ? mapAssignmentRow(row) : null;
+}
+
 export async function listProxies(options?: { includeSecrets?: boolean }) {
   const includeSecrets = options?.includeSecrets === true;
-  const db = getDbInstance();
-  const rows = db
-    .prepare(
-      "SELECT id, name, type, host, port, username, password, region, notes, status, source, family, created_at, updated_at FROM proxy_registry ORDER BY datetime(updated_at) DESC, name ASC"
-    )
-    .all();
+
+  let rows: unknown[];
+  if (isPostgres()) {
+    await ensurePostgresBootstrap();
+    const kdb = getKyselyDb();
+    rows = await kdb
+      .selectFrom("proxy_registry")
+      .select([
+        "id",
+        "name",
+        "type",
+        "host",
+        "port",
+        "username",
+        "password",
+        "region",
+        "notes",
+        "status",
+        "source",
+        "family",
+        "created_at",
+        "updated_at",
+      ])
+      .orderBy("updated_at", "desc")
+      .orderBy("name", "asc")
+      .execute();
+  } else {
+    const db = getDbInstance();
+    rows = db
+      .prepare(
+        "SELECT id, name, type, host, port, username, password, region, notes, status, source, family, created_at, updated_at FROM proxy_registry ORDER BY datetime(updated_at) DESC, name ASC"
+      )
+      .all();
+  }
 
   const proxies = rows.map(mapProxyRow);
   return includeSecrets ? proxies : proxies.map(redactProxySecrets);
 }
 
 export async function getProxyById(id: string, options?: { includeSecrets?: boolean }) {
+  if (isPostgres()) {
+    await ensurePostgresBootstrap();
+    return getProxyRowByIdPg(getKyselyDb(), id, options);
+  }
   const db = getDbInstance();
   return getProxyRowById(db, id, options);
 }
@@ -266,6 +502,37 @@ function getProxyRowById(
   return includeSecrets ? proxy : redactProxySecrets(proxy);
 }
 
+async function getProxyRowByIdPg(
+  kdb: KyselyOrTrx,
+  id: string,
+  options?: { includeSecrets?: boolean }
+) {
+  const includeSecrets = options?.includeSecrets === true;
+  const row = await kdb
+    .selectFrom("proxy_registry")
+    .select([
+      "id",
+      "name",
+      "type",
+      "host",
+      "port",
+      "username",
+      "password",
+      "region",
+      "notes",
+      "status",
+      "source",
+      "family",
+      "created_at",
+      "updated_at",
+    ])
+    .where("id", "=", id)
+    .executeTakeFirst();
+  if (!row) return null;
+  const proxy = mapProxyRow(row);
+  return includeSecrets ? proxy : redactProxySecrets(proxy);
+}
+
 function getProxyRowByIdOrThrow(
   db: ReturnType<typeof getDbInstance>,
   id: string,
@@ -278,11 +545,30 @@ function getProxyRowByIdOrThrow(
   return proxy;
 }
 
+async function getProxyRowByIdOrThrowPg(
+  kdb: KyselyOrTrx,
+  id: string,
+  options?: { includeSecrets?: boolean }
+) {
+  const proxy = await getProxyRowByIdPg(kdb, id, options);
+  if (!proxy) {
+    throw new Error(`Failed to read proxy after mutation: ${id}`);
+  }
+  return proxy;
+}
+
 export async function createProxy(payload: ProxyPayload) {
-  const db = getDbInstance();
   const id = randomUUID();
   const now = new Date().toISOString();
 
+  if (isPostgres()) {
+    await ensurePostgresBootstrap();
+    await insertProxyRowPg(getKyselyDb(), id, payload, now);
+    bumpProxyRegistryGeneration();
+    return getProxyById(id, { includeSecrets: false });
+  }
+
+  const db = getDbInstance();
   insertProxyRow(db, id, payload, now);
 
   backupDbFile("pre-write");
@@ -299,13 +585,24 @@ export async function upsertProxy(payload: ProxyPayload): Promise<{
   proxy: ProxyRegistryRecord | null;
   action: "created" | "updated";
 }> {
-  const db = getDbInstance();
   const host = (payload.host || "").trim();
   const port = Number(payload.port);
 
-  const existing = db
-    .prepare("SELECT id FROM proxy_registry WHERE host = ? AND port = ? LIMIT 1")
-    .get(host, port) as { id?: string } | undefined;
+  let existing: { id?: string } | undefined;
+  if (isPostgres()) {
+    await ensurePostgresBootstrap();
+    existing = await getKyselyDb()
+      .selectFrom("proxy_registry")
+      .select("id")
+      .where("host", "=", host)
+      .where("port", "=", port)
+      .executeTakeFirst();
+  } else {
+    const db = getDbInstance();
+    existing = db
+      .prepare("SELECT id FROM proxy_registry WHERE host = ? AND port = ? LIMIT 1")
+      .get(host, port) as { id?: string } | undefined;
+  }
 
   if (existing?.id) {
     const updated = await updateProxy(existing.id, payload);
@@ -317,10 +614,16 @@ export async function upsertProxy(payload: ProxyPayload): Promise<{
 }
 
 export async function updateProxy(id: string, payload: Partial<ProxyPayload>) {
-  const db = getDbInstance();
   const existing = await getProxyById(id, { includeSecrets: true });
   if (!existing) return null;
 
+  if (isPostgres()) {
+    await updateProxyRowPg(getKyselyDb(), id, existing, payload, new Date().toISOString());
+    bumpProxyRegistryGeneration();
+    return getProxyById(id, { includeSecrets: false });
+  }
+
+  const db = getDbInstance();
   updateProxyRow(db, id, existing, payload, new Date().toISOString());
 
   backupDbFile("pre-write");
@@ -332,9 +635,35 @@ export async function createProxyAndAssign(
   payload: ProxyPayload,
   assignment: ProxyAssignmentPayload
 ): Promise<ProxyMutationResult> {
-  const db = getDbInstance();
   const id = randomUUID();
   const now = new Date().toISOString();
+
+  if (isPostgres()) {
+    await ensurePostgresBootstrap();
+    const kdb = getKyselyDb();
+    const result = await kdb.transaction().execute(async (trx): Promise<ProxyTransactionResult> => {
+      await insertProxyRowPg(trx, id, payload, now);
+      await upsertAssignmentRowPg(trx, assignment, id, now);
+      const legacyClearStatus = await clearLegacyProxyForAssignmentPg(trx, assignment);
+      return {
+        legacyClearStatus,
+        proxy: await getProxyRowByIdOrThrowPg(trx, id, { includeSecrets: false }),
+        assignment: await getAssignmentRowPg(trx, assignment.scope, assignment.scopeId),
+      };
+    });
+
+    bumpProxyRegistryGeneration();
+    if (result.legacyClearStatus === "cleared") {
+      const { bumpProxyConfigGeneration } = await import("./settings");
+      bumpProxyConfigGeneration();
+    }
+    return {
+      proxy: result.proxy,
+      assignment: result.assignment,
+    };
+  }
+
+  const db = getDbInstance();
 
   const tx = db.transaction((): ProxyTransactionResult => {
     insertProxyRow(db, id, payload, now);
@@ -367,8 +696,40 @@ export async function updateProxyAndAssign(
   payload: Partial<ProxyPayload>,
   assignment: ProxyAssignmentPayload
 ): Promise<ProxyMutationResult | null> {
-  const db = getDbInstance();
   const now = new Date().toISOString();
+
+  if (isPostgres()) {
+    await ensurePostgresBootstrap();
+    const kdb = getKyselyDb();
+    const result = await kdb
+      .transaction()
+      .execute(async (trx): Promise<ProxyTransactionResult | null> => {
+        const existing = await getProxyRowByIdPg(trx, id, { includeSecrets: true });
+        if (!existing) return null;
+
+        await updateProxyRowPg(trx, id, existing, payload, now);
+        await upsertAssignmentRowPg(trx, assignment, id, now);
+        const legacyClearStatus = await clearLegacyProxyForAssignmentPg(trx, assignment);
+        return {
+          legacyClearStatus,
+          proxy: await getProxyRowByIdOrThrowPg(trx, id, { includeSecrets: false }),
+          assignment: await getAssignmentRowPg(trx, assignment.scope, assignment.scopeId),
+        };
+      });
+    if (!result) return null;
+
+    bumpProxyRegistryGeneration();
+    if (result.legacyClearStatus === "cleared") {
+      const { bumpProxyConfigGeneration } = await import("./settings");
+      bumpProxyConfigGeneration();
+    }
+    return {
+      proxy: result.proxy,
+      assignment: result.assignment,
+    };
+  }
+
+  const db = getDbInstance();
 
   const tx = db.transaction((): ProxyTransactionResult | null => {
     const existing = getProxyRowById(db, id, { includeSecrets: true });
@@ -402,6 +763,46 @@ export async function updateProxyAndAssign(
 
 export async function getProxyAssignments(filters?: { proxyId?: string; scope?: string }) {
   try {
+    if (isPostgres()) {
+      await ensurePostgresBootstrap();
+      const kdb = getKyselyDb();
+      const cols = [
+        "id",
+        "proxy_id",
+        "scope",
+        "scope_id",
+        "position",
+        "created_at",
+        "updated_at",
+      ] as const;
+      if (filters?.proxyId) {
+        const rows = await kdb
+          .selectFrom("proxy_assignments")
+          .select(cols)
+          .where("proxy_id", "=", filters.proxyId)
+          .orderBy("scope", "asc")
+          .orderBy("scope_id", "asc")
+          .execute();
+        return rows.map(mapAssignmentRow);
+      }
+      if (filters?.scope) {
+        const rows = await kdb
+          .selectFrom("proxy_assignments")
+          .select(cols)
+          .where("scope", "=", normalizeScope(filters.scope))
+          .orderBy("scope_id", "asc")
+          .execute();
+        return rows.map(mapAssignmentRow);
+      }
+      const rows = await kdb
+        .selectFrom("proxy_assignments")
+        .select(cols)
+        .orderBy("scope", "asc")
+        .orderBy("scope_id", "asc")
+        .execute();
+      return rows.map(mapAssignmentRow);
+    }
+
     const db = getDbInstance();
 
     if (filters?.proxyId) {
@@ -438,13 +839,7 @@ export async function getProxyAssignments(filters?: { proxyId?: string; scope?: 
 }
 
 export async function getProxyWhereUsed(proxyId: string) {
-  const db = getDbInstance();
-  const rows = db
-    .prepare(
-      "SELECT id, proxy_id, scope, scope_id, position, created_at, updated_at FROM proxy_assignments WHERE proxy_id = ? ORDER BY scope, scope_id"
-    )
-    .all(proxyId)
-    .map(mapAssignmentRow);
+  const rows = await getProxyAssignments({ proxyId });
 
   return {
     count: rows.length,
@@ -459,6 +854,38 @@ export async function assignProxyToScope(
 ): Promise<ProxyAssignmentRecord | null> {
   const normalizedScope = normalizeScope(scope);
   const normalizedScopeId = normalizeAssignmentScopeId(normalizedScope, scopeId);
+
+  if (isPostgres()) {
+    await ensurePostgresBootstrap();
+    const kdb = getKyselyDb();
+
+    if (!proxyId) {
+      await kdb
+        .deleteFrom("proxy_assignments")
+        .where("scope", "=", normalizedScope)
+        .where((eb) => scopeIdEq(eb, normalizedScopeId))
+        .execute();
+      await clearRotationStatePg(kdb, normalizedScope, normalizedScopeId);
+      bumpProxyRegistryGeneration();
+      return null;
+    }
+
+    const proxy = await getProxyById(proxyId, { includeSecrets: true });
+    if (!proxy) {
+      const err = new Error(`Proxy not found: ${proxyId}`) as Error & { status?: number };
+      err.status = 404;
+      throw err;
+    }
+
+    const now = new Date().toISOString();
+    await replaceScopeWithSingleProxyPg(kdb, normalizedScope, normalizedScopeId, proxyId, now);
+    await resetRotationCursorPg(kdb, normalizedScope, normalizedScopeId);
+
+    bumpProxyRegistryGeneration();
+
+    return getAssignmentRowPg(kdb, normalizedScope, normalizedScopeId);
+  }
+
   const db = getDbInstance();
 
   if (!proxyId) {
@@ -521,6 +948,31 @@ function resetRotationCursor(
   ).run(new Date().toISOString(), scope, normalizedScopeId ?? "");
 }
 
+async function clearRotationStatePg(
+  kdb: KyselyOrTrx,
+  scope: string,
+  normalizedScopeId: string | null
+) {
+  await kdb
+    .deleteFrom("proxy_scope_rotation")
+    .where("scope", "=", scope)
+    .where("scope_id", "=", normalizedScopeId ?? "")
+    .execute();
+}
+
+async function resetRotationCursorPg(
+  kdb: KyselyOrTrx,
+  scope: string,
+  normalizedScopeId: string | null
+) {
+  await kdb
+    .updateTable("proxy_scope_rotation")
+    .set({ cursor: 0, rotated_at: null, updated_at: new Date().toISOString() })
+    .where("scope", "=", scope)
+    .where("scope_id", "=", normalizedScopeId ?? "")
+    .execute();
+}
+
 function normalizeRotationStrategy(strategy: unknown): ProxyRotationStrategy {
   return PROXY_ROTATION_STRATEGIES.includes(strategy as ProxyRotationStrategy)
     ? (strategy as ProxyRotationStrategy)
@@ -543,13 +995,60 @@ export async function addProxyToScopePool(
     throw new Error("scopeId is required for non-global proxy assignments");
   }
 
-  const db = getDbInstance();
   const proxy = await getProxyById(proxyId, { includeSecrets: true });
   if (!proxy) {
     const err = new Error(`Proxy not found: ${proxyId}`) as Error & { status?: number };
     err.status = 404;
     throw err;
   }
+
+  if (isPostgres()) {
+    await ensurePostgresBootstrap();
+    const kdb = getKyselyDb();
+    const existingPg = await kdb
+      .selectFrom("proxy_assignments")
+      .select("id")
+      .where("scope", "=", normalizedScope)
+      .where((eb) => scopeIdEq(eb, normalizedScopeId))
+      .where("proxy_id", "=", proxyId)
+      .executeTakeFirst();
+
+    if (!existingPg) {
+      const now = new Date().toISOString();
+      const maxRow = await kdb
+        .selectFrom("proxy_assignments")
+        .select((eb) => eb.fn.max("position").as("maxPos"))
+        .where("scope", "=", normalizedScope)
+        .where((eb) => scopeIdEq(eb, normalizedScopeId))
+        .executeTakeFirst();
+      const nextPosition =
+        maxRow?.maxPos !== null && maxRow?.maxPos !== undefined ? Number(maxRow.maxPos) + 1 : 0;
+      await kdb
+        .insertInto("proxy_assignments")
+        .values({
+          proxy_id: proxyId,
+          scope: normalizedScope,
+          scope_id: normalizedScopeId,
+          position: nextPosition,
+          created_at: now,
+          updated_at: now,
+        })
+        .execute();
+
+      bumpProxyRegistryGeneration();
+    }
+
+    const rowPg = await kdb
+      .selectFrom("proxy_assignments")
+      .select(["id", "proxy_id", "scope", "scope_id", "position", "created_at", "updated_at"])
+      .where("scope", "=", normalizedScope)
+      .where((eb) => scopeIdEq(eb, normalizedScopeId))
+      .where("proxy_id", "=", proxyId)
+      .executeTakeFirst();
+    return rowPg ? mapAssignmentRow(rowPg) : null;
+  }
+
+  const db = getDbInstance();
 
   const existing = db
     .prepare(
@@ -593,6 +1092,21 @@ export async function removeProxyFromScopePool(
 ): Promise<boolean> {
   const normalizedScope = normalizeScope(scope);
   const normalizedScopeId = normalizeAssignmentScopeId(normalizedScope, scopeId);
+
+  if (isPostgres()) {
+    await ensurePostgresBootstrap();
+    const kdb = getKyselyDb();
+    const result = await kdb
+      .deleteFrom("proxy_assignments")
+      .where("scope", "=", normalizedScope)
+      .where((eb) => scopeIdEq(eb, normalizedScopeId))
+      .where("proxy_id", "=", proxyId)
+      .executeTakeFirst();
+    const removed = Number(result.numDeletedRows ?? 0) > 0;
+    if (removed) bumpProxyRegistryGeneration();
+    return removed;
+  }
+
   const db = getDbInstance();
   const result = db
     .prepare("DELETE FROM proxy_assignments WHERE scope = ? AND scope_id IS ? AND proxy_id = ?")
@@ -615,6 +1129,22 @@ export async function getScopeProxyPool(
 ): Promise<ProxyAssignmentRecord[]> {
   const normalizedScope = normalizeScope(scope);
   const normalizedScopeId = normalizeAssignmentScopeId(normalizedScope, scopeId);
+
+  if (isPostgres()) {
+    await ensurePostgresBootstrap();
+    const kdb = getKyselyDb();
+    const rows = await kdb
+      .selectFrom("proxy_assignments")
+      .select(["id", "proxy_id", "scope", "scope_id", "position", "created_at", "updated_at"])
+      .where("scope", "=", normalizedScope)
+      .where((eb) => scopeIdEq(eb, normalizedScopeId))
+      .orderBy("position", "asc")
+      .orderBy("created_at", "asc")
+      .orderBy("id", "asc")
+      .execute();
+    return rows.map(mapAssignmentRow);
+  }
+
   const db = getDbInstance();
   return db
     .prepare(
@@ -639,12 +1169,56 @@ export async function setScopeRotationStrategy(
   const rotationScopeId = normalizeRotationScopeId(normalizedScope, scopeId);
   const normalizedStrategy = normalizeRotationStrategy(strategy);
   const now = new Date().toISOString();
-  const db = getDbInstance();
 
   const stickyWindow =
     options?.stickyWindowMinutes !== undefined && Number.isFinite(options.stickyWindowMinutes)
       ? Math.max(1, Math.floor(options.stickyWindowMinutes))
       : null;
+
+  if (isPostgres()) {
+    await ensurePostgresBootstrap();
+    const kdb = getKyselyDb();
+    if (stickyWindow !== null) {
+      await kdb
+        .insertInto("proxy_scope_rotation")
+        .values({
+          scope: normalizedScope,
+          scope_id: rotationScopeId,
+          strategy: normalizedStrategy,
+          sticky_window_minutes: stickyWindow,
+          updated_at: now,
+        })
+        .onConflict((oc) =>
+          oc.columns(["scope", "scope_id"]).doUpdateSet({
+            strategy: (eb) => eb.ref("excluded.strategy"),
+            sticky_window_minutes: (eb) => eb.ref("excluded.sticky_window_minutes"),
+            updated_at: (eb) => eb.ref("excluded.updated_at"),
+          })
+        )
+        .execute();
+    } else {
+      await kdb
+        .insertInto("proxy_scope_rotation")
+        .values({
+          scope: normalizedScope,
+          scope_id: rotationScopeId,
+          strategy: normalizedStrategy,
+          updated_at: now,
+        })
+        .onConflict((oc) =>
+          oc.columns(["scope", "scope_id"]).doUpdateSet({
+            strategy: (eb) => eb.ref("excluded.strategy"),
+            updated_at: (eb) => eb.ref("excluded.updated_at"),
+          })
+        )
+        .execute();
+    }
+
+    bumpProxyRegistryGeneration();
+    return normalizedStrategy;
+  }
+
+  const db = getDbInstance();
 
   if (stickyWindow !== null) {
     db.prepare(
@@ -673,6 +1247,18 @@ export async function getScopeRotationStrategy(
 ): Promise<ProxyRotationStrategy> {
   const normalizedScope = normalizeScope(scope);
   const rotationScopeId = normalizeRotationScopeId(normalizedScope, scopeId);
+
+  if (isPostgres()) {
+    await ensurePostgresBootstrap();
+    const row = await getKyselyDb()
+      .selectFrom("proxy_scope_rotation")
+      .select("strategy")
+      .where("scope", "=", normalizedScope)
+      .where("scope_id", "=", rotationScopeId)
+      .executeTakeFirst();
+    return normalizeRotationStrategy(row?.strategy);
+  }
+
   const db = getDbInstance();
   const row = db
     .prepare("SELECT strategy FROM proxy_scope_rotation WHERE scope = ? AND scope_id IS ?")
@@ -687,13 +1273,23 @@ function getOrCreateRotationRow(
   db: ReturnType<typeof getDbInstance>,
   normalizedScope: string,
   rotationScopeId: string
-): { strategy: ProxyRotationStrategy; cursor: number; stickyWindowMinutes: number; rotatedAt: string | null } {
+): {
+  strategy: ProxyRotationStrategy;
+  cursor: number;
+  stickyWindowMinutes: number;
+  rotatedAt: string | null;
+} {
   const row = db
     .prepare(
       "SELECT strategy, cursor, sticky_window_minutes, rotated_at FROM proxy_scope_rotation WHERE scope = ? AND scope_id IS ?"
     )
     .get(normalizedScope, rotationScopeId) as
-    | { strategy?: string; cursor?: number; sticky_window_minutes?: number; rotated_at?: string | null }
+    | {
+        strategy?: string;
+        cursor?: number;
+        sticky_window_minutes?: number;
+        rotated_at?: string | null;
+      }
     | undefined;
 
   if (row) {
@@ -752,7 +1348,13 @@ function pickFromCandidates<T>(
       cursor = state.cursor + 1;
       db.prepare(
         "UPDATE proxy_scope_rotation SET cursor = ?, rotated_at = ?, updated_at = ? WHERE scope = ? AND scope_id IS ?"
-      ).run(cursor, new Date().toISOString(), new Date().toISOString(), normalizedScope, rotationScopeId);
+      ).run(
+        cursor,
+        new Date().toISOString(),
+        new Date().toISOString(),
+        normalizedScope,
+        rotationScopeId
+      );
     }
     const idx = ((cursor % candidates.length) + candidates.length) % candidates.length;
     return candidates[idx];
@@ -792,7 +1394,6 @@ function fetchAlivePoolRows(
 
 export async function deleteProxyById(id: string, options?: { force?: boolean }) {
   const force = options?.force === true;
-  const db = getDbInstance();
   const usage = await getProxyWhereUsed(id);
 
   if (!force && usage.count > 0) {
@@ -807,6 +1408,18 @@ export async function deleteProxyById(id: string, options?: { force?: boolean })
     throw err;
   }
 
+  if (isPostgres()) {
+    await ensurePostgresBootstrap();
+    const kdb = getKyselyDb();
+    if (force && usage.count > 0) {
+      await kdb.deleteFrom("proxy_assignments").where("proxy_id", "=", id).execute();
+    }
+    const result = await kdb.deleteFrom("proxy_registry").where("id", "=", id).executeTakeFirst();
+    bumpProxyRegistryGeneration();
+    return Number(result.numDeletedRows ?? 0) > 0;
+  }
+
+  const db = getDbInstance();
   if (force && usage.count > 0) {
     db.prepare("DELETE FROM proxy_assignments WHERE proxy_id = ?").run(id);
   }
@@ -846,7 +1459,186 @@ function resolveScopePoolInternal(
   return toRegistryProxyResolution(picked, scope, levelId);
 }
 
+async function getOrCreateRotationRowPg(
+  kdb: ReturnType<typeof getKyselyDb>,
+  normalizedScope: string,
+  rotationScopeId: string
+): Promise<{
+  strategy: ProxyRotationStrategy;
+  cursor: number;
+  stickyWindowMinutes: number;
+  rotatedAt: string | null;
+}> {
+  const row = await kdb
+    .selectFrom("proxy_scope_rotation")
+    .select(["strategy", "cursor", "sticky_window_minutes", "rotated_at"])
+    .where("scope", "=", normalizedScope)
+    .where("scope_id", "=", rotationScopeId)
+    .executeTakeFirst();
+
+  if (row) {
+    return {
+      strategy: normalizeRotationStrategy(row.strategy),
+      cursor: Number(row.cursor) || 0,
+      stickyWindowMinutes: Number(row.sticky_window_minutes) || 30,
+      rotatedAt: typeof row.rotated_at === "string" ? row.rotated_at : null,
+    };
+  }
+
+  const now = new Date().toISOString();
+  await kdb
+    .insertInto("proxy_scope_rotation")
+    .values({
+      scope: normalizedScope,
+      scope_id: rotationScopeId,
+      strategy: DEFAULT_PROXY_ROTATION_STRATEGY,
+      cursor: 0,
+      updated_at: now,
+    })
+    .onConflict((oc) => oc.columns(["scope", "scope_id"]).doNothing())
+    .execute();
+  return {
+    strategy: DEFAULT_PROXY_ROTATION_STRATEGY,
+    cursor: 0,
+    stickyWindowMinutes: 30,
+    rotatedAt: null,
+  };
+}
+
+async function pickFromCandidatesPg<T>(
+  kdb: ReturnType<typeof getKyselyDb>,
+  normalizedScope: string,
+  rotationScopeId: string,
+  candidates: T[]
+): Promise<T> {
+  if (candidates.length === 1) return candidates[0];
+
+  const state = await getOrCreateRotationRowPg(kdb, normalizedScope, rotationScopeId);
+
+  if (state.strategy === "random") {
+    return candidates[randomInt(candidates.length)];
+  }
+
+  if (state.strategy === "latency") return pickByLatencyAsync(kdb, candidates);
+
+  if (state.strategy === "sticky") {
+    const windowMs = state.stickyWindowMinutes * 60_000;
+    const lastRotated = state.rotatedAt ? Date.parse(state.rotatedAt) : NaN;
+    const expired = !Number.isFinite(lastRotated) || Date.now() - lastRotated >= windowMs;
+    let cursor = state.cursor;
+    if (expired) {
+      cursor = state.cursor + 1;
+      await kdb
+        .updateTable("proxy_scope_rotation")
+        .set({
+          cursor,
+          rotated_at: new Date().toISOString(),
+          updated_at: new Date().toISOString(),
+        })
+        .where("scope", "=", normalizedScope)
+        .where("scope_id", "=", rotationScopeId)
+        .execute();
+    }
+    const idx = ((cursor % candidates.length) + candidates.length) % candidates.length;
+    return candidates[idx];
+  }
+
+  // round-robin (default): pick at the current cursor, then advance it monotonically.
+  const idx = ((state.cursor % candidates.length) + candidates.length) % candidates.length;
+  await kdb
+    .updateTable("proxy_scope_rotation")
+    .set({ cursor: state.cursor + 1, updated_at: new Date().toISOString() })
+    .where("scope", "=", normalizedScope)
+    .where("scope_id", "=", rotationScopeId)
+    .execute();
+  return candidates[idx];
+}
+
+async function fetchAlivePoolRowsPg(
+  kdb: ReturnType<typeof getKyselyDb>,
+  scope: string,
+  scopeIdFilter: string | null,
+  matchAnyScopeId: boolean
+): Promise<JsonRecord[]> {
+  let query = kdb
+    .selectFrom("proxy_assignments as a")
+    .innerJoin("proxy_registry as p", "p.id", "a.proxy_id")
+    .select([
+      "p.id as id",
+      "p.type as type",
+      "p.host as host",
+      "p.port as port",
+      "p.username as username",
+      "p.password as password",
+      "p.notes as notes",
+      "p.family as family",
+      "a.position as __pos",
+      "a.id as __aid",
+    ])
+    .where("a.scope", "=", scope)
+    .where(
+      sql<boolean>`(p.status is null or lower(p.status) not in ('inactive','error','disabled','dead','down'))`
+    );
+  if (!matchAnyScopeId) {
+    query =
+      scopeIdFilter === null
+        ? query.where("a.scope_id", "is", null)
+        : query.where("a.scope_id", "=", scopeIdFilter);
+  }
+  const rows = await query.orderBy("a.position", "asc").orderBy("a.id", "asc").execute();
+  return rows as unknown as JsonRecord[];
+}
+
+async function resolveScopePoolInternalPg(
+  kdb: ReturnType<typeof getKyselyDb>,
+  scope: ProxyScope,
+  levelId: string | null,
+  options: { rotationScopeId: string; matchAnyScopeId?: boolean; scopeIdFilter?: string | null }
+): Promise<ReturnType<typeof toRegistryProxyResolution> | null> {
+  const rows = await fetchAlivePoolRowsPg(
+    kdb,
+    scope,
+    options.scopeIdFilter ?? null,
+    options.matchAnyScopeId === true
+  );
+  if (rows.length === 0) return null;
+  const picked = await pickFromCandidatesPg(kdb, scope, options.rotationScopeId, rows);
+  return toRegistryProxyResolution(picked, scope, levelId);
+}
+
 export async function resolveProxyForConnectionFromRegistry(connectionId: string) {
+  if (isPostgres()) {
+    await ensurePostgresBootstrap();
+    const kdb = getKyselyDb();
+
+    const account = await resolveScopePoolInternalPg(kdb, "account", connectionId, {
+      rotationScopeId: connectionId,
+      scopeIdFilter: connectionId,
+    });
+    if (account) return account;
+
+    const connection = await kdb
+      .selectFrom("provider_connections")
+      .select("provider")
+      .where("id", "=", connectionId)
+      .executeTakeFirst();
+
+    if (connection?.provider) {
+      const provider = await resolveScopePoolInternalPg(kdb, "provider", connection.provider, {
+        rotationScopeId: connection.provider,
+        scopeIdFilter: connection.provider,
+      });
+      if (provider) return provider;
+    }
+
+    const global = await resolveScopePoolInternalPg(kdb, "global", null, {
+      rotationScopeId: normalizeRotationScopeId("global", null),
+      matchAnyScopeId: true,
+    });
+    if (global) return global;
+
+    return null;
+  }
   try {
     const db = getDbInstance();
 
@@ -883,6 +1675,26 @@ export async function resolveProxyForConnectionFromRegistry(connectionId: string
 }
 
 export async function resolveProxyForScopeFromRegistry(scope: string, scopeId?: string | null) {
+  if (isPostgres()) {
+    await ensurePostgresBootstrap();
+    const kdb = getKyselyDb();
+    const normalizedScope = normalizeScope(scope);
+
+    if (normalizedScope === "global") {
+      return resolveScopePoolInternalPg(kdb, "global", null, {
+        rotationScopeId: normalizeRotationScopeId("global", null),
+        matchAnyScopeId: true,
+      });
+    }
+
+    const normalizedScopeId = scopeId || null;
+    if (!normalizedScopeId) return null;
+
+    return resolveScopePoolInternalPg(kdb, normalizedScope, normalizedScopeId, {
+      rotationScopeId: normalizeRotationScopeId(normalizedScope, normalizedScopeId),
+      scopeIdFilter: normalizedScopeId,
+    });
+  }
   try {
     const db = getDbInstance();
     const normalizedScope = normalizeScope(scope);
@@ -920,7 +1732,60 @@ export async function resolveProxyForScopeFromRegistry(scope: string, scopeId?: 
  * and best-effort: any DB error fails OPEN (returns false) so a guard never breaks
  * the request path.
  */
-export function hasBlockingProxyAssignment(connectionId: string): boolean {
+export async function hasBlockingProxyAssignment(connectionId: string): Promise<boolean> {
+  if (isPostgres()) {
+    try {
+      await ensurePostgresBootstrap();
+      const kdb = getKyselyDb();
+
+      const globalRow = await kdb
+        .selectFrom("key_value")
+        .select("value")
+        .where("namespace", "=", "settings")
+        .where("key", "=", "proxyEnabled")
+        .executeTakeFirst();
+      if (globalRow?.value) {
+        try {
+          if (JSON.parse(globalRow.value) === false) return false;
+        } catch {
+          /* malformed → treat as enabled */
+        }
+      }
+
+      const conn = await kdb
+        .selectFrom("provider_connections")
+        .select(["provider", "proxy_enabled"])
+        .where("id", "=", connectionId)
+        .executeTakeFirst();
+      if (conn && !Boolean(conn.proxy_enabled)) return false;
+      const provider = conn?.provider ?? null;
+
+      const dead = await kdb
+        .selectFrom("proxy_assignments as a")
+        .innerJoin("proxy_registry as p", "p.id", "a.proxy_id")
+        .select(sql<number>`1`.as("one"))
+        .where((eb) => {
+          const orConditions = [
+            eb.and([eb("a.scope", "=", "account"), eb("a.scope_id", "=", connectionId)]),
+            eb("a.scope", "=", "global"),
+          ];
+          if (provider !== null) {
+            orConditions.push(
+              eb.and([eb("a.scope", "=", "provider"), eb("a.scope_id", "=", provider)])
+            );
+          }
+          return eb.or(orConditions);
+        })
+        .where(
+          sql<boolean>`NOT (p.status is null or lower(p.status) not in ('inactive','error','disabled','dead','down'))`
+        )
+        .limit(1)
+        .executeTakeFirst();
+      return !!dead;
+    } catch {
+      return false;
+    }
+  }
   try {
     const db = getDbInstance();
 
@@ -963,18 +1828,37 @@ export function hasBlockingProxyAssignment(connectionId: string): boolean {
 
 export async function migrateLegacyProxyConfigToRegistry(options?: { force?: boolean }) {
   const force = options?.force === true;
-  const db = getDbInstance();
 
-  const existingCountRow = db.prepare("SELECT COUNT(*) AS cnt FROM proxy_registry").get() as
-    { cnt?: number } | undefined;
-  const existingCount = Number(existingCountRow?.cnt || 0);
-  if (!force && existingCount > 0) {
-    return { migrated: 0, skipped: true, reason: "registry_not_empty" as const };
+  let existingCount: number;
+  let rows: Array<{ key?: string | null; value?: string | null }>;
+  if (isPostgres()) {
+    await ensurePostgresBootstrap();
+    const kdb = getKyselyDb();
+    const countRow = await kdb
+      .selectFrom("proxy_registry")
+      .select((eb) => eb.fn.countAll().as("cnt"))
+      .executeTakeFirst();
+    existingCount = Number(countRow?.cnt || 0);
+    if (!force && existingCount > 0) {
+      return { migrated: 0, skipped: true, reason: "registry_not_empty" as const };
+    }
+    rows = await kdb
+      .selectFrom("key_value")
+      .select(["key", "value"])
+      .where("namespace", "=", "proxyConfig")
+      .execute();
+  } else {
+    const db = getDbInstance();
+    const existingCountRow = db.prepare("SELECT COUNT(*) AS cnt FROM proxy_registry").get() as
+      { cnt?: number } | undefined;
+    existingCount = Number(existingCountRow?.cnt || 0);
+    if (!force && existingCount > 0) {
+      return { migrated: 0, skipped: true, reason: "registry_not_empty" as const };
+    }
+    rows = db
+      .prepare("SELECT key, value FROM key_value WHERE namespace = 'proxyConfig'")
+      .all() as Array<{ key?: string; value?: string }>;
   }
-
-  const rows = db
-    .prepare("SELECT key, value FROM key_value WHERE namespace = 'proxyConfig'")
-    .all() as Array<{ key?: string; value?: string }>;
 
   const raw: LegacyProxyConfig = {};
   for (const row of rows) {
@@ -1033,13 +1917,41 @@ export async function migrateLegacyProxyConfigToRegistry(options?: { force?: boo
 }
 
 export async function getProxyHealthStats(options?: { hours?: number }) {
-  const db = getDbInstance();
   const hours = Math.max(1, Math.min(24 * 30, Number(options?.hours || 24)));
   const sinceIso = new Date(Date.now() - hours * 60 * 60 * 1000).toISOString();
 
-  const rows = db
-    .prepare(
-      `SELECT
+  let rows: Array<Record<string, unknown>>;
+  if (isPostgres()) {
+    await ensurePostgresBootstrap();
+    const kdb = getKyselyDb();
+    const result = await sql<Record<string, unknown>>`
+      SELECT
+         p.id as proxy_id,
+         p.name as proxy_name,
+         p.type as proxy_type,
+         p.host as proxy_host,
+         p.port as proxy_port,
+         COUNT(l.id) as total_requests,
+         SUM(CASE WHEN l.status = 'success' THEN 1 ELSE 0 END) as success_count,
+         SUM(CASE WHEN l.status = 'error' THEN 1 ELSE 0 END) as error_count,
+         SUM(CASE WHEN l.status = 'timeout' THEN 1 ELSE 0 END) as timeout_count,
+         AVG(CASE WHEN l.latency_ms IS NOT NULL THEN l.latency_ms END) as avg_latency_ms,
+         MAX(l.timestamp) as last_seen_at
+       FROM proxy_registry p
+       LEFT JOIN proxy_logs l
+         ON l.proxy_host = p.host
+        AND l.proxy_type = p.type
+        AND l.proxy_port = p.port
+        AND l.timestamp >= ${sinceIso}
+       GROUP BY p.id, p.name, p.type, p.host, p.port
+       ORDER BY p.name ASC
+    `.execute(kdb);
+    rows = result.rows;
+  } else {
+    const db = getDbInstance();
+    rows = db
+      .prepare(
+        `SELECT
          p.id as proxy_id,
          p.name as proxy_name,
          p.type as proxy_type,
@@ -1059,8 +1971,9 @@ export async function getProxyHealthStats(options?: { hours?: number }) {
         AND l.timestamp >= ?
        GROUP BY p.id, p.name, p.type, p.host, p.port
        ORDER BY p.name ASC`
-    )
-    .all(sinceIso) as Array<Record<string, unknown>>;
+      )
+      .all(sinceIso) as Array<Record<string, unknown>>;
+  }
 
   return rows.map((row) => {
     const total = Number(row.total_requests || 0);

@@ -3,6 +3,7 @@
 // from proxies.ts to keep that frozen god-file under its line-count cap
 // (imported directly by src/lib/db/proxies.ts, anti-barrel, #6798).
 import { getDbInstance } from "./core";
+import { getKyselyDb } from "./kysely/client";
 
 const PROXY_LATENCY_WINDOW_HOURS = parseInt(process.env.PROXY_LATENCY_WINDOW_HOURS ?? "3", 10);
 
@@ -35,12 +36,7 @@ function buildLatencyMap(db: ReturnType<typeof getDbInstance>): Map<string, numb
   return latencyMap;
 }
 
-// Picks the candidate with the lowest recorded average latency; candidates
-// with no logged latency are treated as -1 (best/first) so untested proxies
-// still get a chance to be selected and gather data.
-export function pickByLatency<T>(db: ReturnType<typeof getDbInstance>, candidates: T[]): T {
-  const latencyMap = buildLatencyMap(db);
-
+function sortByLatency<T>(candidates: T[], latencyMap: Map<string, number>): T {
   const sorted = [...candidates].sort((a, b) => {
     const pA = a as { host: string; port: number };
     const pB = b as { host: string; port: number };
@@ -52,4 +48,41 @@ export function pickByLatency<T>(db: ReturnType<typeof getDbInstance>, candidate
   });
 
   return sorted[0];
+}
+
+// Picks the candidate with the lowest recorded average latency; candidates
+// with no logged latency are treated as -1 (best/first) so untested proxies
+// still get a chance to be selected and gather data.
+export function pickByLatency<T>(db: ReturnType<typeof getDbInstance>, candidates: T[]): T {
+  const latencyMap = buildLatencyMap(db);
+  return sortByLatency(candidates, latencyMap);
+}
+
+async function buildLatencyMapPg(
+  kdb: ReturnType<typeof getKyselyDb>
+): Promise<Map<string, number>> {
+  const sinceIso = new Date(Date.now() - PROXY_LATENCY_WINDOW_HOURS * 60 * 60 * 1000).toISOString();
+
+  const latencyRows = await kdb
+    .selectFrom("proxy_logs")
+    .select(["proxy_host", "proxy_port", (eb) => eb.fn.avg("latency_ms").as("avg_latency")])
+    .where("timestamp", ">=", sinceIso)
+    .groupBy(["proxy_host", "proxy_port"])
+    .execute();
+
+  const latencyMap = new Map<string, number>();
+  for (const r of latencyRows) {
+    if (r.avg_latency !== null && r.avg_latency !== undefined && r.proxy_host !== null) {
+      latencyMap.set(`${r.proxy_host}:${r.proxy_port}`, Number(r.avg_latency));
+    }
+  }
+  return latencyMap;
+}
+
+export async function pickByLatencyAsync<T>(
+  kdb: ReturnType<typeof getKyselyDb>,
+  candidates: T[]
+): Promise<T> {
+  const latencyMap = await buildLatencyMapPg(kdb);
+  return sortByLatency(candidates, latencyMap);
 }

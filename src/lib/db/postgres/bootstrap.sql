@@ -945,36 +945,6 @@ CREATE TABLE IF NOT EXISTS provider_quota_reset_events (
 CREATE INDEX IF NOT EXISTS idx_provider_quota_reset_events_connection_window
   ON provider_quota_reset_events(connection_id, window_key, window_resets_at);
 
-CREATE TABLE IF NOT EXISTS proxy_assignments (
-  id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
-  proxy_id TEXT NOT NULL,
-  scope TEXT NOT NULL,
-  scope_id TEXT,
-  position BIGINT NOT NULL DEFAULT 0,
-  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-  updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
-);
-
-CREATE TABLE IF NOT EXISTS proxy_logs (
-  id TEXT PRIMARY KEY,
-  timestamp TEXT NOT NULL,
-  status TEXT,
-  proxy_type TEXT,
-  proxy_host TEXT,
-  proxy_port BIGINT,
-  level TEXT,
-  level_id TEXT,
-  provider TEXT,
-  target_url TEXT,
-  public_ip TEXT,
-  latency_ms BIGINT DEFAULT 0,
-  error TEXT,
-  connection_id TEXT,
-  combo_id TEXT,
-  account TEXT,
-  tls_fingerprint BIGINT DEFAULT 0
-);
-
 CREATE TABLE IF NOT EXISTS proxy_registry (
   id TEXT PRIMARY KEY,
   name TEXT NOT NULL,
@@ -996,6 +966,39 @@ CREATE TABLE IF NOT EXISTS proxy_registry (
   last_validated TEXT,
   country_code TEXT,
   family TEXT NOT NULL DEFAULT 'auto'
+);
+
+CREATE TABLE IF NOT EXISTS proxy_assignments (
+  id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  proxy_id TEXT NOT NULL REFERENCES proxy_registry(id) ON DELETE RESTRICT,
+  scope TEXT NOT NULL,
+  scope_id TEXT,
+  position BIGINT NOT NULL DEFAULT 0,
+  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  UNIQUE(scope, scope_id, proxy_id)
+);
+CREATE INDEX IF NOT EXISTS idx_proxy_assignments_proxy_id ON proxy_assignments(proxy_id);
+CREATE INDEX IF NOT EXISTS idx_proxy_assignments_scope ON proxy_assignments(scope, scope_id);
+
+CREATE TABLE IF NOT EXISTS proxy_logs (
+  id TEXT PRIMARY KEY,
+  timestamp TEXT NOT NULL,
+  status TEXT,
+  proxy_type TEXT,
+  proxy_host TEXT,
+  proxy_port BIGINT,
+  level TEXT,
+  level_id TEXT,
+  provider TEXT,
+  target_url TEXT,
+  public_ip TEXT,
+  latency_ms BIGINT DEFAULT 0,
+  error TEXT,
+  connection_id TEXT,
+  combo_id TEXT,
+  account TEXT,
+  tls_fingerprint BIGINT DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS proxy_scope_rotation (
