@@ -160,12 +160,12 @@ test("#3500 getAutoRoutingTopProviders — returns top providers for auto/* mode
 // semanticCache — listSemanticCacheEntries
 // ===========================================================================
 
-test("#3500 listSemanticCacheEntries — returns entries with pagination", () => {
+test("#3500 listSemanticCacheEntries — returns entries with pagination", async () => {
   insertSemanticCache({ id: "sc-1", signature: "sig-alpha", model: "gpt-4", hit_count: 5 });
   insertSemanticCache({ id: "sc-2", signature: "sig-beta", model: "claude-3", hit_count: 2 });
   insertSemanticCache({ id: "sc-3", signature: "sig-gamma", model: "gpt-4", hit_count: 1 });
 
-  const result = semanticCache.listSemanticCacheEntries({
+  const result = await semanticCache.listSemanticCacheEntries({
     page: 1,
     limit: 10,
     search: "",
@@ -186,8 +186,8 @@ test("#3500 listSemanticCacheEntries — returns entries with pagination", () =>
   }
 });
 
-test("#3500 listSemanticCacheEntries — search filter narrows results", () => {
-  const result = semanticCache.listSemanticCacheEntries({
+test("#3500 listSemanticCacheEntries — search filter narrows results", async () => {
+  const result = await semanticCache.listSemanticCacheEntries({
     page: 1,
     limit: 10,
     search: "sig-alpha",
@@ -203,8 +203,8 @@ test("#3500 listSemanticCacheEntries — search filter narrows results", () => {
   );
 });
 
-test("#3500 listSemanticCacheEntries — model filter works", () => {
-  const result = semanticCache.listSemanticCacheEntries({
+test("#3500 listSemanticCacheEntries — model filter works", async () => {
+  const result = await semanticCache.listSemanticCacheEntries({
     page: 1,
     limit: 10,
     search: "",
@@ -219,8 +219,8 @@ test("#3500 listSemanticCacheEntries — model filter works", () => {
   }
 });
 
-test("#3500 listSemanticCacheEntries — pagination offset works", () => {
-  const p1 = semanticCache.listSemanticCacheEntries({
+test("#3500 listSemanticCacheEntries — pagination offset works", async () => {
+  const p1 = await semanticCache.listSemanticCacheEntries({
     page: 1,
     limit: 2,
     search: "",
@@ -228,7 +228,7 @@ test("#3500 listSemanticCacheEntries — pagination offset works", () => {
     sortBy: "created_at",
     sortOrder: "asc",
   });
-  const p2 = semanticCache.listSemanticCacheEntries({
+  const p2 = await semanticCache.listSemanticCacheEntries({
     page: 2,
     limit: 2,
     search: "",
@@ -250,11 +250,11 @@ test("#3500 listSemanticCacheEntries — pagination offset works", () => {
 // semanticCache — deleteSemanticCacheBySignature
 // ===========================================================================
 
-test("#3500 deleteSemanticCacheBySignature — deletes exactly the matching entry", () => {
+test("#3500 deleteSemanticCacheBySignature — deletes exactly the matching entry", async () => {
   insertSemanticCache({ id: "sc-del-sig", signature: "sig-to-delete", model: "gpt-4" });
 
   // Verify it exists first
-  const before = semanticCache.listSemanticCacheEntries({
+  const before = await semanticCache.listSemanticCacheEntries({
     page: 1,
     limit: 100,
     search: "sig-to-delete",
@@ -264,10 +264,10 @@ test("#3500 deleteSemanticCacheBySignature — deletes exactly the matching entr
   });
   assert.ok(before.total >= 1, "entry exists before delete");
 
-  const result = semanticCache.deleteSemanticCacheBySignature("sig-to-delete");
+  const result = await semanticCache.deleteSemanticCacheBySignature("sig-to-delete");
   assert.equal(result.deleted, 1);
 
-  const after = semanticCache.listSemanticCacheEntries({
+  const after = await semanticCache.listSemanticCacheEntries({
     page: 1,
     limit: 100,
     search: "sig-to-delete",
@@ -282,11 +282,11 @@ test("#3500 deleteSemanticCacheBySignature — deletes exactly the matching entr
 // semanticCache — deleteSemanticCacheByModel
 // ===========================================================================
 
-test("#3500 deleteSemanticCacheByModel — deletes all entries for the given model", () => {
+test("#3500 deleteSemanticCacheByModel — deletes all entries for the given model", async () => {
   insertSemanticCache({ id: "sc-m1", signature: "sig-model-a-1", model: "model-to-purge" });
   insertSemanticCache({ id: "sc-m2", signature: "sig-model-a-2", model: "model-to-purge" });
 
-  const before = semanticCache.listSemanticCacheEntries({
+  const before = await semanticCache.listSemanticCacheEntries({
     page: 1,
     limit: 100,
     search: "",
@@ -296,10 +296,10 @@ test("#3500 deleteSemanticCacheByModel — deletes all entries for the given mod
   });
   assert.ok(before.total >= 2, "2 entries before delete");
 
-  const result = semanticCache.deleteSemanticCacheByModel("model-to-purge");
+  const result = await semanticCache.deleteSemanticCacheByModel("model-to-purge");
   assert.ok(result.deleted >= 2, `deleted >= 2, got ${result.deleted}`);
 
-  const after = semanticCache.listSemanticCacheEntries({
+  const after = await semanticCache.listSemanticCacheEntries({
     page: 1,
     limit: 100,
     search: "",
