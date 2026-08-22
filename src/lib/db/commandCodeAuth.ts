@@ -2,6 +2,12 @@ import { createHash, randomUUID } from "crypto";
 
 import { getDbInstance, rowToCamel } from "./core";
 import { decrypt, encrypt } from "./encryption";
+import { resolveDbDriverConfig } from "./driverConfig";
+import { ensurePostgresBootstrap, getKyselyDb } from "./kysely/client";
+
+function isPostgres(): boolean {
+  return resolveDbDriverConfig().driver === "postgres";
+}
 
 export type CommandCodeAuthStatus = "pending" | "received" | "applied" | "expired";
 
@@ -96,7 +102,19 @@ function toSafeStatus(row: AuthSessionRow): CommandCodeAuthSafeStatus {
   };
 }
 
-function markExpiredForState(stateHash: string, now = nowIso()): void {
+async function markExpiredForState(stateHash: string, now = nowIso()): Promise<void> {
+  if (isPostgres()) {
+    await ensurePostgresBootstrap();
+    await getKyselyDb()
+      .updateTable("command_code_auth_sessions")
+      .set({ status: "expired", updated_at: now })
+      .where("state_hash", "=", stateHash)
+      .where("status", "in", ["pending", "received"])
+      .where("expires_at", "<=", now)
+      .execute();
+    return;
+  }
+
   db()
     .prepare(
       `UPDATE command_code_auth_sessions
@@ -106,12 +124,41 @@ function markExpiredForState(stateHash: string, now = nowIso()): void {
     .run(now, stateHash, now);
 }
 
-export function createPendingCommandCodeAuthSession(input: {
+export async function createPendingCommandCodeAuthSession(input: {
   stateHash: string;
   expiresAt: string;
-}): CommandCodeAuthSafeStatus {
+}): Promise<CommandCodeAuthSafeStatus> {
   const id = randomUUID();
   const now = nowIso();
+
+  if (isPostgres()) {
+    await ensurePostgresBootstrap();
+    const kdb = getKyselyDb();
+    await kdb
+      .insertInto("command_code_auth_sessions")
+      .values({
+        id,
+        state_hash: input.stateHash,
+        status: "pending",
+        encrypted_api_key: null,
+        metadata_json: null,
+        created_at: now,
+        expires_at: input.expiresAt,
+        received_at: null,
+        applied_at: null,
+        updated_at: now,
+      })
+      .execute();
+
+    const row = await kdb
+      .selectFrom("command_code_auth_sessions")
+      .selectAll()
+      .where("id", "=", id)
+      .executeTakeFirst();
+    if (!row) throw new Error("Failed to create Command Code auth session");
+    return toSafeStatus(row as unknown as AuthSessionRow);
+  }
+
   db()
     .prepare(
       `INSERT INTO command_code_auth_sessions (
@@ -128,18 +175,37 @@ export function createPendingCommandCodeAuthSession(input: {
   return toSafeStatus(row);
 }
 
-export function markCommandCodeAuthSessionReceived(input: {
+export async function markCommandCodeAuthSessionReceived(input: {
   stateHash: string;
   apiKey: string;
   metadata?: CommandCodeAuthMetadata;
-}): CommandCodeAuthSafeStatus | null {
+}): Promise<CommandCodeAuthSafeStatus | null> {
   const now = nowIso();
-  markExpiredForState(input.stateHash, now);
+  await markExpiredForState(input.stateHash, now);
   const metadata: CommandCodeAuthMetadata = {
     ...(input.metadata || {}),
     receivedAt: now,
   };
   const encryptedApiKey = encrypt(input.apiKey);
+
+  if (isPostgres()) {
+    await ensurePostgresBootstrap();
+    await getKyselyDb()
+      .updateTable("command_code_auth_sessions")
+      .set({
+        status: "received",
+        encrypted_api_key: encryptedApiKey,
+        metadata_json: JSON.stringify(metadata),
+        received_at: now,
+        updated_at: now,
+      })
+      .where("state_hash", "=", input.stateHash)
+      .where("status", "in", ["pending", "received"])
+      .where("expires_at", ">", now)
+      .execute();
+    return getCommandCodeAuthSessionSafeStatus(input.stateHash);
+  }
+
   db()
     .prepare(
       `UPDATE command_code_auth_sessions
@@ -151,19 +217,78 @@ export function markCommandCodeAuthSessionReceived(input: {
   return getCommandCodeAuthSessionSafeStatus(input.stateHash);
 }
 
-export function getCommandCodeAuthSessionSafeStatus(
+export async function getCommandCodeAuthSessionSafeStatus(
   stateHash: string
-): CommandCodeAuthSafeStatus | null {
-  markExpiredForState(stateHash);
+): Promise<CommandCodeAuthSafeStatus | null> {
+  await markExpiredForState(stateHash);
+
+  if (isPostgres()) {
+    await ensurePostgresBootstrap();
+    const row = await getKyselyDb()
+      .selectFrom("command_code_auth_sessions")
+      .selectAll()
+      .where("state_hash", "=", stateHash)
+      .executeTakeFirst();
+    return row ? toSafeStatus(row as unknown as AuthSessionRow) : null;
+  }
+
   const row = db()
     .prepare<AuthSessionRow>("SELECT * FROM command_code_auth_sessions WHERE state_hash = ?")
     .get(stateHash);
   return row ? toSafeStatus(row) : null;
 }
 
-export function consumeCommandCodeAuthSecret(
+export async function consumeCommandCodeAuthSecret(
   stateHash: string
-): ConsumedCommandCodeAuthSecret | null {
+): Promise<ConsumedCommandCodeAuthSecret | null> {
+  if (isPostgres()) {
+    await ensurePostgresBootstrap();
+    return getKyselyDb()
+      .transaction()
+      .execute(async (trx) => {
+        const now = nowIso();
+        await trx
+          .updateTable("command_code_auth_sessions")
+          .set({ status: "expired", updated_at: now })
+          .where("state_hash", "=", stateHash)
+          .where("status", "in", ["pending", "received"])
+          .where("expires_at", "<=", now)
+          .execute();
+
+        const row = await trx
+          .selectFrom("command_code_auth_sessions")
+          .selectAll()
+          .where("state_hash", "=", stateHash)
+          .where("status", "=", "received")
+          .where("expires_at", ">", now)
+          .where("encrypted_api_key", "is not", null)
+          .executeTakeFirst();
+        if (!row?.encrypted_api_key) return null;
+
+        const apiKey = decrypt(row.encrypted_api_key);
+        if (!apiKey) return null;
+
+        const result = await trx
+          .updateTable("command_code_auth_sessions")
+          .set({ status: "applied", encrypted_api_key: null, applied_at: now, updated_at: now })
+          .where("id", "=", row.id)
+          .where("status", "=", "received")
+          .executeTakeFirst();
+        if (Number(result.numUpdatedRows) === 0) return null;
+
+        return {
+          ...toSafeStatus({
+            ...row,
+            status: "applied",
+            encrypted_api_key: null,
+            applied_at: now,
+            updated_at: now,
+          }),
+          apiKey,
+        };
+      });
+  }
+
   const database = db();
   return database.transaction(() => {
     const now = nowIso();
