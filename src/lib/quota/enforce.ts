@@ -112,7 +112,7 @@ export async function enforceQuotaShare(input: EnforceInput): Promise<EnforceDec
   const store = await getQuotaStore();
 
   // 3. Resolve the provider plan (dimensions).
-  const plan = resolvePlan(input.connectionId, input.provider);
+  const plan = await resolvePlan(input.connectionId, input.provider);
 
   // 3b. Per-(key, model) model-cap pre-check (Fase 3 #7).
   //
@@ -325,7 +325,7 @@ export async function recordConsumption(input: RecordConsumptionInput): Promise<
 
   if (!poolId) return;
 
-  const plan = resolvePlan(input.connectionId, input.provider);
+  const plan = await resolvePlan(input.connectionId, input.provider);
   const store = await getQuotaStore();
 
   // Pool-level dimension consumption (existing behaviour).

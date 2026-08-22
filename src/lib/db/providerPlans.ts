@@ -10,6 +10,12 @@
  */
 
 import { getDbInstance } from "./core";
+import { resolveDbDriverConfig } from "./driverConfig";
+import { ensurePostgresBootstrap, getKyselyDb } from "./kysely/client";
+
+function isPostgres(): boolean {
+  return resolveDbDriverConfig().driver === "postgres";
+}
 
 // ---------------------------------------------------------------------------
 // Local type shapes (aligned with src/lib/quota/dimensions.ts — merged by F7)
@@ -81,7 +87,18 @@ function rowToPlan(row: PlanRow): ProviderPlan {
  * Get the plan for a specific provider connection, or null if not found.
  * Parses dimensions_json into a typed QuotaDimension array.
  */
-export function getPlan(connectionId: string): ProviderPlan | null {
+export async function getPlan(connectionId: string): Promise<ProviderPlan | null> {
+  if (isPostgres()) {
+    await ensurePostgresBootstrap();
+    const row = await getKyselyDb()
+      .selectFrom("provider_plans")
+      .selectAll()
+      .where("connection_id", "=", connectionId)
+      .executeTakeFirst();
+    if (!row) return null;
+    return rowToPlan(row);
+  }
+
   const row = getDb()
     .prepare<PlanRow>(
       `SELECT connection_id, provider, dimensions_json, source, updated_at
@@ -95,7 +112,17 @@ export function getPlan(connectionId: string): ProviderPlan | null {
 /**
  * List all provider plans stored in the DB.
  */
-export function listPlans(): ProviderPlan[] {
+export async function listPlans(): Promise<ProviderPlan[]> {
+  if (isPostgres()) {
+    await ensurePostgresBootstrap();
+    const rows = await getKyselyDb()
+      .selectFrom("provider_plans")
+      .selectAll()
+      .orderBy("provider", "asc")
+      .execute();
+    return rows.map(rowToPlan);
+  }
+
   const rows = getDb()
     .prepare<PlanRow>(
       `SELECT connection_id, provider, dimensions_json, source, updated_at
@@ -114,14 +141,37 @@ export function listPlans(): ProviderPlan[] {
  * @param dimensions   Array of QuotaDimension objects.
  * @param source       "auto" = detected at runtime; "manual" = operator config.
  */
-export function upsertPlan(
+export async function upsertPlan(
   connectionId: string,
   provider: string,
   dimensions: QuotaDimension[],
   source: "auto" | "manual"
-): void {
+): Promise<void> {
   const now = new Date().toISOString();
   const dimensionsJson = JSON.stringify(dimensions);
+
+  if (isPostgres()) {
+    await ensurePostgresBootstrap();
+    await getKyselyDb()
+      .insertInto("provider_plans")
+      .values({
+        connection_id: connectionId,
+        provider,
+        dimensions_json: dimensionsJson,
+        source,
+        updated_at: now,
+      })
+      .onConflict((oc) =>
+        oc.column("connection_id").doUpdateSet({
+          provider,
+          dimensions_json: dimensionsJson,
+          source,
+          updated_at: now,
+        })
+      )
+      .execute();
+    return;
+  }
 
   getDb()
     .prepare(
@@ -141,7 +191,16 @@ export function upsertPlan(
  * Delete the plan for a connection (clears override, falls back to auto/catalog).
  * Returns true if a row was deleted, false if not found.
  */
-export function deletePlan(connectionId: string): boolean {
+export async function deletePlan(connectionId: string): Promise<boolean> {
+  if (isPostgres()) {
+    await ensurePostgresBootstrap();
+    const result = await getKyselyDb()
+      .deleteFrom("provider_plans")
+      .where("connection_id", "=", connectionId)
+      .executeTakeFirst();
+    return Number(result.numDeletedRows) > 0;
+  }
+
   const result = getDb()
     .prepare("DELETE FROM provider_plans WHERE connection_id = ?")
     .run(connectionId);
