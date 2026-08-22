@@ -1,5 +1,7 @@
 import { createHash, randomBytes, randomUUID } from "crypto";
 import { getDbInstance } from "./core";
+import { resolveDbDriverConfig } from "./driverConfig";
+import { ensurePostgresBootstrap, getKyselyDb } from "./kysely/client";
 import { type AccessScope, normalizeScope } from "../accessTokens/scopes";
 
 /**
@@ -10,6 +12,10 @@ import { type AccessScope, normalizeScope } from "../accessTokens/scopes";
  * Token format: `oma_live_<base64url(32 bytes)>`. The first chars are stored as
  * `token_prefix` so tokens can be listed/identified without revealing the secret.
  */
+
+function isPostgres(): boolean {
+  return resolveDbDriverConfig().driver === "postgres";
+}
 
 const TOKEN_RANDOM_BYTES = 32;
 const TOKEN_SECRET_PREFIX = "oma_live_";
@@ -83,15 +89,14 @@ function isExpired(expiresAt: string | null): boolean {
  * secret — the ONLY time the secret is available. Caller must show it once and
  * never store it server-side.
  */
-export function createAccessToken(input: {
+export async function createAccessToken(input: {
   name: string;
   scope?: AccessScope | string;
   expiresAt?: string | null;
-}): { record: AccessTokenRecord; secret: string } {
+}): Promise<{ record: AccessTokenRecord; secret: string }> {
   const name = (input.name ?? "").trim();
   if (!name) throw new Error("Access token name is required");
 
-  const db = getDbInstance();
   const scope = normalizeScope(input.scope, "read");
   const secret = `${TOKEN_SECRET_PREFIX}${randomBytes(TOKEN_RANDOM_BYTES).toString("base64url")}`;
   const id = `tok_${randomUUID()}`;
@@ -100,11 +105,29 @@ export function createAccessToken(input: {
   const createdAt = new Date().toISOString();
   const expiresAt = input.expiresAt ?? null;
 
-  db.prepare(
-    `INSERT INTO cli_access_tokens
-       (id, token_hash, token_prefix, name, scope, created_at, expires_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?)`
-  ).run(id, tokenHash, tokenPrefix, name, scope, createdAt, expiresAt);
+  if (isPostgres()) {
+    await ensurePostgresBootstrap();
+    const kdb = getKyselyDb();
+    await kdb
+      .insertInto("cli_access_tokens")
+      .values({
+        id,
+        token_hash: tokenHash,
+        token_prefix: tokenPrefix,
+        name,
+        scope,
+        created_at: createdAt,
+        expires_at: expiresAt,
+      })
+      .execute();
+  } else {
+    const db = getDbInstance();
+    db.prepare(
+      `INSERT INTO cli_access_tokens
+         (id, token_hash, token_prefix, name, scope, created_at, expires_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?)`
+    ).run(id, tokenHash, tokenPrefix, name, scope, createdAt, expiresAt);
+  }
 
   return {
     secret,
@@ -125,12 +148,40 @@ export function createAccessToken(input: {
  * Validate a presented secret. Returns the token's identity + scope, or null when
  * the secret is unknown, revoked, or expired. Touches `last_used_at` on success.
  */
-export function verifyAccessToken(secret: string | null | undefined): VerifiedAccessToken | null {
+export async function verifyAccessToken(
+  secret: string | null | undefined
+): Promise<VerifiedAccessToken | null> {
   if (!secret || typeof secret !== "string") return null;
+  const tokenHash = hashAccessToken(secret);
+
+  if (isPostgres()) {
+    await ensurePostgresBootstrap();
+    const kdb = getKyselyDb();
+    const row = await kdb
+      .selectFrom("cli_access_tokens")
+      .selectAll()
+      .where("token_hash", "=", tokenHash)
+      .executeTakeFirst();
+    if (!row) return null;
+    if (row.revoked_at) return null;
+    if (isExpired(row.expires_at)) return null;
+
+    try {
+      await kdb
+        .updateTable("cli_access_tokens")
+        .set({ last_used_at: new Date().toISOString() })
+        .where("id", "=", row.id)
+        .execute();
+    } catch {
+      /* non-fatal */
+    }
+
+    return { id: row.id, name: row.name, scope: normalizeScope(row.scope) };
+  }
+
   const db = getDbInstance();
-  const row = db
-    .prepare("SELECT * FROM cli_access_tokens WHERE token_hash = ?")
-    .get(hashAccessToken(secret)) as AccessTokenRow | undefined;
+  const row = db.prepare("SELECT * FROM cli_access_tokens WHERE token_hash = ?").get(tokenHash) as
+    AccessTokenRow | undefined;
   if (!row) return null;
   if (row.revoked_at) return null;
   if (isExpired(row.expires_at)) return null;
@@ -149,7 +200,18 @@ export function verifyAccessToken(secret: string | null | undefined): VerifiedAc
 }
 
 /** List all tokens (masked — never includes the secret or its hash). */
-export function listAccessTokens(): AccessTokenRecord[] {
+export async function listAccessTokens(): Promise<AccessTokenRecord[]> {
+  if (isPostgres()) {
+    await ensurePostgresBootstrap();
+    const kdb = getKyselyDb();
+    const rows = await kdb
+      .selectFrom("cli_access_tokens")
+      .selectAll()
+      .orderBy("created_at", "desc")
+      .execute();
+    return rows.map((r) => rowToRecord(r as unknown as AccessTokenRow));
+  }
+
   const db = getDbInstance();
   const rows = db
     .prepare("SELECT * FROM cli_access_tokens ORDER BY created_at DESC")
@@ -158,11 +220,21 @@ export function listAccessTokens(): AccessTokenRecord[] {
 }
 
 /** Fetch one token's masked record by id, or null. */
-export function getAccessToken(id: string): AccessTokenRecord | null {
+export async function getAccessToken(id: string): Promise<AccessTokenRecord | null> {
+  if (isPostgres()) {
+    await ensurePostgresBootstrap();
+    const kdb = getKyselyDb();
+    const row = await kdb
+      .selectFrom("cli_access_tokens")
+      .selectAll()
+      .where("id", "=", id)
+      .executeTakeFirst();
+    return row ? rowToRecord(row as unknown as AccessTokenRow) : null;
+  }
+
   const db = getDbInstance();
   const row = db.prepare("SELECT * FROM cli_access_tokens WHERE id = ?").get(id) as
-    | AccessTokenRow
-    | undefined;
+    AccessTokenRow | undefined;
   return row ? rowToRecord(row) : null;
 }
 
@@ -170,14 +242,28 @@ export function getAccessToken(id: string): AccessTokenRecord | null {
  * Revoke a token by id or by its display prefix. Idempotent: revoking an
  * already-revoked token is a no-op. Returns true when a row was newly revoked.
  */
-export function revokeAccessToken(idOrPrefix: string): boolean {
+export async function revokeAccessToken(idOrPrefix: string): Promise<boolean> {
   if (!idOrPrefix) return false;
+  const revokedAt = new Date().toISOString();
+
+  if (isPostgres()) {
+    await ensurePostgresBootstrap();
+    const kdb = getKyselyDb();
+    const result = await kdb
+      .updateTable("cli_access_tokens")
+      .set({ revoked_at: revokedAt })
+      .where((eb) => eb.or([eb("id", "=", idOrPrefix), eb("token_prefix", "=", idOrPrefix)]))
+      .where("revoked_at", "is", null)
+      .executeTakeFirst();
+    return Number(result.numUpdatedRows ?? 0) > 0;
+  }
+
   const db = getDbInstance();
   const res = db
     .prepare(
       `UPDATE cli_access_tokens SET revoked_at = ?
          WHERE (id = ? OR token_prefix = ?) AND revoked_at IS NULL`
     )
-    .run(new Date().toISOString(), idOrPrefix, idOrPrefix);
+    .run(revokedAt, idOrPrefix, idOrPrefix);
   return res.changes > 0;
 }
