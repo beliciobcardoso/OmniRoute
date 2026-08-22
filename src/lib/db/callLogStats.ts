@@ -1,4 +1,19 @@
 import { getDbInstance } from "./core";
+import { resolveDbDriverConfig } from "./driverConfig";
+import { ensurePostgresBootstrap, getKyselyDb } from "./kysely/client";
+
+function isPostgres(): boolean {
+  return resolveDbDriverConfig().driver === "postgres";
+}
+
+function toNum(value: unknown, fallback = 0): number {
+  if (typeof value === "number" && Number.isFinite(value)) return value;
+  if (typeof value === "string" && value.trim()) {
+    const parsed = Number(value);
+    return Number.isFinite(parsed) ? parsed : fallback;
+  }
+  return fallback;
+}
 
 /**
  * Aggregation queries over `call_logs` extracted from route handlers.
@@ -8,6 +23,13 @@ import { getDbInstance } from "./core";
  * can delegate. Read-only aggregation; no writes.
  *
  * Sliced out of #3500 (call_logs cluster).
+ *
+ * getFallbackStats stays SQLite-only/synchronous: it shares the dynamic
+ * whereClause/named-@param convention used throughout the much larger
+ * usageAnalytics.ts query cluster (also not yet converted), and the two need
+ * a single, consistent WHERE-clause translation strategy for Postgres rather
+ * than two independent ad-hoc ones. Deferred to when usageAnalytics.ts is
+ * converted.
  */
 
 // ---------------------------------------------------------------------------
@@ -51,14 +73,77 @@ export interface SearchProviderCountRow {
 }
 
 // ---------------------------------------------------------------------------
-// /api/provider-metrics — aggregate per-provider stats
+// /api/provider-metrics — per-provider success/latency/error aggregates
 // ---------------------------------------------------------------------------
 
 /**
- * Returns one row per provider with call-level aggregates plus last-status
- * subselects. Excludes rows where provider is NULL or '-'.
+ * Per-provider request metrics: totals, success count, avg latency, and the
+ * most recent request/error status+timestamp (via correlated subqueries).
  */
-export function getProviderMetrics(): ProviderMetricRow[] {
+export async function getProviderMetrics(): Promise<ProviderMetricRow[]> {
+  if (isPostgres()) {
+    await ensurePostgresBootstrap();
+    const kdb = getKyselyDb();
+    const { sql } = await import("kysely");
+    const result = await sql<{
+      provider: string;
+      totalRequests: number | string;
+      totalSuccesses: number | string;
+      avgLatencyMs: number | string | null;
+      lastRequestAt: string | null;
+      lastErrorAt: string | null;
+      lastStatus: number | null;
+      lastErrorStatus: number | null;
+    }>`
+      SELECT
+        c.provider,
+        COUNT(*) as "totalRequests",
+        SUM(CASE WHEN status >= 200 AND status < 400 THEN 1 ELSE 0 END) as "totalSuccesses",
+        ROUND(AVG(duration)) as "avgLatencyMs",
+        MAX(timestamp) as "lastRequestAt",
+        MAX(
+          CASE
+            WHEN (status IS NOT NULL AND (status < 200 OR status >= 400))
+              OR error_summary IS NOT NULL
+            THEN timestamp
+            ELSE NULL
+          END
+        ) as "lastErrorAt",
+        (
+          SELECT c2.status
+          FROM call_logs c2
+          WHERE c2.provider = c.provider
+          ORDER BY c2.timestamp DESC, c2.id DESC
+          LIMIT 1
+        ) as "lastStatus",
+        (
+          SELECT c3.status
+          FROM call_logs c3
+          WHERE c3.provider = c.provider
+            AND (
+              (c3.status IS NOT NULL AND (c3.status < 200 OR c3.status >= 400))
+              OR c3.error_summary IS NOT NULL
+            )
+          ORDER BY c3.timestamp DESC, c3.id DESC
+          LIMIT 1
+        ) as "lastErrorStatus"
+      FROM call_logs c
+      WHERE c.provider IS NOT NULL AND c.provider != '-'
+      GROUP BY c.provider
+    `.execute(kdb);
+
+    return result.rows.map((r) => ({
+      provider: r.provider,
+      totalRequests: toNum(r.totalRequests),
+      totalSuccesses: toNum(r.totalSuccesses),
+      avgLatencyMs: toNum(r.avgLatencyMs),
+      lastRequestAt: r.lastRequestAt,
+      lastErrorAt: r.lastErrorAt,
+      lastStatus: r.lastStatus,
+      lastErrorStatus: r.lastErrorStatus,
+    }));
+  }
+
   const db = getDbInstance();
   return db
     .prepare(
@@ -108,7 +193,27 @@ export function getProviderMetrics(): ProviderMetricRow[] {
 /**
  * Per-provider request count and average latency for search requests.
  */
-export function getSearchProviderStats(): SearchProviderStatRow[] {
+export async function getSearchProviderStats(): Promise<SearchProviderStatRow[]> {
+  if (isPostgres()) {
+    await ensurePostgresBootstrap();
+    const kdb = getKyselyDb();
+    const rows = await kdb
+      .selectFrom("call_logs")
+      .select((eb) => [
+        "provider",
+        eb.fn.countAll().as("requests"),
+        eb.fn<number>("round", [eb.fn.avg("duration")]).as("avg_latency_ms"),
+      ])
+      .where("request_type", "=", "search")
+      .groupBy("provider")
+      .execute();
+    return rows.map((r) => ({
+      provider: String(r.provider),
+      requests: toNum(r.requests),
+      avg_latency_ms: toNum(r.avg_latency_ms),
+    }));
+  }
+
   const db = getDbInstance();
   return db
     .prepare(
@@ -126,7 +231,24 @@ export function getSearchProviderStats(): SearchProviderStatRow[] {
 /**
  * Most recent 10 search entries (request_summary + provider + timestamp).
  */
-export function getRecentSearchLogs(): SearchRecentRow[] {
+export async function getRecentSearchLogs(): Promise<SearchRecentRow[]> {
+  if (isPostgres()) {
+    await ensurePostgresBootstrap();
+    const kdb = getKyselyDb();
+    const rows = await kdb
+      .selectFrom("call_logs")
+      .select(["request_summary", "provider", "timestamp"])
+      .where("request_type", "=", "search")
+      .orderBy("timestamp", "desc")
+      .limit(10)
+      .execute();
+    return rows.map((r) => ({
+      request_summary: r.request_summary,
+      provider: r.provider ?? "",
+      timestamp: r.timestamp ?? "",
+    }));
+  }
+
   const db = getDbInstance();
   return db
     .prepare(
@@ -149,7 +271,38 @@ export function getRecentSearchLogs(): SearchRecentRow[] {
  * Single-pass scalar aggregations for all search entries since `todayIso`.
  * `todayIso` is the ISO-8601 UTC start-of-day string used for the "today" count.
  */
-export function getSearchAggregateStats(todayIso: string): SearchAggregateStats {
+export async function getSearchAggregateStats(todayIso: string): Promise<SearchAggregateStats> {
+  if (isPostgres()) {
+    await ensurePostgresBootstrap();
+    const kdb = getKyselyDb();
+    const { sql } = await import("kysely");
+    const result = await sql<{
+      total: number | string;
+      today: number | string;
+      errors: number | string;
+      avg_duration: number | string | null;
+      cached: number | string;
+    }>`
+      SELECT
+        COUNT(*) as total,
+        COALESCE(SUM(CASE WHEN timestamp >= ${todayIso} THEN 1 ELSE 0 END), 0) as today,
+        COALESCE(SUM(CASE WHEN status >= 400 OR error_summary IS NOT NULL THEN 1 ELSE 0 END), 0) as errors,
+        AVG(CASE WHEN duration > 0 THEN duration END) as avg_duration,
+        COALESCE(SUM(CASE WHEN duration > 0 AND duration < 5 THEN 1 ELSE 0 END), 0) as cached
+      FROM call_logs
+      WHERE request_type = 'search'
+    `.execute(kdb);
+    const row = result.rows[0];
+    if (!row) return { total: 0, today: 0, errors: 0, avg_duration: null, cached: 0 };
+    return {
+      total: toNum(row.total),
+      today: toNum(row.today),
+      errors: toNum(row.errors),
+      avg_duration: row.avg_duration === null ? null : toNum(row.avg_duration),
+      cached: toNum(row.cached),
+    };
+  }
+
   const db = getDbInstance();
   const row = db
     .prepare(
@@ -169,7 +322,20 @@ export function getSearchAggregateStats(todayIso: string): SearchAggregateStats 
 /**
  * Per-provider request count for search entries, ordered by count descending.
  */
-export function getSearchProviderCounts(): SearchProviderCountRow[] {
+export async function getSearchProviderCounts(): Promise<SearchProviderCountRow[]> {
+  if (isPostgres()) {
+    await ensurePostgresBootstrap();
+    const kdb = getKyselyDb();
+    const rows = await kdb
+      .selectFrom("call_logs")
+      .select((eb) => ["provider", eb.fn.countAll().as("cnt")])
+      .where("request_type", "=", "search")
+      .groupBy("provider")
+      .orderBy("cnt", "desc")
+      .execute();
+    return rows.map((r) => ({ provider: String(r.provider), cnt: toNum(r.cnt) }));
+  }
+
   const db = getDbInstance();
   return db
     .prepare(
@@ -193,6 +359,9 @@ export interface FallbackStatsRow {
 
 /**
  * Scalar fallback-rate stats over `call_logs` for the usage analytics endpoint.
+ *
+ * SQLite-only — see module docstring (shares usageAnalytics.ts's dynamic
+ * whereClause/@param convention, deferred to that module's conversion).
  *
  * @param whereClause - SQL WHERE clause (may be empty string) using the same
  *                      named params as the usage_history queries.
