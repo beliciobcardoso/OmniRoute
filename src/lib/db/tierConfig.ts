@@ -2,9 +2,15 @@ import { getDbInstance } from "./core";
 import type { TierConfig } from "../../../open-sse/services/tierTypes";
 import { validateTierConfig, DEFAULT_TIER_CONFIG } from "../../../open-sse/services/tierConfig";
 import { defaultLogger as log } from "@omniroute/open-sse/utils/logger";
+import { resolveDbDriverConfig } from "./driverConfig";
+import { ensurePostgresBootstrap, getKyselyDb } from "./kysely/client";
 
 const TABLE = "tier_config";
 const CORRUPTED_VALUE_PREVIEW_LEN = 200;
+
+function isPostgres(): boolean {
+  return resolveDbDriverConfig().driver === "postgres";
+}
 
 export function initTierConfigTable(): void {
   const db = getDbInstance();
@@ -17,9 +23,21 @@ export function initTierConfigTable(): void {
   `);
 }
 
-export function saveTierConfig(config: TierConfig): void {
-  const db = getDbInstance();
+export async function saveTierConfig(config: TierConfig): Promise<void> {
   const serialized = JSON.stringify(config);
+
+  if (isPostgres()) {
+    await ensurePostgresBootstrap();
+    const now = new Date().toISOString();
+    await getKyselyDb()
+      .insertInto("tier_config")
+      .values({ key: "tier_config", value: serialized, updated_at: now })
+      .onConflict((oc) => oc.column("key").doUpdateSet({ value: serialized, updated_at: now }))
+      .execute();
+    return;
+  }
+
+  const db = getDbInstance();
   db.prepare(
     `INSERT OR REPLACE INTO ${TABLE} (key, value, updated_at) VALUES ('tier_config', ?, datetime('now'))`
   ).run(serialized);
@@ -50,22 +68,33 @@ function previewCorruptedValue(value: unknown): string {
  * The caller (`loadTierConfig()`) then falls back to `DEFAULT_TIER_CONFIG`,
  * so a corrupted row never silently feeds invalid pricing into the router.
  */
-export function loadTierConfigFromDb(): TierConfig | null {
-  const db = getDbInstance();
-  const row = db.prepare(`SELECT value FROM ${TABLE} WHERE key = 'tier_config'`).get() as
-    | { value: string }
-    | undefined;
-  if (!row) return null;
+export async function loadTierConfigFromDb(): Promise<TierConfig | null> {
+  let raw: string | undefined;
 
-  const raw = row.value;
+  if (isPostgres()) {
+    await ensurePostgresBootstrap();
+    const row = await getKyselyDb()
+      .selectFrom("tier_config")
+      .select("value")
+      .where("key", "=", "tier_config")
+      .executeTakeFirst();
+    if (!row) return null;
+    raw = row.value;
+  } else {
+    const db = getDbInstance();
+    const row = db.prepare(`SELECT value FROM ${TABLE} WHERE key = 'tier_config'`).get() as
+      { value: string } | undefined;
+    if (!row) return null;
+    raw = row.value;
+  }
   let parsed: unknown;
   try {
     parsed = JSON.parse(raw);
   } catch (err) {
-    log.warn(
-      { err: err instanceof Error ? err.message : String(err), value: previewCorruptedValue(raw) },
-      "tier_config JSON.parse failed; falling back to DEFAULT_TIER_CONFIG"
-    );
+    log.warn("TIER_CONFIG", "tier_config JSON.parse failed; falling back to DEFAULT_TIER_CONFIG", {
+      err: err instanceof Error ? err.message : String(err),
+      value: previewCorruptedValue(raw),
+    });
     return null;
   }
 
@@ -73,16 +102,17 @@ export function loadTierConfigFromDb(): TierConfig | null {
     return validateTierConfig(parsed);
   } catch (err) {
     log.warn(
+      "TIER_CONFIG",
+      "tier_config Zod validation failed; falling back to DEFAULT_TIER_CONFIG",
       {
         err: err instanceof Error ? err.message : String(err),
         value: previewCorruptedValue(raw),
-      },
-      "tier_config Zod validation failed; falling back to DEFAULT_TIER_CONFIG"
+      }
     );
     return null;
   }
 }
 
-export function loadTierConfig(): TierConfig {
-  return loadTierConfigFromDb() || DEFAULT_TIER_CONFIG;
+export async function loadTierConfig(): Promise<TierConfig> {
+  return (await loadTierConfigFromDb()) || DEFAULT_TIER_CONFIG;
 }
