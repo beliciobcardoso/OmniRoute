@@ -33,19 +33,19 @@ describe("db/interceptionRules — per-model interception rules (#3384)", () => 
     fs.rmSync(tmpDir, { recursive: true, force: true });
   });
 
-  it("returns null for an unconfigured provider", () => {
+  it("returns null for an unconfigured provider", async () => {
     assert.equal(getInterceptionRules("anthropic"), null);
   });
 
-  it("round-trips a provider-level rule via set/get", () => {
-    setInterceptionRules("anthropic", { interceptSearch: true, interceptFetch: false });
+  it("round-trips a provider-level rule via set/get", async () => {
+    await setInterceptionRules("anthropic", { interceptSearch: true, interceptFetch: false });
     const rules = getInterceptionRules("anthropic");
     assert.equal(rules?.interceptSearch, true);
     assert.equal(rules?.interceptFetch, false);
   });
 
-  it("round-trips a per-model override", () => {
-    setInterceptionRules("anthropic", {
+  it("round-trips a per-model override", async () => {
+    await setInterceptionRules("anthropic", {
       interceptSearch: false,
       models: { "claude-opus-4": { interceptSearch: true } },
     });
@@ -54,32 +54,32 @@ describe("db/interceptionRules — per-model interception rules (#3384)", () => 
     assert.equal(rules?.models?.["claude-opus-4"]?.interceptSearch, true);
   });
 
-  it("delete resets a provider back to unconfigured", () => {
-    setInterceptionRules("anthropic", { interceptSearch: true });
-    deleteInterceptionRules("anthropic");
+  it("delete resets a provider back to unconfigured", async () => {
+    await setInterceptionRules("anthropic", { interceptSearch: true });
+    await deleteInterceptionRules("anthropic");
     assert.equal(getInterceptionRules("anthropic"), null);
   });
 
-  it("invalidates the in-memory cache after a write", () => {
-    setInterceptionRules("openai", { interceptSearch: true });
+  it("invalidates the in-memory cache after a write", async () => {
+    await setInterceptionRules("openai", { interceptSearch: true });
     assert.equal(getInterceptionRules("openai")?.interceptSearch, true);
-    setInterceptionRules("openai", { interceptSearch: false });
+    await setInterceptionRules("openai", { interceptSearch: false });
     assert.equal(getInterceptionRules("openai")?.interceptSearch, false);
   });
 
   describe("resolveInterceptSearch — precedence", () => {
-    it("returns undefined when no rule is configured (caller falls back to bypass defaults)", () => {
+    it("returns undefined when no rule is configured (caller falls back to bypass defaults)", async () => {
       assert.equal(resolveInterceptSearch("anthropic", "claude-opus-4"), undefined);
     });
 
-    it("returns the provider-level rule when no model override exists", () => {
-      setInterceptionRules("anthropic", { interceptSearch: true });
+    it("returns the provider-level rule when no model override exists", async () => {
+      await setInterceptionRules("anthropic", { interceptSearch: true });
       assert.equal(resolveInterceptSearch("anthropic", "claude-opus-4"), true);
       assert.equal(resolveInterceptSearch("anthropic", "claude-haiku-4"), true);
     });
 
-    it("per-model rule overrides the provider-level rule", () => {
-      setInterceptionRules("anthropic", {
+    it("per-model rule overrides the provider-level rule", async () => {
+      await setInterceptionRules("anthropic", {
         interceptSearch: false,
         models: { "claude-opus-4": { interceptSearch: true } },
       });
@@ -87,7 +87,7 @@ describe("db/interceptionRules — per-model interception rules (#3384)", () => 
       assert.equal(resolveInterceptSearch("anthropic", "claude-haiku-4"), false);
     });
 
-    it("returns undefined for an empty/missing provider", () => {
+    it("returns undefined for an empty/missing provider", async () => {
       assert.equal(resolveInterceptSearch("", "claude-opus-4"), undefined);
       assert.equal(resolveInterceptSearch(null, "claude-opus-4"), undefined);
       assert.equal(resolveInterceptSearch(undefined, "claude-opus-4"), undefined);

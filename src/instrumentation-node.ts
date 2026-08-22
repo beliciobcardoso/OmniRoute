@@ -296,6 +296,9 @@ export async function registerNodejs(): Promise<void> {
     const { ensureParamFilterCacheLoaded } = await import("@/lib/db/paramFilters");
     await ensureParamFilterCacheLoaded();
 
+    const { ensureInterceptionRulesCacheLoaded } = await import("@/lib/db/interceptionRules");
+    await ensureInterceptionRulesCacheLoaded();
+
     const migration = await migrateCodexConnectionDefaultsFromLegacySettings();
     if (migration.migrated) {
       console.log(

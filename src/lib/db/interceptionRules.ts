@@ -6,9 +6,22 @@
  *
  * Resolution precedence (see resolveInterceptSearch): per-model rule > provider-level
  * rule > undefined (caller falls back to the existing native-bypass defaults).
+ *
+ * getInterceptionRules/resolveInterceptSearch are on the hot request path
+ * (called per chat request to decide native-bypass vs. interception) and must
+ * stay synchronous — see paramFilters.ts for the identical cache-preserving
+ * pattern this module follows. The cache is warmed asynchronously at startup
+ * (ensureInterceptionRulesCacheLoaded, called from src/instrumentation-node.ts)
+ * and refreshed after every write.
  */
 
 import { getDbInstance } from "./core";
+import { resolveDbDriverConfig } from "./driverConfig";
+import { ensurePostgresBootstrap, getKyselyDb } from "./kysely/client";
+
+function isPostgres(): boolean {
+  return resolveDbDriverConfig().driver === "postgres";
+}
 
 const NAMESPACE = "interception_rules";
 
@@ -38,10 +51,6 @@ export interface ProviderInterceptionRules {
 // ── Cache ───────────────────────────────────────────────────────────────────
 
 let rulesCache: Map<string, ProviderInterceptionRules> | null = null;
-
-function invalidateCache(): void {
-  rulesCache = null;
-}
 
 // ── Helpers ─────────────────────────────────────────────────────────────────
 
@@ -106,11 +115,21 @@ function toProviderInterceptionRules(raw: unknown): ProviderInterceptionRules | 
 
 // ── Read ────────────────────────────────────────────────────────────────────
 
-function readNamespace(namespace: string): Record<string, unknown> {
-  const db = getDbInstance();
-  const rows = db
-    .prepare("SELECT key, value FROM key_value WHERE namespace = ?")
-    .all(namespace) as Array<{ key: string; value: string }>;
+async function readNamespace(namespace: string): Promise<Record<string, unknown>> {
+  let rows: Array<{ key: string; value: string }>;
+
+  if (isPostgres()) {
+    await ensurePostgresBootstrap();
+    rows = (await getKyselyDb()
+      .selectFrom("key_value")
+      .select(["key", "value"])
+      .where("namespace", "=", namespace)
+      .execute()) as Array<{ key: string; value: string }>;
+  } else {
+    rows = getDbInstance()
+      .prepare("SELECT key, value FROM key_value WHERE namespace = ?")
+      .all(namespace) as Array<{ key: string; value: string }>;
+  }
 
   const values: Record<string, unknown> = {};
   for (const row of rows) {
@@ -119,8 +138,8 @@ function readNamespace(namespace: string): Record<string, unknown> {
   return values;
 }
 
-function loadAllRules(): Map<string, ProviderInterceptionRules> {
-  const raw = readNamespace(NAMESPACE);
+async function loadAllRules(): Promise<Map<string, ProviderInterceptionRules>> {
+  const raw = await readNamespace(NAMESPACE);
   const map = new Map<string, ProviderInterceptionRules>();
   for (const [key, value] of Object.entries(raw)) {
     const parsed = toProviderInterceptionRules(value);
@@ -129,29 +148,36 @@ function loadAllRules(): Map<string, ProviderInterceptionRules> {
   return map;
 }
 
-function loadRulesCached(): Map<string, ProviderInterceptionRules> {
-  if (rulesCache === null) {
-    rulesCache = loadAllRules();
-  }
+/**
+ * Warm (or re-warm) the in-memory cache from the DB. Call once at startup
+ * (src/instrumentation-node.ts) before serving traffic, and after every write
+ * in this module so the hot-path sync readers below see fresh data.
+ */
+export async function ensureInterceptionRulesCacheLoaded(): Promise<
+  Map<string, ProviderInterceptionRules>
+> {
+  rulesCache = await loadAllRules();
   return rulesCache;
+}
+
+function loadRulesCachedSync(): Map<string, ProviderInterceptionRules> {
+  return rulesCache ?? new Map();
 }
 
 // ── Public API ──────────────────────────────────────────────────────────────
 
 /** Get the interception rules for a single provider, or null if not configured. */
 export function getInterceptionRules(provider: string): ProviderInterceptionRules | null {
-  return toNormalizedString(provider) ? (loadRulesCached().get(provider) ?? null) : null;
+  return toNormalizedString(provider) ? (loadRulesCachedSync().get(provider) ?? null) : null;
 }
 
-/** Upsert the entire interception rule set for a provider. Invalidates the cache. */
-export function setInterceptionRules(provider: string, rules: ProviderInterceptionRules): void {
+/** Upsert the entire interception rule set for a provider. Refreshes the cache. */
+export async function setInterceptionRules(
+  provider: string,
+  rules: ProviderInterceptionRules
+): Promise<void> {
   const normalizedProvider = toNormalizedString(provider);
   if (!normalizedProvider) return;
-
-  const db = getDbInstance();
-  const stmt = db.prepare(
-    "INSERT OR REPLACE INTO key_value (namespace, key, value) VALUES (?, ?, ?)"
-  );
 
   const normalized: ProviderInterceptionRules = {
     interceptSearch: rules.interceptSearch,
@@ -160,22 +186,43 @@ export function setInterceptionRules(provider: string, rules: ProviderIntercepti
     fetchProxyUrl: rules.fetchProxyUrl,
     models: rules.models && Object.keys(rules.models).length > 0 ? rules.models : undefined,
   };
+  const value = JSON.stringify(normalized);
 
-  stmt.run(NAMESPACE, normalizedProvider, JSON.stringify(normalized));
-  invalidateCache();
+  if (isPostgres()) {
+    await ensurePostgresBootstrap();
+    await getKyselyDb()
+      .insertInto("key_value")
+      .values({ namespace: NAMESPACE, key: normalizedProvider, value })
+      .onConflict((oc) => oc.columns(["namespace", "key"]).doUpdateSet({ value }))
+      .execute();
+  } else {
+    getDbInstance()
+      .prepare("INSERT OR REPLACE INTO key_value (namespace, key, value) VALUES (?, ?, ?)")
+      .run(NAMESPACE, normalizedProvider, value);
+  }
+
+  await ensureInterceptionRulesCacheLoaded();
 }
 
 /** Delete the interception rules for a provider. Resets that provider to default behavior. */
-export function deleteInterceptionRules(provider: string): void {
+export async function deleteInterceptionRules(provider: string): Promise<void> {
   const normalizedProvider = toNormalizedString(provider);
   if (!normalizedProvider) return;
 
-  const db = getDbInstance();
-  db.prepare("DELETE FROM key_value WHERE namespace = ? AND key = ?").run(
-    NAMESPACE,
-    normalizedProvider
-  );
-  invalidateCache();
+  if (isPostgres()) {
+    await ensurePostgresBootstrap();
+    await getKyselyDb()
+      .deleteFrom("key_value")
+      .where("namespace", "=", NAMESPACE)
+      .where("key", "=", normalizedProvider)
+      .execute();
+  } else {
+    getDbInstance()
+      .prepare("DELETE FROM key_value WHERE namespace = ? AND key = ?")
+      .run(NAMESPACE, normalizedProvider);
+  }
+
+  await ensureInterceptionRulesCacheLoaded();
 }
 
 /**
