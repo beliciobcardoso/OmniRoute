@@ -75,9 +75,10 @@ export async function GET(request: Request) {
 
     // #6328: honor hidePaidModels at the export boundary so backup files
     // cannot silently smuggle paid model ids back in on import.
-    const combos = rawSettings.hidePaidModels === true
-      ? filterPaidComboSteps(combosRaw as Array<{ models?: unknown }>)
-      : combosRaw;
+    const combos =
+      rawSettings.hidePaidModels === true
+        ? filterPaidComboSteps(combosRaw as Array<{ models?: unknown }>)
+        : combosRaw;
 
     const exportData: Record<string, unknown> = {
       settings: safeSettings,
@@ -97,9 +98,9 @@ export async function GET(request: Request) {
     // These tables (usage_history, domain_cost_history, domain_budgets) can contain
     // thousands of rows and make the config backup grow to many MBs.
     if (includeHistory) {
-      exportData.usageHistory = getAllUsageHistory();
-      exportData.domainCostHistory = getAllDomainCostHistory();
-      exportData.domainBudgets = getAllDomainBudgets();
+      exportData.usageHistory = await getAllUsageHistory();
+      exportData.domainCostHistory = await getAllDomainCostHistory();
+      exportData.domainBudgets = await getAllDomainBudgets();
     }
 
     return new NextResponse(JSON.stringify(exportData, null, 2), {

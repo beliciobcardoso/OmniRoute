@@ -26,7 +26,7 @@ import {
 // ── 1. buildUnifiedSource — pure branching ───────────────────────────────────
 
 describe("usageAnalytics/sources — buildUnifiedSource", () => {
-  it("includes the daily_usage_summary leg for a wide window with no api-key filter", () => {
+  it("includes the daily_usage_summary leg for a wide window with no api-key filter", async () => {
     const { unifiedSource, unifiedParams } = buildUnifiedSource({
       sinceIso: "2024-06-01T00:00:00.000Z",
       untilIso: null,
@@ -44,7 +44,7 @@ describe("usageAnalytics/sources — buildUnifiedSource", () => {
     assert.equal(unifiedParams.rawCutoffDate, "2024-06-15");
   });
 
-  it("drops the aggregated leg when an api-key filter is active (raw-only)", () => {
+  it("drops the aggregated leg when an api-key filter is active (raw-only)", async () => {
     const { unifiedSource, unifiedParams } = buildUnifiedSource({
       sinceIso: "2024-06-01T00:00:00.000Z",
       untilIso: null,
@@ -63,7 +63,7 @@ describe("usageAnalytics/sources — buildUnifiedSource", () => {
     assert.equal(unifiedParams.rawCutoff, undefined);
   });
 
-  it("buildPresetUnifiedSource returns the unifiedSource/unifiedParams shape", () => {
+  it("buildPresetUnifiedSource returns the unifiedSource/unifiedParams shape", async () => {
     const result = buildPresetUnifiedSource({
       sinceIso: null,
       untilIso: null,
@@ -113,7 +113,7 @@ describe("usageAnalytics.ts public API surface", () => {
     });
   }
 
-  it("loses no public runtime function in the split", () => {
+  it("loses no public runtime function in the split", async () => {
     const missing = expectedFns.filter((n) => typeof host[n] !== "function");
     assert.deepEqual(missing, [], `missing: ${missing.join(", ")}`);
   });

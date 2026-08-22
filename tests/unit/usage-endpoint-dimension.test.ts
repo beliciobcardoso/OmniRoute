@@ -1,7 +1,7 @@
 /**
  * Ported feature regression — decolua/9router#152 (thanks @toanalien).
  *
- * Covers the new `endpoint` column on usage_history + getEndpointUsageRows()
+ * Covers the new `endpoint` column on usage_history + await getEndpointUsageRows()
  * aggregation. Asserts: persistence round-trip, NULL → 'unknown' folding,
  * per-endpoint grouping, sinceIso filter.
  */
@@ -29,7 +29,7 @@ test.beforeEach(async () => {
   await resetStorage();
 });
 
-test.after(() => {
+test.after(async () => {
   core.resetDbInstance();
   fs.rmSync(TEST_DATA_DIR, { recursive: true, force: true });
 });
@@ -63,7 +63,7 @@ test("saveRequestUsage persists endpoint and getEndpointUsageRows groups by endp
     endpoint: "/v1/messages",
   });
 
-  const rows = usageAnalytics.getEndpointUsageRows();
+  const rows = await usageAnalytics.getEndpointUsageRows();
   const byKey = new Map(rows.map((r) => [`${r.endpoint}|${r.provider}|${r.model}`, r]));
 
   const chat = byKey.get("/v1/chat/completions|openai|gpt-4o-mini");
@@ -89,7 +89,7 @@ test("getEndpointUsageRows folds NULL endpoint into 'unknown' bucket (backward c
     timestamp: new Date().toISOString(),
   });
 
-  const rows = usageAnalytics.getEndpointUsageRows();
+  const rows = await usageAnalytics.getEndpointUsageRows();
   const unknown = rows.find((r) => r.endpoint === "unknown");
   assert.ok(unknown, "NULL endpoint should fold into 'unknown'");
   assert.equal(unknown.requests, 1);
@@ -118,7 +118,7 @@ test("getEndpointUsageRows honors sinceIso filter", async () => {
   });
 
   const sinceIso = new Date(Date.now() - 60 * 60 * 1000).toISOString();
-  const rows = usageAnalytics.getEndpointUsageRows({ sinceIso });
+  const rows = await usageAnalytics.getEndpointUsageRows({ sinceIso });
   const chat = rows.find((r) => r.endpoint === "/v1/chat/completions");
   assert.ok(chat);
   assert.equal(chat.requests, 1, "only the recent row should be counted");

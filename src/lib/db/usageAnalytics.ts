@@ -11,6 +11,75 @@
 
 import { getDbInstance } from "./core";
 import type { AnalyticsParams } from "./usageAnalytics/sources";
+import { CompiledQuery } from "kysely";
+import { resolveDbDriverConfig } from "./driverConfig";
+import { ensurePostgresBootstrap, getKyselyDb } from "./kysely/client";
+
+function isPostgres(): boolean {
+  return resolveDbDriverConfig().driver === "postgres";
+}
+
+// These queries are hand-written SQL strings executed via better-sqlite3's
+// named-parameter binding (`@name`). Postgres has no named-parameter syntax —
+// only positional `$1, $2, ...` — so this rewrites `@name` tokens into
+// positional placeholders (reusing the same `$N` for repeated names) and
+// returns a values array in matching order. It also swaps the two SQLite-only
+// expressions this module actually uses: `DATE(timestamp)` (timestamp is
+// stored as an ISO-8601 TEXT column, so `::date` is the direct Postgres
+// equivalent) and `strftime('%w', timestamp)` (ISO day-of-week, replicated via
+// EXTRACT(DOW ...) cast back to text so callers see the same "0".."6" shape).
+// Every other expression in this file (LOWER, COALESCE, NULLIF, CASE WHEN,
+// COUNT/SUM/AVG, JOIN) is already portable ANSI SQL, so no other rewriting is
+// needed — the query text is otherwise byte-identical across both dialects.
+//
+// One more dialect quirk: every result column here is aliased camelCase
+// (`as totalRequests`), and several queries also reference that alias again
+// in GROUP BY / ORDER BY (and, for getWeeklyPatternRows, an outer SELECT
+// over an inner subquery) — all unquoted. SQLite preserves identifiers
+// verbatim; Postgres folds unquoted identifiers to lowercase, so an alias
+// defined as `"totalRequests"` (once quoted) would no longer match a bare
+// `totalRequests` reference elsewhere in the same query ("column
+// totalrequests does not exist"). So: collect every camelCase alias
+// introduced via `as <alias>`, then quote *every* occurrence of that exact
+// word throughout the text — the definition and every later reference alike.
+function toPostgresAnalyticsSql(
+  sqlText: string,
+  params: Record<string, unknown>
+): { text: string; values: unknown[] } {
+  let text = sqlText
+    .replace(/DATE\(timestamp\)/g, "(timestamp)::date")
+    .replace(/strftime\('%w',\s*timestamp\)/g, "EXTRACT(DOW FROM (timestamp)::timestamptz)::text");
+
+  const camelAliases = new Set<string>();
+  for (const m of text.matchAll(/\bas\s+([A-Za-z_][A-Za-z0-9_]*)/g)) {
+    if (/[A-Z]/.test(m[1])) camelAliases.add(m[1]);
+  }
+  for (const alias of camelAliases) {
+    text = text.replace(new RegExp(`\\b${alias}\\b`, "g"), `"${alias}"`);
+  }
+
+  const values: unknown[] = [];
+  const seen = new Map<string, number>();
+  text = text.replace(/@([a-zA-Z_][a-zA-Z0-9_]*)/g, (_match, name: string) => {
+    if (seen.has(name)) return `$${seen.get(name)}`;
+    values.push(params[name]);
+    const idx = values.length;
+    seen.set(name, idx);
+    return `$${idx}`;
+  });
+  return { text, values };
+}
+
+async function runAnalyticsQueryPg<T>(
+  sqlText: string,
+  params: Record<string, unknown> = {}
+): Promise<T[]> {
+  await ensurePostgresBootstrap();
+  const kdb = getKyselyDb();
+  const { text, values } = toPostgresAnalyticsSql(sqlText, params);
+  const result = await kdb.executeQuery(CompiledQuery.raw(text, values));
+  return result.rows as T[];
+}
 
 export { buildUnifiedSource, buildPresetUnifiedSource } from "./usageAnalytics/sources";
 export type {
@@ -43,11 +112,11 @@ export interface UsageSummaryRow {
  * @param unifiedSource - Pre-built subquery string (UNION of raw + aggregated rows).
  * @param params        - Named params referenced inside `unifiedSource`.
  */
-export function getUsageSummary(unifiedSource: string, params: AnalyticsParams): UsageSummaryRow {
-  const db = getDbInstance();
-  const row = db
-    .prepare(
-      `
+export async function getUsageSummary(
+  unifiedSource: string,
+  params: AnalyticsParams
+): Promise<UsageSummaryRow> {
+  const sqlText = `
       SELECT
         COUNT(*) as totalRequests,
         COALESCE(SUM(tokens_input), 0) as promptTokens,
@@ -61,9 +130,10 @@ export function getUsageSummary(unifiedSource: string, params: AnalyticsParams):
         COALESCE(MIN(timestamp), '') as firstRequest,
         COALESCE(MAX(timestamp), '') as lastRequest
       FROM ${unifiedSource} AS _u
-    `
-    )
-    .get(params) as UsageSummaryRow | undefined;
+    `;
+  const row = isPostgres()
+    ? (await runAnalyticsQueryPg<UsageSummaryRow>(sqlText, params))[0]
+    : (getDbInstance().prepare(sqlText).get(params) as UsageSummaryRow | undefined);
   return (
     row ?? {
       totalRequests: 0,
@@ -94,11 +164,11 @@ export interface DailyUsageRow {
 /**
  * Daily request + token counts aggregated from the unified source CTE.
  */
-export function getDailyUsage(unifiedSource: string, params: AnalyticsParams): DailyUsageRow[] {
-  const db = getDbInstance();
-  return db
-    .prepare(
-      `
+export async function getDailyUsage(
+  unifiedSource: string,
+  params: AnalyticsParams
+): Promise<DailyUsageRow[]> {
+  const sqlText = `
       SELECT
         DATE(timestamp) as date,
         COUNT(*) as requests,
@@ -108,9 +178,9 @@ export function getDailyUsage(unifiedSource: string, params: AnalyticsParams): D
       FROM ${unifiedSource} AS _u
       GROUP BY DATE(timestamp)
       ORDER BY date ASC
-    `
-    )
-    .all(params) as DailyUsageRow[];
+    `;
+  if (isPostgres()) return runAnalyticsQueryPg<DailyUsageRow>(sqlText, params);
+  return getDbInstance().prepare(sqlText).all(params) as DailyUsageRow[];
 }
 
 // ---------------------------------------------------------------------------
@@ -130,11 +200,11 @@ export interface DailyCostRow {
 /**
  * Per-day, per-provider, per-model token breakdown for cost calculation.
  */
-export function getDailyCostRows(unifiedSource: string, params: AnalyticsParams): DailyCostRow[] {
-  const db = getDbInstance();
-  return db
-    .prepare(
-      `
+export async function getDailyCostRows(
+  unifiedSource: string,
+  params: AnalyticsParams
+): Promise<DailyCostRow[]> {
+  const sqlText = `
       SELECT
         DATE(timestamp) as date,
         LOWER(provider) as provider,
@@ -148,9 +218,9 @@ export function getDailyCostRows(unifiedSource: string, params: AnalyticsParams)
       FROM ${unifiedSource} AS _u
       GROUP BY DATE(timestamp), LOWER(provider), LOWER(model), serviceTier
       ORDER BY date ASC
-    `
-    )
-    .all(params) as DailyCostRow[];
+    `;
+  if (isPostgres()) return runAnalyticsQueryPg<DailyCostRow>(sqlText, params);
+  return getDbInstance().prepare(sqlText).all(params) as DailyCostRow[];
 }
 
 // ---------------------------------------------------------------------------
@@ -168,11 +238,11 @@ export interface HeatmapRow {
  * @param heatmapConditions - Array of SQL condition strings (combined with AND).
  * @param params            - Named params referenced inside the conditions.
  */
-export function getHeatmapRows(heatmapConditions: string[], params: AnalyticsParams): HeatmapRow[] {
-  const db = getDbInstance();
-  return db
-    .prepare(
-      `
+export async function getHeatmapRows(
+  heatmapConditions: string[],
+  params: AnalyticsParams
+): Promise<HeatmapRow[]> {
+  const sqlText = `
       SELECT
         DATE(timestamp) as date,
         COALESCE(SUM(tokens_input + tokens_output), 0) as totalTokens
@@ -180,9 +250,9 @@ export function getHeatmapRows(heatmapConditions: string[], params: AnalyticsPar
       WHERE ${heatmapConditions.join(" AND ")}
       GROUP BY DATE(timestamp)
       ORDER BY date ASC
-    `
-    )
-    .all(params) as HeatmapRow[];
+    `;
+  if (isPostgres()) return runAnalyticsQueryPg<HeatmapRow>(sqlText, params);
+  return getDbInstance().prepare(sqlText).all(params) as HeatmapRow[];
 }
 
 // ---------------------------------------------------------------------------
@@ -206,11 +276,11 @@ export interface ModelUsageRow {
 /**
  * Per-model usage aggregates from the unified source CTE.
  */
-export function getModelUsageRows(unifiedSource: string, params: AnalyticsParams): ModelUsageRow[] {
-  const db = getDbInstance();
-  return db
-    .prepare(
-      `
+export async function getModelUsageRows(
+  unifiedSource: string,
+  params: AnalyticsParams
+): Promise<ModelUsageRow[]> {
+  const sqlText = `
       SELECT
         LOWER(model) as model,
         LOWER(provider) as provider,
@@ -228,9 +298,9 @@ export function getModelUsageRows(unifiedSource: string, params: AnalyticsParams
       FROM ${unifiedSource} AS _u
       GROUP BY LOWER(model), LOWER(provider), serviceTier
       ORDER BY requests DESC
-    `
-    )
-    .all(params) as ModelUsageRow[];
+    `;
+  if (isPostgres()) return runAnalyticsQueryPg<ModelUsageRow>(sqlText, params);
+  return getDbInstance().prepare(sqlText).all(params) as ModelUsageRow[];
 }
 
 // ---------------------------------------------------------------------------
@@ -249,14 +319,11 @@ export interface ProviderCostRow {
 /**
  * Per-provider, per-model token breakdown for provider cost calculation.
  */
-export function getProviderCostRows(
+export async function getProviderCostRows(
   unifiedSource: string,
   params: AnalyticsParams
-): ProviderCostRow[] {
-  const db = getDbInstance();
-  return db
-    .prepare(
-      `
+): Promise<ProviderCostRow[]> {
+  const sqlText = `
       SELECT
         LOWER(provider) as provider,
         LOWER(model) as model,
@@ -268,9 +335,9 @@ export function getProviderCostRows(
         COALESCE(SUM(tokens_reasoning), 0) as reasoningTokens
       FROM ${unifiedSource} AS _u
       GROUP BY LOWER(provider), LOWER(model), serviceTier
-    `
-    )
-    .all(params) as ProviderCostRow[];
+    `;
+  if (isPostgres()) return runAnalyticsQueryPg<ProviderCostRow>(sqlText, params);
+  return getDbInstance().prepare(sqlText).all(params) as ProviderCostRow[];
 }
 
 // ---------------------------------------------------------------------------
@@ -288,14 +355,11 @@ export interface ProviderUsageRow {
 /**
  * Per-provider usage aggregates from the unified source CTE.
  */
-export function getProviderUsageRows(
+export async function getProviderUsageRows(
   unifiedSource: string,
   params: AnalyticsParams
-): ProviderUsageRow[] {
-  const db = getDbInstance();
-  return db
-    .prepare(
-      `
+): Promise<ProviderUsageRow[]> {
+  const sqlText = `
       SELECT
         LOWER(provider) as provider,
         COUNT(*) as requests,
@@ -307,9 +371,9 @@ export function getProviderUsageRows(
       FROM ${unifiedSource} AS _u
       GROUP BY LOWER(provider)
       ORDER BY requests DESC
-    `
-    )
-    .all(params) as ProviderUsageRow[];
+    `;
+  if (isPostgres()) return runAnalyticsQueryPg<ProviderUsageRow>(sqlText, params);
+  return getDbInstance().prepare(sqlText).all(params) as ProviderUsageRow[];
 }
 
 // ---------------------------------------------------------------------------
@@ -334,11 +398,11 @@ export interface AccountCostRow {
  *                      prefixed with `usage_history.` by the caller.
  * @param params      - Named params referenced inside `whereClause`.
  */
-export function getAccountCostRows(whereClause: string, params: AnalyticsParams): AccountCostRow[] {
-  const db = getDbInstance();
-  return db
-    .prepare(
-      `
+export async function getAccountCostRows(
+  whereClause: string,
+  params: AnalyticsParams
+): Promise<AccountCostRow[]> {
+  const sqlText = `
       SELECT
         COALESCE(NULLIF(c.display_name, ''), NULLIF(c.email, ''), NULLIF(c.name, ''), usage_history.connection_id, 'unknown') as account,
         LOWER(usage_history.provider) as provider,
@@ -353,9 +417,9 @@ export function getAccountCostRows(whereClause: string, params: AnalyticsParams)
       LEFT JOIN provider_connections c ON c.id = usage_history.connection_id
       ${whereClause}
       GROUP BY account, LOWER(usage_history.provider), LOWER(usage_history.model), serviceTier
-    `
-    )
-    .all(params) as AccountCostRow[];
+    `;
+  if (isPostgres()) return runAnalyticsQueryPg<AccountCostRow>(sqlText, params);
+  return getDbInstance().prepare(sqlText).all(params) as AccountCostRow[];
 }
 
 // ---------------------------------------------------------------------------
@@ -377,14 +441,11 @@ export interface AccountUsageRow {
  *                      prefixed with `usage_history.` by the caller.
  * @param params      - Named params referenced inside `whereClause`.
  */
-export function getAccountUsageRows(
+export async function getAccountUsageRows(
   whereClause: string,
   params: AnalyticsParams
-): AccountUsageRow[] {
-  const db = getDbInstance();
-  return db
-    .prepare(
-      `
+): Promise<AccountUsageRow[]> {
+  const sqlText = `
       SELECT
         COALESCE(NULLIF(c.display_name, ''), NULLIF(c.email, ''), NULLIF(c.name, ''), usage_history.connection_id, 'unknown') as account,
         COUNT(usage_history.id) as requests,
@@ -399,9 +460,9 @@ export function getAccountUsageRows(
       GROUP BY account
       ORDER BY requests DESC
       LIMIT 50
-    `
-    )
-    .all(params) as AccountUsageRow[];
+    `;
+  if (isPostgres()) return runAnalyticsQueryPg<AccountUsageRow>(sqlText, params);
+  return getDbInstance().prepare(sqlText).all(params) as AccountUsageRow[];
 }
 
 // ---------------------------------------------------------------------------
@@ -427,14 +488,11 @@ export interface ApiKeyUsageRow {
  * @param apiKeyWhereClause - Full WHERE clause including api_key presence guard.
  * @param params            - Named params referenced inside `apiKeyWhereClause`.
  */
-export function getApiKeyUsageRows(
+export async function getApiKeyUsageRows(
   apiKeyWhereClause: string,
   params: AnalyticsParams
-): ApiKeyUsageRow[] {
-  const db = getDbInstance();
-  return db
-    .prepare(
-      `
+): Promise<ApiKeyUsageRow[]> {
+  const sqlText = `
       SELECT
         NULLIF(api_key_id, '') as apiKeyId,
         COALESCE(NULLIF(api_key_id, ''), NULLIF(api_key_name, ''), 'unknown') as apiKeyGroupKey,
@@ -451,9 +509,9 @@ export function getApiKeyUsageRows(
       FROM usage_history
       ${apiKeyWhereClause}
       GROUP BY COALESCE(NULLIF(api_key_id, ''), NULLIF(api_key_name, ''), 'unknown'), NULLIF(api_key_id, ''), LOWER(provider), LOWER(model), serviceTier
-    `
-    )
-    .all(params) as ApiKeyUsageRow[];
+    `;
+  if (isPostgres()) return runAnalyticsQueryPg<ApiKeyUsageRow>(sqlText, params);
+  return getDbInstance().prepare(sqlText).all(params) as ApiKeyUsageRow[];
 }
 
 // ---------------------------------------------------------------------------
@@ -474,14 +532,11 @@ export interface ServiceTierUsageRow {
 /**
  * Per-service-tier, per-provider, per-model usage aggregates.
  */
-export function getServiceTierUsageRows(
+export async function getServiceTierUsageRows(
   unifiedSource: string,
   params: AnalyticsParams
-): ServiceTierUsageRow[] {
-  const db = getDbInstance();
-  return db
-    .prepare(
-      `
+): Promise<ServiceTierUsageRow[]> {
+  const sqlText = `
       SELECT
         COALESCE(NULLIF(service_tier, ''), 'standard') as serviceTier,
         LOWER(provider) as provider,
@@ -496,9 +551,9 @@ export function getServiceTierUsageRows(
         COALESCE(SUM(tokens_input + tokens_output), 0) as totalTokens
       FROM ${unifiedSource} AS _u
       GROUP BY serviceTier, LOWER(provider), LOWER(model)
-    `
-    )
-    .all(params) as ServiceTierUsageRow[];
+    `;
+  if (isPostgres()) return runAnalyticsQueryPg<ServiceTierUsageRow>(sqlText, params);
+  return getDbInstance().prepare(sqlText).all(params) as ServiceTierUsageRow[];
 }
 
 // ---------------------------------------------------------------------------
@@ -516,14 +571,11 @@ export interface ApiKeyMetadataRow {
  * @param apiKeyWhereClause - Full WHERE clause including api_key presence guard.
  * @param params            - Named params referenced inside `apiKeyWhereClause`.
  */
-export function getApiKeyMetadataRows(
+export async function getApiKeyMetadataRows(
   apiKeyWhereClause: string,
   params: AnalyticsParams
-): ApiKeyMetadataRow[] {
-  const db = getDbInstance();
-  return db
-    .prepare(
-      `
+): Promise<ApiKeyMetadataRow[]> {
+  const sqlText = `
       SELECT
         NULLIF(api_key_id, '') as apiKeyId,
         NULLIF(api_key_name, '') as apiKeyName,
@@ -533,9 +585,9 @@ export function getApiKeyMetadataRows(
       ${apiKeyWhereClause}
       GROUP BY NULLIF(api_key_id, ''), NULLIF(api_key_name, '')
       ORDER BY lastUsed DESC
-    `
-    )
-    .all(params) as ApiKeyMetadataRow[];
+    `;
+  if (isPostgres()) return runAnalyticsQueryPg<ApiKeyMetadataRow>(sqlText, params);
+  return getDbInstance().prepare(sqlText).all(params) as ApiKeyMetadataRow[];
 }
 
 // ---------------------------------------------------------------------------
@@ -550,14 +602,11 @@ export interface WeeklyPatternRow {
 /**
  * Day-of-week aggregates for the weekly activity pattern chart.
  */
-export function getWeeklyPatternRows(
+export async function getWeeklyPatternRows(
   unifiedSource: string,
   params: AnalyticsParams
-): WeeklyPatternRow[] {
-  const db = getDbInstance();
-  return db
-    .prepare(
-      `
+): Promise<WeeklyPatternRow[]> {
+  const sqlText = `
       SELECT
         dayOfWeek,
         COUNT(*) as days,
@@ -574,9 +623,9 @@ export function getWeeklyPatternRows(
       )
       GROUP BY dayOfWeek
       ORDER BY dayOfWeek ASC
-    `
-    )
-    .all(params) as WeeklyPatternRow[];
+    `;
+  if (isPostgres()) return runAnalyticsQueryPg<WeeklyPatternRow>(sqlText, params);
+  return getDbInstance().prepare(sqlText).all(params) as WeeklyPatternRow[];
 }
 
 // ---------------------------------------------------------------------------
@@ -596,14 +645,11 @@ export interface PresetCostModelRow {
  * Per-model token breakdown for preset range cost calculation.
  * Uses a preset-specific unified source (may differ from the main query window).
  */
-export function getPresetCostModelRows(
+export async function getPresetCostModelRows(
   presetUnifiedSource: string,
   params: AnalyticsParams
-): PresetCostModelRow[] {
-  const db = getDbInstance();
-  return db
-    .prepare(
-      `
+): Promise<PresetCostModelRow[]> {
+  const sqlText = `
       SELECT
         LOWER(model) as model,
         LOWER(provider) as provider,
@@ -615,9 +661,9 @@ export function getPresetCostModelRows(
         COALESCE(SUM(tokens_reasoning), 0) as reasoningTokens
       FROM ${presetUnifiedSource} AS _pu
       GROUP BY LOWER(model), LOWER(provider), serviceTier
-    `
-    )
-    .all(params) as PresetCostModelRow[];
+    `;
+  if (isPostgres()) return runAnalyticsQueryPg<PresetCostModelRow>(sqlText, params);
+  return getDbInstance().prepare(sqlText).all(params) as PresetCostModelRow[];
 }
 
 // ---------------------------------------------------------------------------
@@ -654,8 +700,9 @@ export interface EndpointUsageParams {
  * Inspired by decolua/9router#152 (byEndpoint aggregation), reshaped for the
  * OmniRoute SQLite schema + analytics conventions.
  */
-export function getEndpointUsageRows(params: EndpointUsageParams = {}): EndpointUsageRow[] {
-  const db = getDbInstance();
+export async function getEndpointUsageRows(
+  params: EndpointUsageParams = {}
+): Promise<EndpointUsageRow[]> {
   const conditions: string[] = [];
   const bind: Record<string, unknown> = {};
   if (params.sinceIso) {
@@ -667,9 +714,7 @@ export function getEndpointUsageRows(params: EndpointUsageParams = {}): Endpoint
     bind.until = params.untilIso;
   }
   const whereSql = conditions.length > 0 ? `WHERE ${conditions.join(" AND ")}` : "";
-  return db
-    .prepare(
-      `
+  const sqlText = `
       SELECT
         COALESCE(NULLIF(endpoint, ''), 'unknown') as endpoint,
         LOWER(COALESCE(provider, 'unknown')) as provider,
@@ -688,9 +733,9 @@ export function getEndpointUsageRows(params: EndpointUsageParams = {}): Endpoint
       ${whereSql}
       GROUP BY endpoint, LOWER(COALESCE(provider, 'unknown')), LOWER(COALESCE(model, 'unknown'))
       ORDER BY requests DESC
-    `
-    )
-    .all(bind) as EndpointUsageRow[];
+    `;
+  if (isPostgres()) return runAnalyticsQueryPg<EndpointUsageRow>(sqlText, bind);
+  return getDbInstance().prepare(sqlText).all(bind) as EndpointUsageRow[];
 }
 
 // ---------------------------------------------------------------------------
@@ -713,14 +758,11 @@ export interface ProviderDailyUsageRow {
  * per-provider aggregate (`getProviderUsageRows`) or the per-day aggregate
  * (`getDailyUsage`).
  */
-export function getProviderDailyUsageRows(
+export async function getProviderDailyUsageRows(
   unifiedSource: string,
   params: AnalyticsParams
-): ProviderDailyUsageRow[] {
-  const db = getDbInstance();
-  return db
-    .prepare(
-      `
+): Promise<ProviderDailyUsageRow[]> {
+  const sqlText = `
       SELECT
         DATE(timestamp) as date,
         LOWER(provider) as provider,
@@ -731,9 +773,9 @@ export function getProviderDailyUsageRows(
       FROM ${unifiedSource} AS _u
       GROUP BY DATE(timestamp), LOWER(provider)
       ORDER BY date DESC, requests DESC
-    `
-    )
-    .all(params) as ProviderDailyUsageRow[];
+    `;
+  if (isPostgres()) return runAnalyticsQueryPg<ProviderDailyUsageRow>(sqlText, params);
+  return getDbInstance().prepare(sqlText).all(params) as ProviderDailyUsageRow[];
 }
 
 // ---------------------------------------------------------------------------
@@ -744,23 +786,26 @@ export function getProviderDailyUsageRows(
  * Returns all rows from `usage_history` for backup export.
  * Only called when `?includeHistory=true` is explicitly requested.
  */
-export function getAllUsageHistory(): Record<string, unknown>[] {
-  const db = getDbInstance();
-  return db.prepare("SELECT * FROM usage_history").all() as Record<string, unknown>[];
+export async function getAllUsageHistory(): Promise<Record<string, unknown>[]> {
+  if (isPostgres()) return runAnalyticsQueryPg("SELECT * FROM usage_history", {});
+  return getDbInstance().prepare("SELECT * FROM usage_history").all() as Record<string, unknown>[];
 }
 
 /**
  * Returns all rows from `domain_cost_history` for backup export.
  */
-export function getAllDomainCostHistory(): Record<string, unknown>[] {
-  const db = getDbInstance();
-  return db.prepare("SELECT * FROM domain_cost_history").all() as Record<string, unknown>[];
+export async function getAllDomainCostHistory(): Promise<Record<string, unknown>[]> {
+  if (isPostgres()) return runAnalyticsQueryPg("SELECT * FROM domain_cost_history", {});
+  return getDbInstance().prepare("SELECT * FROM domain_cost_history").all() as Record<
+    string,
+    unknown
+  >[];
 }
 
 /**
  * Returns all rows from `domain_budgets` for backup export.
  */
-export function getAllDomainBudgets(): Record<string, unknown>[] {
-  const db = getDbInstance();
-  return db.prepare("SELECT * FROM domain_budgets").all() as Record<string, unknown>[];
+export async function getAllDomainBudgets(): Promise<Record<string, unknown>[]> {
+  if (isPostgres()) return runAnalyticsQueryPg("SELECT * FROM domain_budgets", {});
+  return getDbInstance().prepare("SELECT * FROM domain_budgets").all() as Record<string, unknown>[];
 }
