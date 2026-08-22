@@ -207,11 +207,9 @@ export function cacheReasoningByKey(
     createdAt: now,
   });
 
-  try {
-    setReasoningCache(key, provider, model, reasoning, TTL_MS);
-  } catch {
+  void setReasoningCache(key, provider, model, reasoning, TTL_MS).catch(() => {
     // DB persistence failure is non-fatal; memory cache still serves the hot path.
-  }
+  });
 }
 
 function buildAssistantMessageCacheKey(requestId: string, messageIndex: number): string {
@@ -341,7 +339,7 @@ export function recordReplay(): void {
 /**
  * Get combined stats from memory + DB + counters.
  */
-export function getReasoningCacheServiceStats(): {
+export async function getReasoningCacheServiceStats(): Promise<{
   memoryEntries: number;
   dbEntries: number;
   totalEntries: number;
@@ -354,7 +352,7 @@ export function getReasoningCacheServiceStats(): {
   byModel: Record<string, { entries: number; chars: number }>;
   oldestEntry: string | null;
   newestEntry: string | null;
-} {
+}> {
   // Purge expired memory entries before reporting
   purgeExpiredMemory();
 
@@ -367,7 +365,7 @@ export function getReasoningCacheServiceStats(): {
     newestEntry: null as string | null,
   };
   try {
-    dbStats = getReasoningCacheStats();
+    dbStats = await getReasoningCacheStats();
   } catch {
     // DB stats are unavailable; return memory counters with empty persisted stats.
   }
@@ -394,16 +392,16 @@ export function getReasoningCacheServiceStats(): {
 /**
  * Get paginated entries (delegates to DB).
  */
-export function getReasoningCacheServiceEntries(
+export async function getReasoningCacheServiceEntries(
   opts: {
     limit?: number;
     offset?: number;
     provider?: string;
     model?: string;
   } = {}
-): unknown[] {
+): Promise<unknown[]> {
   try {
-    return getReasoningCacheEntries(opts);
+    return await getReasoningCacheEntries(opts);
   } catch {
     return [];
   }
@@ -413,7 +411,7 @@ export function getReasoningCacheServiceEntries(
  * Clear all reasoning cache entries (memory + DB).
  * Returns count of DB entries removed.
  */
-export function clearReasoningCacheAll(provider?: string): number {
+export async function clearReasoningCacheAll(provider?: string): Promise<number> {
   // Clear memory
   if (provider) {
     for (const [key, entry] of memoryCache) {
@@ -429,7 +427,7 @@ export function clearReasoningCacheAll(provider?: string): number {
   replays = 0;
 
   try {
-    return clearAllReasoningCache(provider);
+    return await clearAllReasoningCache(provider);
   } catch {
     return 0;
   }
@@ -438,12 +436,12 @@ export function clearReasoningCacheAll(provider?: string): number {
 /**
  * Delete one reasoning cache entry by tool_call_id from memory + DB.
  */
-export function deleteReasoningCacheEntry(toolCallId: string): number {
+export async function deleteReasoningCacheEntry(toolCallId: string): Promise<number> {
   if (!toolCallId) return 0;
   const existedInMemory = memoryCache.delete(toolCallId);
   let deletedFromDb = 0;
   try {
-    deletedFromDb = deleteReasoningCache(toolCallId);
+    deletedFromDb = await deleteReasoningCache(toolCallId);
   } catch {
     // Memory delete already happened; DB delete can be retried by a later cleanup.
   }
@@ -454,10 +452,10 @@ export function deleteReasoningCacheEntry(toolCallId: string): number {
  * Cleanup expired entries from both memory and DB.
  * Called periodically (e.g., every 30 min from health-check).
  */
-export function cleanupReasoningCache(): number {
+export async function cleanupReasoningCache(): Promise<number> {
   purgeExpiredMemory();
   try {
-    return cleanupExpiredReasoning();
+    return await cleanupExpiredReasoning();
   } catch {
     return 0;
   }
@@ -486,25 +484,29 @@ function getCleanupIntervalMs(): number {
 
 function startAutoCleanup(): void {
   // Run once immediately on boot
-  try {
-    const deleted = cleanupReasoningCache();
-    if (deleted > 0) {
-      console.log(`[ReasoningCache] boot cleanup removed ${deleted} expired entries`);
+  void (async () => {
+    try {
+      const deleted = await cleanupReasoningCache();
+      if (deleted > 0) {
+        console.log(`[ReasoningCache] boot cleanup removed ${deleted} expired entries`);
+      }
+    } catch (error) {
+      console.error("[ReasoningCache] boot cleanup failed:", error);
     }
-  } catch (error) {
-    console.error("[ReasoningCache] boot cleanup failed:", error);
-  }
+  })();
 
   // Schedule periodic cleanup
   const timer = setInterval(() => {
-    try {
-      const deleted = cleanupReasoningCache();
-      if (deleted > 0) {
-        console.log(`[ReasoningCache] periodic cleanup removed ${deleted} expired entries`);
+    void (async () => {
+      try {
+        const deleted = await cleanupReasoningCache();
+        if (deleted > 0) {
+          console.log(`[ReasoningCache] periodic cleanup removed ${deleted} expired entries`);
+        }
+      } catch (error) {
+        console.error("[ReasoningCache] periodic cleanup failed:", error);
       }
-    } catch (error) {
-      console.error("[ReasoningCache] periodic cleanup failed:", error);
-    }
+    })();
   }, getCleanupIntervalMs());
 
   timer.unref?.();

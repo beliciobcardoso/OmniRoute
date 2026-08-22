@@ -12,8 +12,8 @@ try {
 
 const { cacheReasoningByKey, lookupReasoning, clearReasoningCacheAll } = mod;
 
-function reset() {
-  clearReasoningCacheAll();
+async function reset() {
+  await clearReasoningCacheAll();
 }
 
 // ── Constants ──
@@ -34,7 +34,7 @@ test("MAX_ENTRY_BYTES is 10000", async () => {
 // ── Truncation ──
 
 test("reasoning string > 10000 chars is truncated to 10000", async () => {
-  reset();
+  await reset();
   const key = randomUUID();
   const long = "A".repeat(15000);
   cacheReasoningByKey(key, "deepseek", "deepseek-r1", long);
@@ -44,7 +44,7 @@ test("reasoning string > 10000 chars is truncated to 10000", async () => {
 });
 
 test("short reasoning string is cached unchanged", async () => {
-  reset();
+  await reset();
   const key = randomUUID();
   const short = "short reasoning content";
   cacheReasoningByKey(key, "deepseek", "deepseek-r1", short);
@@ -54,7 +54,7 @@ test("short reasoning string is cached unchanged", async () => {
 });
 
 test("truncation preserves the beginning of the string", async () => {
-  reset();
+  await reset();
   const key = randomUUID();
   const prefix = "BEGINNING_MARKER_";
   const long = prefix + "X".repeat(20000);
@@ -68,7 +68,7 @@ test("truncation preserves the beginning of the string", async () => {
 // ── Memory cache MAX_MEMORY_ENTRIES limit ──
 
 test("memory cache respects MAX_MEMORY_ENTRIES limit (200)", async () => {
-  reset();
+  await reset();
   const keys: string[] = [];
   // Cache 201 entries — the oldest should be evicted from memory
   for (let i = 0; i < 201; i++) {

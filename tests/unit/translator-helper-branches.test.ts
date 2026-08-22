@@ -619,8 +619,8 @@ test("fallbackToolCallId returns the right id shape with and without an index", 
   assert.match(zeroIndex, /^call_0_\d+$/, "index 0 must use the indexed form, not the bare form");
 });
 
-test("translateRequest replays cached reasoning-only messages when interleaved field is reasoning_content", () => {
-  clearReasoningCacheAll();
+test("translateRequest replays cached reasoning-only messages when interleaved field is reasoning_content", async () => {
+  await clearReasoningCacheAll();
   clearModelsDevCapabilities();
   saveModelsDevCapabilities({
     deepseek: {
@@ -655,13 +655,13 @@ test("translateRequest replays cached reasoning-only messages when interleaved f
   );
 
   assert.equal(result.messages[1].reasoning_content, "cached reasoning only");
-  assert.equal(getReasoningCacheServiceStats().replays, 1);
+  assert.equal((await getReasoningCacheServiceStats()).replays, 1);
   clearModelsDevCapabilities();
-  clearReasoningCacheAll();
+  await clearReasoningCacheAll();
 });
 
-test("translateRequest does not replay reasoning-only messages for non-DeepSeek models", () => {
-  clearReasoningCacheAll();
+test("translateRequest does not replay reasoning-only messages for non-DeepSeek models", async () => {
+  await clearReasoningCacheAll();
   cacheReasoningByKey(
     "request:req_kimi_reasoning_only:message:0",
     "kimi",
@@ -686,184 +686,177 @@ test("translateRequest does not replay reasoning-only messages for non-DeepSeek 
   );
 
   assert.equal(result.messages[1].reasoning_content, undefined);
-  assert.equal(getReasoningCacheServiceStats().replays, 0);
-  clearReasoningCacheAll();
+  assert.equal((await getReasoningCacheServiceStats()).replays, 0);
+  await clearReasoningCacheAll();
 });
 
-  test("translateRequest injects thinking block into Claude-format messages for Kimi K2 reasoning models", () => {
-    clearReasoningCacheAll();
-    clearModelsDevCapabilities();
-    saveModelsDevCapabilities({
-      "kimi-coding": {
-        "kimi-k2.5": buildCapability({
-          interleaved_field: "reasoning_content",
-          reasoning: true,
-          tool_call: true,
-        }),
-      },
-    });
-    cacheReasoningByKey(
-      "toolu_kimi_claude",
-      "kimi-coding",
-      "kimi-k2.5",
-      "cached thinking for Kimi tool call"
-    );
+test("translateRequest injects thinking block into Claude-format messages for Kimi K2 reasoning models", async () => {
+  await clearReasoningCacheAll();
+  clearModelsDevCapabilities();
+  saveModelsDevCapabilities({
+    "kimi-coding": {
+      "kimi-k2.5": buildCapability({
+        interleaved_field: "reasoning_content",
+        reasoning: true,
+        tool_call: true,
+      }),
+    },
+  });
+  cacheReasoningByKey(
+    "toolu_kimi_claude",
+    "kimi-coding",
+    "kimi-k2.5",
+    "cached thinking for Kimi tool call"
+  );
 
-    // Claude-format request: assistant has tool_use in content[] but NO thinking block
-    // This simulates the scenario that causes infinite loops
-    const result = translateRequest(
-      FORMATS.OPENAI,
-      FORMATS.CLAUDE,
-      "kimi-k2.5",
-      {
-        thinking: { type: "enabled", budget_tokens: 2000 },
-        messages: [
-          { role: "user", content: "read the file" },
-          {
-            role: "assistant",
-            content: [
-              {
-                type: "tool_use",
-                id: "toolu_kimi_claude",
-                name: "read_file",
-                input: { path: "test.ts" },
-              },
-            ],
-          },
-          { role: "tool", tool_call_id: "toolu_kimi_claude", content: "file data" },
-        ],
-      },
-      false,
-      null,
-      "kimi-coding"
-    );
+  // Claude-format request: assistant has tool_use in content[] but NO thinking block
+  // This simulates the scenario that causes infinite loops
+  const result = translateRequest(
+    FORMATS.OPENAI,
+    FORMATS.CLAUDE,
+    "kimi-k2.5",
+    {
+      thinking: { type: "enabled", budget_tokens: 2000 },
+      messages: [
+        { role: "user", content: "read the file" },
+        {
+          role: "assistant",
+          content: [
+            {
+              type: "tool_use",
+              id: "toolu_kimi_claude",
+              name: "read_file",
+              input: { path: "test.ts" },
+            },
+          ],
+        },
+        { role: "tool", tool_call_id: "toolu_kimi_claude", content: "file data" },
+      ],
+    },
+    false,
+    null,
+    "kimi-coding"
+  );
 
-    const assistantMsg = result.messages.find((m) => m.role === "assistant");
-    assert.ok(assistantMsg, "assistant message should exist");
-    assert.ok(Array.isArray(assistantMsg.content), "content should be array");
+  const assistantMsg = result.messages.find((m) => m.role === "assistant");
+  assert.ok(assistantMsg, "assistant message should exist");
+  assert.ok(Array.isArray(assistantMsg.content), "content should be array");
 
-    // Should have a thinking block injected before tool_use
-    const thinkingBlock = assistantMsg.content.find((b) => b?.type === "thinking");
-    assert.ok(thinkingBlock, "thinking block should be injected");
-    assert.equal(
-      thinkingBlock.thinking,
-      "cached thinking for Kimi tool call",
-      "should use cached reasoning"
-    );
+  // Should have a thinking block injected before tool_use
+  const thinkingBlock = assistantMsg.content.find((b) => b?.type === "thinking");
+  assert.ok(thinkingBlock, "thinking block should be injected");
+  assert.equal(
+    thinkingBlock.thinking,
+    "cached thinking for Kimi tool call",
+    "should use cached reasoning"
+  );
 
-    // Thinking block should appear before tool_use
-    const thinkingIdx = assistantMsg.content.indexOf(thinkingBlock);
-    const toolUseIdx = assistantMsg.content.findIndex((b) => b?.type === "tool_use");
-    assert.ok(thinkingIdx < toolUseIdx, "thinking block should be before tool_use");
+  // Thinking block should appear before tool_use
+  const thinkingIdx = assistantMsg.content.indexOf(thinkingBlock);
+  const toolUseIdx = assistantMsg.content.findIndex((b) => b?.type === "tool_use");
+  assert.ok(thinkingIdx < toolUseIdx, "thinking block should be before tool_use");
 
-    assert.equal(getReasoningCacheServiceStats().replays, 1);
-    clearModelsDevCapabilities();
-    clearReasoningCacheAll();
+  assert.equal((await getReasoningCacheServiceStats()).replays, 1);
+  clearModelsDevCapabilities();
+  await clearReasoningCacheAll();
+});
+
+test("translateRequest injects placeholder thinking block for Claude-format Kimi K2 on cache miss", async () => {
+  await clearReasoningCacheAll();
+  clearModelsDevCapabilities();
+  saveModelsDevCapabilities({
+    "kimi-coding": {
+      "kimi-k2.6": buildCapability({
+        interleaved_field: "reasoning_content",
+        reasoning: true,
+        tool_call: true,
+      }),
+    },
   });
 
-  test("translateRequest injects placeholder thinking block for Claude-format Kimi K2 on cache miss", () => {
-    clearReasoningCacheAll();
-    clearModelsDevCapabilities();
-    saveModelsDevCapabilities({
-      "kimi-coding": {
-        "kimi-k2.6": buildCapability({
-          interleaved_field: "reasoning_content",
-          reasoning: true,
-          tool_call: true,
-        }),
-      },
-    });
+  // No cache seeded - should fall back to placeholder
+  const result = translateRequest(
+    FORMATS.OPENAI,
+    FORMATS.CLAUDE,
+    "kimi-k2.6",
+    {
+      thinking: { type: "enabled", budget_tokens: 2000 },
+      messages: [
+        { role: "user", content: "do it" },
+        {
+          role: "assistant",
+          content: [{ type: "tool_use", id: "toolu_miss", name: "bash", input: { command: "ls" } }],
+        },
+        { role: "tool", tool_call_id: "toolu_miss", content: "output" },
+      ],
+    },
+    false,
+    null,
+    "kimi-coding"
+  );
 
-    // No cache seeded - should fall back to placeholder
-    const result = translateRequest(
-      FORMATS.OPENAI,
-      FORMATS.CLAUDE,
-      "kimi-k2.6",
-      {
-        thinking: { type: "enabled", budget_tokens: 2000 },
-        messages: [
-          { role: "user", content: "do it" },
-          {
-            role: "assistant",
-            content: [
-              { type: "tool_use", id: "toolu_miss", name: "bash", input: { command: "ls" } },
-            ],
-          },
-          { role: "tool", tool_call_id: "toolu_miss", content: "output" },
-        ],
-      },
-      false,
-      null,
-      "kimi-coding"
-    );
+  const assistantMsg = result.messages.find((m) => m.role === "assistant");
+  assert.ok(assistantMsg, "assistant message should exist");
 
-    const assistantMsg = result.messages.find((m) => m.role === "assistant");
-    assert.ok(assistantMsg, "assistant message should exist");
+  const thinkingBlock =
+    Array.isArray(assistantMsg.content) && assistantMsg.content.find((b) => b?.type === "thinking");
+  assert.ok(thinkingBlock, "thinking block should be injected on cache miss");
+  // Must be non-empty for kimi-coding
+  assert.ok(
+    thinkingBlock.thinking && thinkingBlock.thinking.length > 0,
+    "placeholder must be non-empty"
+  );
 
-    const thinkingBlock =
-      Array.isArray(assistantMsg.content) &&
-      assistantMsg.content.find((b) => b?.type === "thinking");
-    assert.ok(thinkingBlock, "thinking block should be injected on cache miss");
-    // Must be non-empty for kimi-coding
-    assert.ok(
-      thinkingBlock.thinking && thinkingBlock.thinking.length > 0,
-      "placeholder must be non-empty"
-    );
+  clearModelsDevCapabilities();
+  await clearReasoningCacheAll();
+});
 
-    clearModelsDevCapabilities();
-    clearReasoningCacheAll();
+test("translateRequest does NOT inject duplicate thinking for Claude-format messages with existing thinking block", async () => {
+  await clearReasoningCacheAll();
+  clearModelsDevCapabilities();
+  saveModelsDevCapabilities({
+    "kimi-coding": {
+      "kimi-k2.5": buildCapability({
+        interleaved_field: "reasoning_content",
+        reasoning: true,
+        tool_call: true,
+      }),
+    },
   });
 
-  test("translateRequest does NOT inject duplicate thinking for Claude-format messages with existing thinking block", () => {
-    clearReasoningCacheAll();
-    clearModelsDevCapabilities();
-    saveModelsDevCapabilities({
-      "kimi-coding": {
-        "kimi-k2.5": buildCapability({
-          interleaved_field: "reasoning_content",
-          reasoning: true,
-          tool_call: true,
-        }),
-      },
-    });
+  const result = translateRequest(
+    FORMATS.OPENAI,
+    FORMATS.CLAUDE,
+    "kimi-k2.5",
+    {
+      messages: [
+        { role: "user", content: "hi" },
+        {
+          role: "assistant",
+          content: [
+            { type: "thinking", thinking: "I already have this" },
+            { type: "tool_use", id: "toolu_existing", name: "read", input: {} },
+          ],
+        },
+        { role: "tool", tool_call_id: "toolu_existing", content: "data" },
+      ],
+    },
+    false,
+    null,
+    "kimi-coding"
+  );
 
-    const result = translateRequest(
-      FORMATS.OPENAI,
-      FORMATS.CLAUDE,
-      "kimi-k2.5",
-      {
-        messages: [
-          { role: "user", content: "hi" },
-          {
-            role: "assistant",
-            content: [
-              { type: "thinking", thinking: "I already have this" },
-              { type: "tool_use", id: "toolu_existing", name: "read", input: {} },
-            ],
-          },
-          { role: "tool", tool_call_id: "toolu_existing", content: "data" },
-        ],
-      },
-      false,
-      null,
-      "kimi-coding"
-    );
+  const assistantMsg = result.messages.find((m) => m.role === "assistant");
+  const thinkingBlocks =
+    Array.isArray(assistantMsg.content) &&
+    assistantMsg.content.filter((b) => b?.type === "thinking");
+  assert.equal(thinkingBlocks?.length, 1, "should have exactly one thinking block (no duplicate)");
+  assert.equal(
+    thinkingBlocks[0].thinking,
+    "I already have this",
+    "original thinking should be preserved"
+  );
 
-    const assistantMsg = result.messages.find((m) => m.role === "assistant");
-    const thinkingBlocks =
-      Array.isArray(assistantMsg.content) &&
-      assistantMsg.content.filter((b) => b?.type === "thinking");
-    assert.equal(
-      thinkingBlocks?.length,
-      1,
-      "should have exactly one thinking block (no duplicate)"
-    );
-    assert.equal(
-      thinkingBlocks[0].thinking,
-      "I already have this",
-      "original thinking should be preserved"
-    );
-
-    clearModelsDevCapabilities();
-    clearReasoningCacheAll();
-  });
+  clearModelsDevCapabilities();
+  await clearReasoningCacheAll();
+});
