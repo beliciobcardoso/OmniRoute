@@ -1326,3 +1326,19 @@ CREATE TABLE IF NOT EXISTS xp_audit_log (
   metadata TEXT,
   created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
+
+CREATE TABLE IF NOT EXISTS prompt_templates (
+  id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  slug TEXT NOT NULL,
+  version BIGINT NOT NULL DEFAULT 1,
+  content TEXT NOT NULL,
+  content_hash TEXT NOT NULL,
+  variables TEXT,
+  description TEXT,
+  is_active BIGINT NOT NULL DEFAULT 1,
+  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  UNIQUE(slug, version)
+);
+CREATE INDEX IF NOT EXISTS idx_pt_slug ON prompt_templates(slug);
+CREATE INDEX IF NOT EXISTS idx_pt_active ON prompt_templates(slug, is_active);
+CREATE INDEX IF NOT EXISTS idx_pt_hash ON prompt_templates(content_hash);

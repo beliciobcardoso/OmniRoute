@@ -1335,6 +1335,18 @@ export interface XpAuditLogTable {
   created_at: Generated<string>;
 }
 
+export interface PromptTemplatesTable {
+  id: Generated<number>;
+  slug: string;
+  version: Generated<number>;
+  content: string;
+  content_hash: string;
+  variables: string | null;
+  description: string | null;
+  is_active: Generated<number>;
+  created_at: Generated<string>;
+}
+
 export interface Database {
   _omniroute_migrations: OmnirouteMigrationsTable;
   a2a_task_events: A2aTaskEventsTable;
@@ -1400,6 +1412,7 @@ export interface Database {
   plugin_analytics: PluginAnalyticsTable;
   plugin_metrics: PluginMetricsTable;
   plugins: PluginsTable;
+  prompt_templates: PromptTemplatesTable;
   provider_connections: ProviderConnectionsTable;
   provider_key_limits: ProviderKeyLimitsTable;
   provider_nodes: ProviderNodesTable;

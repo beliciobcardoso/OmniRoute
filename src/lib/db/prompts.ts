@@ -11,6 +11,12 @@
 
 import crypto from "crypto";
 import { getDbInstance } from "./core";
+import { resolveDbDriverConfig } from "./driverConfig";
+import { ensurePostgresBootstrap, getKyselyDb } from "./kysely/client";
+
+function isPostgres(): boolean {
+  return resolveDbDriverConfig().driver === "postgres";
+}
 
 interface StatementLike<TRow = unknown> {
   all: (...params: unknown[]) => TRow[];
@@ -87,14 +93,10 @@ const PROMPT_SCHEMA = `
   CREATE INDEX IF NOT EXISTS idx_pt_hash ON prompt_templates(content_hash);
 `;
 
-let _initialized = false;
-
 function ensureSchema(): void {
-  if (_initialized) return;
   try {
     const db = getDbInstance() as unknown as DbLike;
     db.exec(PROMPT_SCHEMA);
-    _initialized = true;
   } catch {
     // Schema creation is best-effort during build phase
   }
@@ -123,14 +125,73 @@ export interface PromptTemplate {
  * has changed, a new version is created. If content is identical,
  * returns the existing version without duplicating.
  */
-export function savePrompt(
+export async function savePrompt(
   slug: string,
   content: string,
   options: { variables?: string[]; description?: string } = {}
-): PromptTemplate {
+): Promise<PromptTemplate> {
+  const hash = hashContent(content);
+
+  if (isPostgres()) {
+    await ensurePostgresBootstrap();
+    const kdb = getKyselyDb();
+
+    const existing = await kdb
+      .selectFrom("prompt_templates")
+      .selectAll()
+      .where("slug", "=", slug)
+      .where("content_hash", "=", hash)
+      .executeTakeFirst();
+
+    if (existing) {
+      return rowToPrompt(existing);
+    }
+
+    await kdb
+      .updateTable("prompt_templates")
+      .set({ is_active: 0 })
+      .where("slug", "=", slug)
+      .where("is_active", "=", 1)
+      .execute();
+
+    const maxVersionRow = await kdb
+      .selectFrom("prompt_templates")
+      .select((eb) => eb.fn.max("version").as("max_v"))
+      .where("slug", "=", slug)
+      .executeTakeFirst();
+    const nextVersion = toNumber(maxVersionRow?.max_v, 0) + 1;
+    const createdAt = new Date().toISOString();
+
+    const inserted = await kdb
+      .insertInto("prompt_templates")
+      .values({
+        slug,
+        version: nextVersion,
+        content,
+        content_hash: hash,
+        variables: options.variables ? JSON.stringify(options.variables) : null,
+        description: options.description || null,
+        is_active: 1,
+        created_at: createdAt,
+      })
+      .returning(["id"])
+      .executeTakeFirst();
+
+    return {
+      id: toNumber(inserted?.id, 0),
+      slug,
+      version: nextVersion,
+      content,
+      contentHash: hash,
+      variables: options.variables || null,
+      description: options.description || null,
+      isActive: true,
+      createdAt,
+    };
+  }
+
   ensureSchema();
   const db = getDbInstance() as unknown as DbLike;
-  const hash = hashContent(content);
 
   // Check if identical content already exists for this slug
   const existing = db
@@ -185,7 +246,18 @@ export function savePrompt(
 /**
  * Get the active (latest) version of a prompt by slug.
  */
-export function getActivePrompt(slug: string): PromptTemplate | null {
+export async function getActivePrompt(slug: string): Promise<PromptTemplate | null> {
+  if (isPostgres()) {
+    await ensurePostgresBootstrap();
+    const row = await getKyselyDb()
+      .selectFrom("prompt_templates")
+      .selectAll()
+      .where("slug", "=", slug)
+      .where("is_active", "=", 1)
+      .executeTakeFirst();
+    return row ? rowToPrompt(row) : null;
+  }
+
   ensureSchema();
   const db = getDbInstance() as unknown as DbLike;
   const row = db
@@ -197,7 +269,21 @@ export function getActivePrompt(slug: string): PromptTemplate | null {
 /**
  * Get a specific version of a prompt.
  */
-export function getPromptVersion(slug: string, version: number): PromptTemplate | null {
+export async function getPromptVersion(
+  slug: string,
+  version: number
+): Promise<PromptTemplate | null> {
+  if (isPostgres()) {
+    await ensurePostgresBootstrap();
+    const row = await getKyselyDb()
+      .selectFrom("prompt_templates")
+      .selectAll()
+      .where("slug", "=", slug)
+      .where("version", "=", version)
+      .executeTakeFirst();
+    return row ? rowToPrompt(row) : null;
+  }
+
   ensureSchema();
   const db = getDbInstance() as unknown as DbLike;
   const row = db
@@ -209,7 +295,18 @@ export function getPromptVersion(slug: string, version: number): PromptTemplate 
 /**
  * List all versions of a prompt (newest first).
  */
-export function listPromptVersions(slug: string): PromptTemplate[] {
+export async function listPromptVersions(slug: string): Promise<PromptTemplate[]> {
+  if (isPostgres()) {
+    await ensurePostgresBootstrap();
+    const rows = await getKyselyDb()
+      .selectFrom("prompt_templates")
+      .selectAll()
+      .where("slug", "=", slug)
+      .orderBy("version", "desc")
+      .execute();
+    return rows.map(rowToPrompt);
+  }
+
   ensureSchema();
   const db = getDbInstance() as unknown as DbLike;
   const rows = db
@@ -221,11 +318,35 @@ export function listPromptVersions(slug: string): PromptTemplate[] {
 /**
  * List all prompt slugs with their active version info.
  */
-export function listPrompts(): Array<{
-  slug: string;
-  activeVersion: number;
-  totalVersions: number;
-}> {
+export async function listPrompts(): Promise<
+  Array<{
+    slug: string;
+    activeVersion: number;
+    totalVersions: number;
+  }>
+> {
+  if (isPostgres()) {
+    await ensurePostgresBootstrap();
+    const rows = await getKyselyDb()
+      .selectFrom("prompt_templates")
+      .select((eb) => [
+        "slug",
+        eb.fn
+          .max(eb.case().when("is_active", "=", 1).then(eb.ref("version")).else(0).end())
+          .as("active_version"),
+        eb.fn.countAll().as("total_versions"),
+      ])
+      .groupBy("slug")
+      .orderBy("slug")
+      .execute();
+
+    return rows.map((r) => ({
+      slug: toString(r.slug),
+      activeVersion: toNumber(r.active_version, 0),
+      totalVersions: toNumber(r.total_versions, 0),
+    }));
+  }
+
   ensureSchema();
   const db = getDbInstance() as unknown as DbLike;
   const rows = db
@@ -249,7 +370,40 @@ export function listPrompts(): Array<{
 /**
  * Rollback to a previous version (makes it the active one).
  */
-export function rollbackPrompt(slug: string, version: number): PromptTemplate | null {
+export async function rollbackPrompt(
+  slug: string,
+  version: number
+): Promise<PromptTemplate | null> {
+  if (isPostgres()) {
+    await ensurePostgresBootstrap();
+    const kdb = getKyselyDb();
+
+    const target = await kdb
+      .selectFrom("prompt_templates")
+      .selectAll()
+      .where("slug", "=", slug)
+      .where("version", "=", version)
+      .executeTakeFirst();
+
+    if (!target) return null;
+
+    await kdb.transaction().execute(async (trx) => {
+      await trx
+        .updateTable("prompt_templates")
+        .set({ is_active: 0 })
+        .where("slug", "=", slug)
+        .execute();
+      await trx
+        .updateTable("prompt_templates")
+        .set({ is_active: 1 })
+        .where("slug", "=", slug)
+        .where("version", "=", version)
+        .execute();
+    });
+
+    return rowToPrompt({ ...target, is_active: 1 });
+  }
+
   ensureSchema();
   const db = getDbInstance() as unknown as DbLike;
 
@@ -274,8 +428,11 @@ export function rollbackPrompt(slug: string, version: number): PromptTemplate | 
 /**
  * Render a prompt template by substituting variables.
  */
-export function renderPrompt(slug: string, vars: Record<string, string> = {}): string | null {
-  const prompt = getActivePrompt(slug);
+export async function renderPrompt(
+  slug: string,
+  vars: Record<string, string> = {}
+): Promise<string | null> {
+  const prompt = await getActivePrompt(slug);
   if (!prompt) return null;
 
   let content = prompt.content;
