@@ -81,7 +81,7 @@ export async function handleCompressionStatus(
     await snapshotMcpDescriptionCompressionStats();
     const analyticsSummary = getCompressionAnalyticsSummary();
     const mcpDescriptionStats = getMcpDescriptionCompressionStats();
-    const cacheStats = getCacheStatsSummary();
+    const cacheStats = await getCacheStatsSummary();
 
     const result = {
       enabled: settings.enabled,
@@ -323,12 +323,24 @@ export async function handleCompressionComboStats(
 // T07 — RTK learn/discover exposed via MCP (read-only; suggestions only). Mines the opt-in
 // raw-output sample store, exactly like the /api/context/rtk/{discover,learn} routes.
 const rtkDiscoverInput = z.object({
-  limit: z.number().int().positive().max(2000).optional().describe("Max samples to scan (default 500)"),
+  limit: z
+    .number()
+    .int()
+    .positive()
+    .max(2000)
+    .optional()
+    .describe("Max samples to scan (default 500)"),
 });
 
 const rtkLearnInput = z.object({
   command: z.string().min(1).max(500).describe("The command to learn an RTK filter draft for"),
-  limit: z.number().int().positive().max(2000).optional().describe("Max samples to scan (default 500)"),
+  limit: z
+    .number()
+    .int()
+    .positive()
+    .max(2000)
+    .optional()
+    .describe("Max samples to scan (default 500)"),
 });
 
 function resolveSampleLimit(limit?: number): number {
