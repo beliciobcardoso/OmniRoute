@@ -375,9 +375,13 @@ function lookupFreeAliasArenaElo(normalizedModel: string, normalizedTask: string
   return queryModelIntelligence(baseId, normalizedTask, "arena_elo");
 }
 
-export function setUserFitnessOverride(model: string, category: string, score: number): void {
+export async function setUserFitnessOverride(
+  model: string,
+  category: string,
+  score: number
+): Promise<void> {
   try {
-    setUserFitnessOverrideEntry(model.toLowerCase(), category.toLowerCase(), score);
+    await setUserFitnessOverrideEntry(model.toLowerCase(), category.toLowerCase(), score);
     invalidateFitnessCache();
   } catch (err) {
     throw new Error(
@@ -386,9 +390,9 @@ export function setUserFitnessOverride(model: string, category: string, score: n
   }
 }
 
-export function clearUserFitnessOverride(model: string, category: string): void {
+export async function clearUserFitnessOverride(model: string, category: string): Promise<void> {
   try {
-    deleteUserFitnessOverrideEntry(model.toLowerCase(), category.toLowerCase());
+    await deleteUserFitnessOverrideEntry(model.toLowerCase(), category.toLowerCase());
     invalidateFitnessCache();
   } catch (err) {
     throw new Error(

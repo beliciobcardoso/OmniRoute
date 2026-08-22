@@ -5,9 +5,24 @@
  * and user overrides. Resolution chain: user_override → arena_elo → models_dev_tier.
  *
  * @see Migration 097_model_intelligence.sql
+ *
+ * Read path (getModelIntelligence/getModelIntelligenceBySource/
+ * getResolvedTaskFitness) stays SQLite-only/synchronous: it backs the
+ * in-memory lookup cache in open-sse/services/autoCombo/taskFitness.ts,
+ * called synchronously during Auto-Combo's per-request 12-factor scoring —
+ * the same hot-path-must-stay-sync constraint documented for
+ * quotaSnapshots.ts/proxies.ts/contextHandoffs.ts elsewhere in this effort.
+ * Only the write/admin paths (background sync jobs, user-override CRUD) are
+ * converted to async dual-dialect here.
  */
 
 import { getDbInstance, rowToCamel } from "./core";
+import { resolveDbDriverConfig } from "./driverConfig";
+import { ensurePostgresBootstrap, getKyselyDb } from "./kysely/client";
+
+function isPostgres(): boolean {
+  return resolveDbDriverConfig().driver === "postgres";
+}
 
 // ──────────────── Types ────────────────
 
@@ -40,9 +55,25 @@ function rowToEntry(row: Record<string, unknown>): ModelIntelligenceEntry {
   };
 }
 
+function toNum(value: unknown, fallback = 0): number {
+  if (typeof value === "number" && Number.isFinite(value)) return value;
+  if (typeof value === "string" && value.trim()) {
+    const parsed = Number(value);
+    return Number.isFinite(parsed) ? parsed : fallback;
+  }
+  return fallback;
+}
+
 // ──────────────── CRUD ────────────────
 
-export function getModelIntelligence(model: string, category: string): ModelIntelligenceEntry | null {
+/**
+ * Hot-path read used by taskFitness.ts's in-memory cache. Stays SQLite-only —
+ * see module docstring.
+ */
+export function getModelIntelligence(
+  model: string,
+  category: string
+): ModelIntelligenceEntry | null {
   const db = getDbInstance();
   const row = db
     .prepare(
@@ -62,6 +93,10 @@ export function getModelIntelligence(model: string, category: string): ModelInte
   return row ? rowToEntry(row) : null;
 }
 
+/**
+ * Hot-path read used by taskFitness.ts's in-memory cache. Stays SQLite-only —
+ * see module docstring.
+ */
 export function getModelIntelligenceBySource(
   model: string,
   source: string,
@@ -79,7 +114,37 @@ export function getModelIntelligenceBySource(
   return row ? rowToEntry(row) : null;
 }
 
-export function upsertModelIntelligence(entry: Omit<ModelIntelligenceEntry, "syncedAt">): void {
+export async function upsertModelIntelligence(
+  entry: Omit<ModelIntelligenceEntry, "syncedAt">
+): Promise<void> {
+  if (isPostgres()) {
+    await ensurePostgresBootstrap();
+    const kdb = getKyselyDb();
+    await kdb
+      .insertInto("model_intelligence")
+      .values({
+        model: entry.model,
+        source: entry.source,
+        category: entry.category,
+        score: entry.score,
+        elo_raw: entry.eloRaw ?? null,
+        confidence: entry.confidence ?? null,
+        synced_at: new Date().toISOString(),
+        expires_at: entry.expiresAt ?? null,
+      })
+      .onConflict((oc) =>
+        oc.columns(["model", "source", "category"]).doUpdateSet((eb) => ({
+          score: eb.ref("excluded.score"),
+          elo_raw: eb.ref("excluded.elo_raw"),
+          confidence: eb.ref("excluded.confidence"),
+          synced_at: eb.ref("excluded.synced_at"),
+          expires_at: eb.ref("excluded.expires_at"),
+        }))
+      )
+      .execute();
+    return;
+  }
+
   const db = getDbInstance();
 
   db.prepare(
@@ -97,7 +162,23 @@ export function upsertModelIntelligence(entry: Omit<ModelIntelligenceEntry, "syn
   );
 }
 
-export function deleteModelIntelligence(model: string, source: string, category: string): boolean {
+export async function deleteModelIntelligence(
+  model: string,
+  source: string,
+  category: string
+): Promise<boolean> {
+  if (isPostgres()) {
+    await ensurePostgresBootstrap();
+    const kdb = getKyselyDb();
+    const result = await kdb
+      .deleteFrom("model_intelligence")
+      .where("model", "=", model)
+      .where("source", "=", source)
+      .where("category", "=", category)
+      .executeTakeFirst();
+    return Number(result.numDeletedRows ?? 0) > 0;
+  }
+
   const db = getDbInstance();
   const result = db
     .prepare(
@@ -108,7 +189,20 @@ export function deleteModelIntelligence(model: string, source: string, category:
   return (result.changes ?? 0) > 0;
 }
 
-export function deleteExpiredIntelligence(source?: string): number {
+export async function deleteExpiredIntelligence(source?: string): Promise<number> {
+  if (isPostgres()) {
+    await ensurePostgresBootstrap();
+    const kdb = getKyselyDb();
+    const nowIso = new Date().toISOString();
+    let query = kdb
+      .deleteFrom("model_intelligence")
+      .where("expires_at", "is not", null)
+      .where("expires_at", "<", nowIso);
+    if (source) query = query.where("source", "=", source);
+    const result = await query.executeTakeFirst();
+    return Number(result.numDeletedRows ?? 0);
+  }
+
   const db = getDbInstance();
   const conditions = ["expires_at IS NOT NULL", "datetime(expires_at) < datetime('now')"];
   const params: unknown[] = [];
@@ -119,24 +213,44 @@ export function deleteExpiredIntelligence(source?: string): number {
   }
 
   const where = conditions.join(" AND ");
-  const result = db
-    .prepare(`DELETE FROM model_intelligence WHERE ${where}`)
-    .run(...params);
+  const result = db.prepare(`DELETE FROM model_intelligence WHERE ${where}`).run(...params);
   return result.changes ?? 0;
 }
 
-export function deleteModelIntelligenceBySource(source: string): number {
+export async function deleteModelIntelligenceBySource(source: string): Promise<number> {
+  if (isPostgres()) {
+    await ensurePostgresBootstrap();
+    const kdb = getKyselyDb();
+    const result = await kdb
+      .deleteFrom("model_intelligence")
+      .where("source", "=", source)
+      .executeTakeFirst();
+    return Number(result.numDeletedRows ?? 0);
+  }
+
   const db = getDbInstance();
-  const result = db
-    .prepare(`DELETE FROM model_intelligence WHERE source = ?`)
-    .run(source);
+  const result = db.prepare(`DELETE FROM model_intelligence WHERE source = ?`).run(source);
   return result.changes ?? 0;
 }
 
-export function listModelIntelligence(filters?: {
+export async function listModelIntelligence(filters?: {
   source?: string;
   category?: string;
-}): ModelIntelligenceEntry[] {
+}): Promise<ModelIntelligenceEntry[]> {
+  if (isPostgres()) {
+    await ensurePostgresBootstrap();
+    const kdb = getKyselyDb();
+    let query = kdb.selectFrom("model_intelligence").selectAll();
+    if (filters?.source) query = query.where("source", "=", filters.source);
+    if (filters?.category) query = query.where("category", "=", filters.category);
+    const rows = await query
+      .orderBy("model", "asc")
+      .orderBy("source", "asc")
+      .orderBy("category", "asc")
+      .execute();
+    return rows.map((r) => rowToEntry(r as unknown as Record<string, unknown>));
+  }
+
   const db = getDbInstance();
 
   const conditions: string[] = [];
@@ -158,8 +272,43 @@ export function listModelIntelligence(filters?: {
   return rows.map(rowToEntry);
 }
 
-export function bulkUpsertModelIntelligence(entries: Array<Omit<ModelIntelligenceEntry, "syncedAt">>): number {
+export async function bulkUpsertModelIntelligence(
+  entries: Array<Omit<ModelIntelligenceEntry, "syncedAt">>
+): Promise<number> {
   if (entries.length === 0) return 0;
+
+  if (isPostgres()) {
+    await ensurePostgresBootstrap();
+    const kdb = getKyselyDb();
+    const now = new Date().toISOString();
+    await kdb.transaction().execute(async (trx) => {
+      for (const entry of entries) {
+        await trx
+          .insertInto("model_intelligence")
+          .values({
+            model: entry.model,
+            source: entry.source,
+            category: entry.category,
+            score: entry.score,
+            elo_raw: entry.eloRaw ?? null,
+            confidence: entry.confidence ?? null,
+            synced_at: now,
+            expires_at: entry.expiresAt ?? null,
+          })
+          .onConflict((oc) =>
+            oc.columns(["model", "source", "category"]).doUpdateSet((eb) => ({
+              score: eb.ref("excluded.score"),
+              elo_raw: eb.ref("excluded.elo_raw"),
+              confidence: eb.ref("excluded.confidence"),
+              synced_at: eb.ref("excluded.synced_at"),
+              expires_at: eb.ref("excluded.expires_at"),
+            }))
+          )
+          .execute();
+      }
+    });
+    return entries.length;
+  }
 
   const db = getDbInstance();
   const stmt = db.prepare(
@@ -188,6 +337,10 @@ export function bulkUpsertModelIntelligence(entries: Array<Omit<ModelIntelligenc
   return upsertAll();
 }
 
+/**
+ * Hot-path read used by taskFitness.ts's in-memory cache. Stays SQLite-only —
+ * see module docstring.
+ */
 export function getResolvedTaskFitness(model: string, category: string): number | null {
   const entry = getModelIntelligence(model, category);
   return entry ? entry.score : null;
@@ -201,12 +354,12 @@ export function getResolvedTaskFitness(model: string, category: string): number 
  * @param category - Task category
  * @param score - Fitness score [0..1]
  */
-export function setUserFitnessOverrideEntry(
+export async function setUserFitnessOverrideEntry(
   model: string,
   category: string,
-  score: number,
-): void {
-  upsertModelIntelligence({
+  score: number
+): Promise<void> {
+  await upsertModelIntelligence({
     model: model.toLowerCase(),
     source: "user_override",
     category: category.toLowerCase(),
@@ -224,9 +377,9 @@ export function setUserFitnessOverrideEntry(
  * @param category - Task category
  * @returns true if an entry was deleted
  */
-export function deleteUserFitnessOverrideEntry(
+export async function deleteUserFitnessOverrideEntry(
   model: string,
-  category: string,
-): boolean {
+  category: string
+): Promise<boolean> {
   return deleteModelIntelligence(model.toLowerCase(), "user_override", category.toLowerCase());
 }
