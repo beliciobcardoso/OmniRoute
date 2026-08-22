@@ -32,23 +32,23 @@ export interface KeyGroupAuthResult {
  * @param provider - Optional provider (e.g., "openai", "anthropic")
  * @returns KeyGroupAuthResult
  */
-export function authorizeKeyModelAccess(
+export async function authorizeKeyModelAccess(
   apiKeyId: string | undefined,
   model: string,
   provider?: string
-): KeyGroupAuthResult {
+): Promise<KeyGroupAuthResult> {
   if (!apiKeyId) {
     // No API key = no restriction (public endpoint)
     return { authorized: true, groups: [] };
   }
 
-  const groups = getKeyGroupsForApiKey(apiKeyId);
+  const groups = await getKeyGroupsForApiKey(apiKeyId);
   if (groups.length === 0) {
     // Key not in any group = no restriction
     return { authorized: true, groups: [] };
   }
 
-  const accessCheck = checkKeyModelAccess(apiKeyId, model, provider);
+  const accessCheck = await checkKeyModelAccess(apiKeyId, model, provider);
 
   if (accessCheck.allowed) {
     return {
@@ -72,11 +72,11 @@ export function authorizeKeyModelAccess(
 /**
  * Get a summary of group memberships for an API key (for dashboard display).
  */
-export function getKeyGroupSummary(apiKeyId: string): {
+export async function getKeyGroupSummary(apiKeyId: string): Promise<{
   groups: Array<{ id: string; name: string }>;
   restricted: boolean;
-} {
-  const groups = getKeyGroupsForApiKey(apiKeyId);
+}> {
+  const groups = await getKeyGroupsForApiKey(apiKeyId);
   return {
     groups: groups.map((g) => ({ id: g.id, name: g.name })),
     restricted: groups.length > 0,

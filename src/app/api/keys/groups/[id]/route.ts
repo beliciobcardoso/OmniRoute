@@ -28,11 +28,11 @@ const updateKeyGroupSchema = z
 export async function GET(request: Request, { params }: RouteParams) {
   try {
     const { id } = await params;
-    const group = getKeyGroupWithPermissions(id);
+    const group = await getKeyGroupWithPermissions(id);
     if (!group) {
       return NextResponse.json({ error: "Group not found" }, { status: 404 });
     }
-    const members = getGroupMembers(id);
+    const members = await getGroupMembers(id);
     return NextResponse.json({ group, members });
   } catch (error) {
     return NextResponse.json({ error: "Failed to get group" }, { status: 500 });
@@ -51,7 +51,7 @@ export async function PUT(request: Request, { params }: RouteParams) {
       return NextResponse.json({ error: validation.error }, { status: 400 });
     }
 
-    const group = updateKeyGroup(id, validation.data);
+    const group = await updateKeyGroup(id, validation.data);
     if (!group) {
       return NextResponse.json({ error: "Group not found" }, { status: 404 });
     }
@@ -67,7 +67,7 @@ export async function PUT(request: Request, { params }: RouteParams) {
 export async function DELETE(request: Request, { params }: RouteParams) {
   try {
     const { id } = await params;
-    const deleted = deleteKeyGroup(id);
+    const deleted = await deleteKeyGroup(id);
     if (!deleted) {
       return NextResponse.json({ error: "Group not found" }, { status: 404 });
     }
