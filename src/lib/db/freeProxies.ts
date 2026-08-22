@@ -1,7 +1,31 @@
 import { randomUUID } from "crypto";
 import { getDbInstance } from "./core";
 import { backupDbFile } from "./backup";
+import { resolveDbDriverConfig } from "./driverConfig";
+import { ensurePostgresBootstrap, getKyselyDb } from "./kysely/client";
 import type { FreeProxyItem, FreeProxySourceId } from "@/lib/freeProxyProviders/types";
+
+function isPostgres(): boolean {
+  return resolveDbDriverConfig().driver === "postgres";
+}
+
+// Postgres BIGINT columns (port, quality_score, latency_ms, in_pool) come back
+// as JS strings from node-postgres, not numbers — coerce before any numeric
+// comparison or boolean check (e.g. `in_pool === 1` silently breaks on "1").
+function toInt(value: unknown): number {
+  if (typeof value === "number") return value;
+  if (typeof value === "bigint") return Number(value);
+  if (typeof value === "string" && value.trim().length > 0) {
+    const parsed = Number(value);
+    return Number.isFinite(parsed) ? parsed : 0;
+  }
+  return 0;
+}
+
+function toIntOrNull(value: unknown): number | null {
+  if (value === null || value === undefined) return null;
+  return toInt(value);
+}
 
 export interface FreeProxyRecord {
   id: string;
@@ -39,14 +63,14 @@ function mapRow(row: unknown): FreeProxyRecord {
     id: String(r.id ?? ""),
     source: String(r.source ?? "1proxy") as FreeProxySourceId,
     host: String(r.host ?? ""),
-    port: Number(r.port) || 0,
+    port: toInt(r.port),
     type: String(r.type ?? "http"),
     countryCode: r.country_code != null ? String(r.country_code) : null,
-    qualityScore: r.quality_score != null ? Number(r.quality_score) : null,
-    latencyMs: r.latency_ms != null ? Number(r.latency_ms) : null,
+    qualityScore: toIntOrNull(r.quality_score),
+    latencyMs: toIntOrNull(r.latency_ms),
     anonymity: r.anonymity != null ? String(r.anonymity) : null,
     lastValidated: r.last_validated != null ? String(r.last_validated) : null,
-    inPool: r.in_pool === 1 || r.in_pool === true,
+    inPool: r.in_pool === true || toInt(r.in_pool) === 1,
     poolProxyId: r.pool_proxy_id != null ? String(r.pool_proxy_id) : null,
     createdAt: String(r.created_at ?? ""),
     updatedAt: String(r.updated_at ?? ""),
@@ -56,8 +80,60 @@ function mapRow(row: unknown): FreeProxyRecord {
 export async function upsertFreeProxy(
   item: FreeProxyItem
 ): Promise<{ id: string; action: "created" | "updated" }> {
-  const db = getDbInstance();
   const now = new Date().toISOString();
+
+  if (isPostgres()) {
+    await ensurePostgresBootstrap();
+    const kdb = getKyselyDb();
+    const existing = await kdb
+      .selectFrom("free_proxies")
+      .select("id")
+      .where("source", "=", item.source)
+      .where("host", "=", item.host)
+      .where("port", "=", item.port)
+      .executeTakeFirst();
+
+    if (existing?.id) {
+      await kdb
+        .updateTable("free_proxies")
+        .set({
+          type: item.type,
+          country_code: item.countryCode ?? null,
+          quality_score: item.qualityScore ?? null,
+          latency_ms: item.latencyMs ?? null,
+          anonymity: item.anonymity ?? null,
+          last_validated: item.lastValidated ?? now,
+          updated_at: now,
+        })
+        .where("id", "=", existing.id)
+        .execute();
+      return { id: existing.id, action: "updated" };
+    }
+
+    const id = randomUUID();
+    await kdb
+      .insertInto("free_proxies")
+      .values({
+        id,
+        source: item.source,
+        host: item.host,
+        port: item.port,
+        type: item.type,
+        country_code: item.countryCode ?? null,
+        quality_score: item.qualityScore ?? null,
+        latency_ms: item.latencyMs ?? null,
+        anonymity: item.anonymity ?? null,
+        last_validated: item.lastValidated ?? now,
+        in_pool: 0,
+        pool_proxy_id: null,
+        created_at: now,
+        updated_at: now,
+      })
+      .execute();
+    return { id, action: "created" };
+  }
+
+  const db = getDbInstance();
 
   const existing = db
     .prepare("SELECT id FROM free_proxies WHERE source = ? AND host = ? AND port = ?")
@@ -117,6 +193,53 @@ export async function listFreeProxies(options?: {
   limit?: number;
   offset?: number;
 }): Promise<FreeProxyRecord[]> {
+  if (isPostgres()) {
+    await ensurePostgresBootstrap();
+    let query = getKyselyDb().selectFrom("free_proxies").selectAll();
+
+    if (options?.sources?.length) {
+      query = query.where("source", "in", options.sources);
+    }
+    if (options?.protocol) {
+      query = query.where("type", "=", options.protocol);
+    }
+    if (options?.country) {
+      query = query.where("country_code", "=", options.country.toUpperCase());
+    }
+    if (options?.minQuality != null) {
+      query = query.where("quality_score", ">=", options.minQuality);
+    }
+    if (options?.onlyInPool) {
+      query = query.where("in_pool", "=", 1);
+    }
+    if (options?.onlyNotInPool) {
+      query = query.where("in_pool", "=", 0);
+    }
+    if (options?.search) {
+      query = query.where("host", "like", `%${options.search}%`);
+    }
+
+    if (options?.sortBy === "latency") {
+      query = query
+        .orderBy((eb) => eb.case().when("latency_ms", "is", null).then(0).else(1).end())
+        .orderBy("latency_ms", "asc");
+    } else if (options?.sortBy === "recent") {
+      query = query.orderBy("last_validated", "desc");
+    } else {
+      query = query.orderBy("quality_score", "desc").orderBy("last_validated", "desc");
+    }
+
+    if (options?.limit) {
+      query = query.limit(options.limit);
+      if (options?.offset) {
+        query = query.offset(options.offset);
+      }
+    }
+
+    const rows = await query.execute();
+    return rows.map(mapRow);
+  }
+
   const db = getDbInstance();
   const params: unknown[] = [];
   let sql = "SELECT * FROM free_proxies WHERE 1=1";
@@ -178,6 +301,38 @@ export async function countFreeProxies(options?: {
   onlyNotInPool?: boolean;
   search?: string;
 }): Promise<number> {
+  if (isPostgres()) {
+    await ensurePostgresBootstrap();
+    let query = getKyselyDb()
+      .selectFrom("free_proxies")
+      .select((eb) => eb.fn.countAll().as("count"));
+
+    if (options?.sources?.length) {
+      query = query.where("source", "in", options.sources);
+    }
+    if (options?.protocol) {
+      query = query.where("type", "=", options.protocol);
+    }
+    if (options?.country) {
+      query = query.where("country_code", "=", options.country.toUpperCase());
+    }
+    if (options?.minQuality != null) {
+      query = query.where("quality_score", ">=", options.minQuality);
+    }
+    if (options?.onlyInPool) {
+      query = query.where("in_pool", "=", 1);
+    }
+    if (options?.onlyNotInPool) {
+      query = query.where("in_pool", "=", 0);
+    }
+    if (options?.search) {
+      query = query.where("host", "like", `%${options.search}%`);
+    }
+
+    const row = await query.executeTakeFirst();
+    return row ? Number(row.count) : 0;
+  }
+
   const db = getDbInstance();
   const params: unknown[] = [];
   let sql = "SELECT COUNT(*) AS count FROM free_proxies WHERE 1=1";
@@ -244,14 +399,35 @@ export async function listFreeProxiesBySource(
 }
 
 export async function getFreeProxyById(id: string): Promise<FreeProxyRecord | null> {
+  if (isPostgres()) {
+    await ensurePostgresBootstrap();
+    const row = await getKyselyDb()
+      .selectFrom("free_proxies")
+      .selectAll()
+      .where("id", "=", id)
+      .executeTakeFirst();
+    return row ? mapRow(row) : null;
+  }
+
   const db = getDbInstance();
   const row = db.prepare("SELECT * FROM free_proxies WHERE id = ?").get(id);
   return row ? mapRow(row) : null;
 }
 
 export async function markFreeProxyInPool(id: string, poolProxyId: string): Promise<void> {
-  const db = getDbInstance();
   const now = new Date().toISOString();
+
+  if (isPostgres()) {
+    await ensurePostgresBootstrap();
+    await getKyselyDb()
+      .updateTable("free_proxies")
+      .set({ in_pool: 1, pool_proxy_id: poolProxyId, updated_at: now })
+      .where("id", "=", id)
+      .execute();
+    return;
+  }
+
+  const db = getDbInstance();
   db.prepare(
     "UPDATE free_proxies SET in_pool = 1, pool_proxy_id = ?, updated_at = ? WHERE id = ?"
   ).run(poolProxyId, now, id);
@@ -278,9 +454,51 @@ export async function promoteFreeProxyToPool(
     source: string;
   }
 ): Promise<string | null> {
-  const db = getDbInstance();
   const now = new Date().toISOString();
   const newRegistryId = randomUUID();
+
+  if (isPostgres()) {
+    await ensurePostgresBootstrap();
+    const kdb = getKyselyDb();
+    const result = await kdb.transaction().execute(async (trx) => {
+      const exists = await trx
+        .selectFrom("free_proxies")
+        .select(["id", "in_pool"])
+        .where("id", "=", freeProxyId)
+        .executeTakeFirst();
+      if (!exists?.id) return null;
+
+      await trx
+        .insertInto("proxy_registry")
+        .values({
+          id: newRegistryId,
+          name: registryPayload.name,
+          type: registryPayload.type,
+          host: registryPayload.host,
+          port: Number(registryPayload.port),
+          username: "",
+          password: "",
+          region: null,
+          notes: null,
+          status: "active",
+          source: registryPayload.source,
+          created_at: now,
+          updated_at: now,
+        })
+        .execute();
+
+      await trx
+        .updateTable("free_proxies")
+        .set({ in_pool: 1, pool_proxy_id: newRegistryId, updated_at: now })
+        .where("id", "=", freeProxyId)
+        .execute();
+
+      return newRegistryId;
+    });
+    return result;
+  }
+
+  const db = getDbInstance();
 
   const result = db.transaction(() => {
     const exists = db
@@ -315,6 +533,15 @@ export async function promoteFreeProxyToPool(
 }
 
 export async function deleteFreeProxy(id: string): Promise<boolean> {
+  if (isPostgres()) {
+    await ensurePostgresBootstrap();
+    const result = await getKyselyDb()
+      .deleteFrom("free_proxies")
+      .where("id", "=", id)
+      .executeTakeFirst();
+    return Number(result.numDeletedRows) > 0;
+  }
+
   const db = getDbInstance();
   const result = db.prepare("DELETE FROM free_proxies WHERE id = ?").run(id);
   backupDbFile("pre-write");
@@ -322,6 +549,16 @@ export async function deleteFreeProxy(id: string): Promise<boolean> {
 }
 
 export async function clearFreeProxiesBySource(source: FreeProxySourceId): Promise<number> {
+  if (isPostgres()) {
+    await ensurePostgresBootstrap();
+    const result = await getKyselyDb()
+      .deleteFrom("free_proxies")
+      .where("source", "=", source)
+      .where("in_pool", "=", 0)
+      .executeTakeFirst();
+    return Number(result.numDeletedRows);
+  }
+
   const db = getDbInstance();
   const result = db
     .prepare("DELETE FROM free_proxies WHERE source = ? AND in_pool = 0")
@@ -341,6 +578,26 @@ export async function pruneStaleFreeProxies(
   source: FreeProxySourceId,
   activeKeys: ReadonlySet<string>
 ): Promise<number> {
+  if (isPostgres()) {
+    await ensurePostgresBootstrap();
+    const kdb = getKyselyDb();
+    const rows = await kdb
+      .selectFrom("free_proxies")
+      .select(["id", "host", "port"])
+      .where("source", "=", source)
+      .where("in_pool", "=", 0)
+      .execute();
+
+    const staleIds = rows.filter((r) => !activeKeys.has(`${r.host}:${r.port}`)).map((r) => r.id);
+    if (staleIds.length === 0) return 0;
+
+    const result = await kdb
+      .deleteFrom("free_proxies")
+      .where("id", "in", staleIds)
+      .executeTakeFirst();
+    return Number(result.numDeletedRows);
+  }
+
   const db = getDbInstance();
   const rows = db
     .prepare("SELECT id, host, port FROM free_proxies WHERE source = ? AND in_pool = 0")
@@ -371,8 +628,19 @@ const FREE_PROXY_SYNC_KEY = "last_sync_at";
  * so the route can echo it back. `at` is overridable for deterministic tests.
  */
 export async function recordFreeProxySync(at?: string): Promise<string> {
-  const db = getDbInstance();
   const ts = at ?? new Date().toISOString();
+
+  if (isPostgres()) {
+    await ensurePostgresBootstrap();
+    await getKyselyDb()
+      .insertInto("key_value")
+      .values({ namespace: FREE_PROXY_SYNC_NAMESPACE, key: FREE_PROXY_SYNC_KEY, value: ts })
+      .onConflict((oc) => oc.columns(["namespace", "key"]).doUpdateSet({ value: ts }))
+      .execute();
+    return ts;
+  }
+
+  const db = getDbInstance();
   db.prepare("INSERT OR REPLACE INTO key_value (namespace, key, value) VALUES (?, ?, ?)").run(
     FREE_PROXY_SYNC_NAMESPACE,
     FREE_PROXY_SYNC_KEY,
@@ -389,7 +657,50 @@ function getRecordedFreeProxySync(db: ReturnType<typeof getDbInstance>): string 
   return row?.value != null ? String(row.value) : null;
 }
 
+async function getRecordedFreeProxySyncPostgres(): Promise<string | null> {
+  const row = await getKyselyDb()
+    .selectFrom("key_value")
+    .select("value")
+    .where("namespace", "=", FREE_PROXY_SYNC_NAMESPACE)
+    .where("key", "=", FREE_PROXY_SYNC_KEY)
+    .executeTakeFirst();
+  return row?.value != null ? String(row.value) : null;
+}
+
 export async function getFreeProxyStats(): Promise<FreeProxyStats> {
+  if (isPostgres()) {
+    await ensurePostgresBootstrap();
+    const kdb = getKyselyDb();
+
+    const totals = await kdb
+      .selectFrom("free_proxies")
+      .select((eb) => [
+        eb.fn.countAll().as("total"),
+        eb.fn.sum(eb.case().when("in_pool", "=", 1).then(1).else(0).end()).as("in_pool_count"),
+        eb.fn.avg("quality_score").as("avg_quality"),
+        eb.fn.max("last_validated").as("last_sync_at"),
+      ])
+      .executeTakeFirst();
+
+    const bySource = await kdb
+      .selectFrom("free_proxies")
+      .select(["source", (eb) => eb.fn.countAll().as("count")])
+      .groupBy("source")
+      .orderBy("count", "desc")
+      .execute();
+
+    const recordedSyncAt = await getRecordedFreeProxySyncPostgres();
+    const derivedSyncAt = totals?.last_sync_at != null ? String(totals.last_sync_at) : null;
+
+    return {
+      total: totals ? Number(totals.total) || 0 : 0,
+      inPool: totals ? Number(totals.in_pool_count) || 0 : 0,
+      avgQuality: totals?.avg_quality != null ? Math.round(Number(totals.avg_quality)) : null,
+      bySource: bySource.map((r) => ({ source: String(r.source), count: Number(r.count) })),
+      lastSyncAt: recordedSyncAt ?? derivedSyncAt,
+    };
+  }
+
   const db = getDbInstance();
   const totals = db
     .prepare(
@@ -429,16 +740,34 @@ export async function recordFreeProxySyncErrors(
   source: FreeProxySourceId,
   errors: string[]
 ): Promise<void> {
-  const db = getDbInstance();
   const at = new Date().toISOString();
+  const payload = JSON.stringify(errors);
+
+  if (isPostgres()) {
+    await ensurePostgresBootstrap();
+    await getKyselyDb()
+      .insertInto("free_proxy_sync_errors")
+      .values({ source, errors: payload, updated_at: at })
+      .onConflict((oc) => oc.column("source").doUpdateSet({ errors: payload, updated_at: at }))
+      .execute();
+    return;
+  }
+
+  const db = getDbInstance();
   db.prepare(
     "INSERT OR REPLACE INTO free_proxy_sync_errors (source, errors, updated_at) VALUES (?, ?, ?)"
-  ).run(source, JSON.stringify(errors), at);
+  ).run(source, payload, at);
   backupDbFile("pre-write");
 }
 
 /** Clear a source's stored sync error (called on a successful sync). */
 export async function clearFreeProxySyncErrors(source: FreeProxySourceId): Promise<void> {
+  if (isPostgres()) {
+    await ensurePostgresBootstrap();
+    await getKyselyDb().deleteFrom("free_proxy_sync_errors").where("source", "=", source).execute();
+    return;
+  }
+
   const db = getDbInstance();
   db.prepare("DELETE FROM free_proxy_sync_errors WHERE source = ?").run(source);
   backupDbFile("pre-write");
@@ -450,11 +779,22 @@ export async function clearFreeProxySyncErrors(source: FreeProxySourceId): Promi
  * state.
  */
 export async function getFreeProxySyncErrors(): Promise<FreeProxySyncErrors> {
-  const db = getDbInstance();
-  const rows = db.prepare("SELECT source, errors FROM free_proxy_sync_errors").all() as Array<{
-    source: string;
-    errors: string;
-  }>;
+  let rows: Array<{ source: string; errors: string }>;
+
+  if (isPostgres()) {
+    await ensurePostgresBootstrap();
+    rows = await getKyselyDb()
+      .selectFrom("free_proxy_sync_errors")
+      .select(["source", "errors"])
+      .execute();
+  } else {
+    const db = getDbInstance();
+    rows = db.prepare("SELECT source, errors FROM free_proxy_sync_errors").all() as Array<{
+      source: string;
+      errors: string;
+    }>;
+  }
+
   const out: FreeProxySyncErrors = {};
   for (const row of rows) {
     if (!row.source) continue;
