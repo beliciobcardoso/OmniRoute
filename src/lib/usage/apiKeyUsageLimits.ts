@@ -35,8 +35,8 @@ export interface ApiKeyUsageLimitDeps {
   now?: () => number;
   getProviderConnectionById?: (connectionId: string) => Promise<unknown>;
   getProviderConnections?: (filter?: Record<string, unknown>) => Promise<unknown[]>;
-  getProviderLimitsCache?: (connectionId: string) => ProviderLimitsCacheEntry | null;
-  getAllProviderLimitsCache?: () => Record<string, ProviderLimitsCacheEntry>;
+  getProviderLimitsCache?: (connectionId: string) => Promise<ProviderLimitsCacheEntry | null>;
+  getAllProviderLimitsCache?: () => Promise<Record<string, ProviderLimitsCacheEntry>>;
 }
 
 interface UsageCostRow {
@@ -326,7 +326,7 @@ async function getProviderWeeklyWindow(
       const connection = connectionFromValue(await deps.getProviderConnectionById(connectionId));
       if (!connection) continue;
       const resetAt = findWeeklyQuotaResetAt(
-        deps.getProviderLimitsCache(connection.id)?.quotas,
+        (await deps.getProviderLimitsCache(connection.id))?.quotas,
         nowMs
       );
       if (resetAt) {
@@ -339,7 +339,7 @@ async function getProviderWeeklyWindow(
       }
     }
   } else {
-    const caches = deps.getAllProviderLimitsCache();
+    const caches = await deps.getAllProviderLimitsCache();
     const connections = await deps.getProviderConnections({ isActive: true });
     for (const rawConnection of connections) {
       const connection = connectionFromValue(rawConnection);

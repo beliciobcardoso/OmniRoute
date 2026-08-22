@@ -70,7 +70,7 @@ test("non-Antigravity cache entry is returned verbatim (junk quota key survives)
     apiKey: "sk-test-openai",
   });
   const quotas = { "definitely-not-a-real-model": { used: 1, limit: 10 } };
-  providerLimitsDb.setProviderLimitsCache((conn as { id: string }).id, cacheEntry(quotas));
+  await providerLimitsDb.setProviderLimitsCache((conn as { id: string }).id, cacheEntry(quotas));
 
   const out = await providerLimits.getSanitizedCachedProviderLimitsMap();
   const entry = out[(conn as { id: string }).id];
@@ -94,7 +94,7 @@ test("Antigravity cache entry is still sanitized (non-user-callable quota key dr
     credits: { used: 5, limit: 100 },
     "definitely-not-a-real-model": { used: 1, limit: 10 },
   };
-  providerLimitsDb.setProviderLimitsCache((conn as { id: string }).id, cacheEntry(quotas));
+  await providerLimitsDb.setProviderLimitsCache((conn as { id: string }).id, cacheEntry(quotas));
 
   const out = await providerLimits.getSanitizedCachedProviderLimitsMap();
   const entry = out[(conn as { id: string }).id];

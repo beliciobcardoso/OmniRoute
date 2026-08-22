@@ -52,7 +52,7 @@ test("Codex provider window costs use the weekly reset window and API key USD li
     resetTime: "00:00",
   });
 
-  providerLimits.setProviderLimitsCache("codex-conn", {
+  await providerLimits.setProviderLimitsCache("codex-conn", {
     quotas: {
       "session (5h)": {
         used: 0,
@@ -126,7 +126,7 @@ test("Claude provider window costs split spending across API keys from the curre
     resetTime: "00:00",
   });
 
-  providerLimits.setProviderLimitsCache("claude-conn", {
+  await providerLimits.setProviderLimitsCache("claude-conn", {
     quotas: {
       "Session (5hr)": {
         used: 2,
@@ -200,7 +200,7 @@ test("provider window costs use the recorded reset event as the cost cutoff", as
     },
   });
 
-  providerLimits.setProviderLimitsCache("claude-reset-event", {
+  await providerLimits.setProviderLimitsCache("claude-reset-event", {
     quotas: {
       "weekly (7d)": {
         used: 25,
@@ -275,7 +275,7 @@ test("provider window costs cut at an observed same-resetAt quota reset", async 
   });
 
   const targetResetAt = "2026-07-02T23:00:00.000Z";
-  providerLimits.setProviderLimitsCache("claude-early-reset", {
+  await providerLimits.setProviderLimitsCache("claude-early-reset", {
     quotas: {
       "weekly (7d)": {
         used: 7,
@@ -396,7 +396,7 @@ test("provider window costs prefer recorded USD history over repricing usage tok
 
   const key = await apiKeys.createApiKey("Recorded USD Key", "machine-recorded-usd");
 
-  providerLimits.setProviderLimitsCache("claude-recorded-cost", {
+  await providerLimits.setProviderLimitsCache("claude-recorded-cost", {
     quotas: {
       "weekly (7d)": {
         used: 50,

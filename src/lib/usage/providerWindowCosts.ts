@@ -161,11 +161,11 @@ function scoreWeeklyQuota(name: string): number {
   return score;
 }
 
-function selectWeeklyWindow(
+async function selectWeeklyWindow(
   provider: string,
   connectionId: string | null,
   nowMs: number
-): {
+): Promise<{
   startMs: number;
   resetMs: number | null;
   source: ProviderWindowCostBreakdown["windowSource"];
@@ -173,10 +173,10 @@ function selectWeeklyWindow(
   quotaUsedPercent: number | null;
   quotaRemainingPercent: number | null;
   windowStartSource: ProviderWindowCostBreakdown["windowStartSource"];
-} {
+}> {
   const cacheEntries = connectionId
-    ? [[connectionId, getProviderLimitsCache(connectionId)] as const]
-    : Object.entries(getAllProviderLimitsCache());
+    ? [[connectionId, await getProviderLimitsCache(connectionId)] as const]
+    : Object.entries(await getAllProviderLimitsCache());
 
   let selected: {
     score: number;
@@ -398,7 +398,7 @@ export async function getProviderWindowCostBreakdown({
 }): Promise<ProviderWindowCostBreakdown> {
   const providerKey = provider.trim().toLowerCase();
   const nowMs = Number.isFinite(now) ? now : Date.now();
-  const window = selectWeeklyWindow(providerKey, connectionId, nowMs);
+  const window = await selectWeeklyWindow(providerKey, connectionId, nowMs);
   const windowStartAt = new Date(window.startMs).toISOString();
   const windowResetAt = window.resetMs ? new Date(window.resetMs).toISOString() : null;
   const nowIso = new Date(nowMs).toISOString();
