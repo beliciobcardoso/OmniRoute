@@ -3,8 +3,30 @@
 import { getDbInstance } from "../core";
 import { backupDbFile } from "../backup";
 import { getKeyValue } from "./shared";
+import { resolveDbDriverConfig } from "../driverConfig";
+import { ensurePostgresBootstrap, getKyselyDb } from "../kysely/client";
+
+function isPostgres(): boolean {
+  return resolveDbDriverConfig().driver === "postgres";
+}
 
 export async function getModelAliases() {
+  if (isPostgres()) {
+    await ensurePostgresBootstrap();
+    const kdb = getKyselyDb();
+    const rows = await kdb
+      .selectFrom("key_value")
+      .select(["key", "value"])
+      .where("namespace", "=", "modelAliases")
+      .execute();
+    const result: Record<string, unknown> = {};
+    for (const row of rows) {
+      const { key, value } = getKeyValue(row);
+      if (!key || value === null) continue;
+      result[key] = JSON.parse(value);
+    }
+    return result;
+  }
   const db = getDbInstance();
   const rows = db
     .prepare("SELECT key, value FROM key_value WHERE namespace = 'modelAliases'")
@@ -19,6 +41,18 @@ export async function getModelAliases() {
 }
 
 export async function setModelAlias(alias: string, model: unknown) {
+  if (isPostgres()) {
+    await ensurePostgresBootstrap();
+    const kdb = getKyselyDb();
+    await kdb
+      .insertInto("key_value")
+      .values({ namespace: "modelAliases", key: alias, value: JSON.stringify(model) })
+      .onConflict((oc) =>
+        oc.columns(["namespace", "key"]).doUpdateSet({ value: (eb) => eb.ref("excluded.value") })
+      )
+      .execute();
+    return;
+  }
   const db = getDbInstance();
   db.prepare(
     "INSERT OR REPLACE INTO key_value (namespace, key, value) VALUES ('modelAliases', ?, ?)"
@@ -27,6 +61,16 @@ export async function setModelAlias(alias: string, model: unknown) {
 }
 
 export async function deleteModelAlias(alias: string) {
+  if (isPostgres()) {
+    await ensurePostgresBootstrap();
+    const kdb = getKyselyDb();
+    await kdb
+      .deleteFrom("key_value")
+      .where("namespace", "=", "modelAliases")
+      .where("key", "=", alias)
+      .execute();
+    return;
+  }
   const db = getDbInstance();
   db.prepare("DELETE FROM key_value WHERE namespace = 'modelAliases' AND key = ?").run(alias);
   backupDbFile("pre-write");

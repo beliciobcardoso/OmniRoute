@@ -40,9 +40,96 @@ export {
 } from "./models/aliases";
 export { getMitmAlias, setMitmAliasAll } from "./models/mitmAlias";
 
+import { resolveDbDriverConfig } from "./driverConfig";
+import { ensurePostgresBootstrap, getKyselyDb } from "./kysely/client";
+
+function isPostgres(): boolean {
+  return resolveDbDriverConfig().driver === "postgres";
+}
+
+async function pgGetKeyValue(namespace: string, key: string): Promise<string | null> {
+  await ensurePostgresBootstrap();
+  const kdb = getKyselyDb();
+  const row = await kdb
+    .selectFrom("key_value")
+    .select("value")
+    .where("namespace", "=", namespace)
+    .where("key", "=", key)
+    .executeTakeFirst();
+  return row?.value ?? null;
+}
+
+async function pgGetKeyValueRows(
+  namespace: string
+): Promise<Array<{ key: string; value: string }>> {
+  await ensurePostgresBootstrap();
+  const kdb = getKyselyDb();
+  return await kdb
+    .selectFrom("key_value")
+    .select(["key", "value"])
+    .where("namespace", "=", namespace)
+    .execute();
+}
+
+async function pgSetKeyValue(namespace: string, key: string, value: string): Promise<void> {
+  await ensurePostgresBootstrap();
+  const kdb = getKyselyDb();
+  await kdb
+    .insertInto("key_value")
+    .values({ namespace, key, value })
+    .onConflict((oc) =>
+      oc.columns(["namespace", "key"]).doUpdateSet({ value: (eb) => eb.ref("excluded.value") })
+    )
+    .execute();
+}
+
+async function pgDeleteKeyValue(namespace: string, key: string): Promise<void> {
+  await ensurePostgresBootstrap();
+  const kdb = getKyselyDb();
+  await kdb
+    .deleteFrom("key_value")
+    .where("namespace", "=", namespace)
+    .where("key", "=", key)
+    .execute();
+}
+
+async function pgDeleteKeyValueRows(namespace: string): Promise<void> {
+  await ensurePostgresBootstrap();
+  const kdb = getKyselyDb();
+  await kdb.deleteFrom("key_value").where("namespace", "=", namespace).execute();
+}
+
+async function pgGetKeyValueRowsByKeyPrefix(
+  namespace: string,
+  keyPrefix: string
+): Promise<Array<{ key: string; value: string }>> {
+  await ensurePostgresBootstrap();
+  const kdb = getKyselyDb();
+  return await kdb
+    .selectFrom("key_value")
+    .select(["key", "value"])
+    .where("namespace", "=", namespace)
+    .where("key", "like", `${keyPrefix}%`)
+    .execute();
+}
+
 // ──────────────── Custom Models ────────────────
 
 export async function getCustomModels(providerId?: string) {
+  if (isPostgres()) {
+    if (providerId) {
+      const value = await pgGetKeyValue("customModels", providerId);
+      return value ? JSON.parse(value) : [];
+    }
+    const rows = await pgGetKeyValueRows("customModels");
+    const result: Record<string, unknown> = {};
+    for (const row of rows) {
+      const { key, value } = getKeyValue(row);
+      if (!key || value === null) continue;
+      result[key] = JSON.parse(value);
+    }
+    return result;
+  }
   const db = getDbInstance();
   if (providerId) {
     const row = db
@@ -64,6 +151,16 @@ export async function getCustomModels(providerId?: string) {
 }
 
 export async function getAllCustomModels() {
+  if (isPostgres()) {
+    const rows = await pgGetKeyValueRows("customModels");
+    const result: Record<string, unknown> = {};
+    for (const row of rows) {
+      const { key, value } = getKeyValue(row);
+      if (!key || value === null) continue;
+      result[key] = JSON.parse(value);
+    }
+    return result;
+  }
   const db = getDbInstance();
   const rows = db
     .prepare("SELECT key, value FROM key_value WHERE namespace = 'customModels'")
@@ -102,11 +199,13 @@ export async function addCustomModel(
   // form — read back by getCustomVisionCapabilityFields() in the /v1/models catalog.
   supportsVision?: boolean
 ) {
-  const db = getDbInstance();
-  const row = db
-    .prepare("SELECT value FROM key_value WHERE namespace = 'customModels' AND key = ?")
-    .get(providerId);
-  const value = getKeyValue(row).value;
+  const value = isPostgres()
+    ? await pgGetKeyValue("customModels", providerId)
+    : getKeyValue(
+        getDbInstance()
+          .prepare("SELECT value FROM key_value WHERE namespace = 'customModels' AND key = ?")
+          .get(providerId)
+      ).value;
   const models = value ? JSON.parse(value) : [];
 
   const exists = models.find((m: JsonRecord) => m.id === modelId);
@@ -128,6 +227,11 @@ export async function addCustomModel(
     ...(typeof supportsVision === "boolean" ? { supportsVision } : {}),
   };
   models.push(model);
+  if (isPostgres()) {
+    await pgSetKeyValue("customModels", providerId, JSON.stringify(models));
+    return model;
+  }
+  const db = getDbInstance();
   db.prepare(
     "INSERT OR REPLACE INTO key_value (namespace, key, value) VALUES ('customModels', ?, ?)"
   ).run(providerId, JSON.stringify(models));
@@ -163,7 +267,6 @@ export async function replaceCustomModels(
     return Array.isArray(existing) ? existing : [];
   }
 
-  const db = getDbInstance();
   const existing = await getCustomModels(providerId);
   const existingMap = new Map<string, JsonRecord>();
   if (Array.isArray(existing)) {
@@ -224,6 +327,16 @@ export async function replaceCustomModels(
     };
   });
 
+  if (isPostgres()) {
+    if (merged.length === 0) {
+      await pgDeleteKeyValue("customModels", providerId);
+    } else {
+      await pgSetKeyValue("customModels", providerId, JSON.stringify(merged));
+    }
+    return merged;
+  }
+
+  const db = getDbInstance();
   if (merged.length === 0) {
     db.prepare("DELETE FROM key_value WHERE namespace = 'customModels' AND key = ?").run(
       providerId
@@ -239,6 +352,23 @@ export async function replaceCustomModels(
 }
 
 export async function removeCustomModel(providerId: string, modelId: string) {
+  if (isPostgres()) {
+    const value = await pgGetKeyValue("customModels", providerId);
+    if (!value) return false;
+    const models = JSON.parse(value);
+    const before = models.length;
+    const filtered = models.filter((m: JsonRecord) => m.id !== modelId);
+    if (filtered.length === before) return false;
+
+    if (filtered.length === 0) {
+      await pgDeleteKeyValue("customModels", providerId);
+    } else {
+      await pgSetKeyValue("customModels", providerId, JSON.stringify(filtered));
+    }
+    removeModelCompatOverride(providerId, modelId);
+    return true;
+  }
+
   const db = getDbInstance();
   const row = db
     .prepare("SELECT value FROM key_value WHERE namespace = 'customModels' AND key = ?")
@@ -351,12 +481,16 @@ export async function getSyncedAvailableModelsForConnection(
   providerId: string,
   connectionId: string
 ): Promise<SyncedAvailableModel[]> {
-  const db = getDbInstance();
   const key = `${providerId}:${connectionId}`;
-  const row = db
-    .prepare("SELECT value FROM key_value WHERE namespace = 'syncedAvailableModels' AND key = ?")
-    .get(key);
-  const value = getKeyValue(row).value;
+  const value = isPostgres()
+    ? await pgGetKeyValue("syncedAvailableModels", key)
+    : getKeyValue(
+        getDbInstance()
+          .prepare(
+            "SELECT value FROM key_value WHERE namespace = 'syncedAvailableModels' AND key = ?"
+          )
+          .get(key)
+      ).value;
   if (!value) return [];
   try {
     const models = JSON.parse(value);
@@ -372,12 +506,13 @@ export async function getSyncedAvailableModelsForConnection(
 export async function getSyncedAvailableModels(
   providerId: string
 ): Promise<SyncedAvailableModel[]> {
-  const db = getDbInstance();
-  const rows = db
-    .prepare(
-      "SELECT key, value FROM key_value WHERE namespace = 'syncedAvailableModels' AND key LIKE ?"
-    )
-    .all(`${providerId}:%`);
+  const rows = isPostgres()
+    ? await pgGetKeyValueRowsByKeyPrefix("syncedAvailableModels", `${providerId}:`)
+    : getDbInstance()
+        .prepare(
+          "SELECT key, value FROM key_value WHERE namespace = 'syncedAvailableModels' AND key LIKE ?"
+        )
+        .all(`${providerId}:%`);
   const map = new Map<string, SyncedAvailableModel>();
   for (const row of rows) {
     const { key, value } = getKeyValue(row);
@@ -396,13 +531,14 @@ export async function getSyncedAvailableModels(
 export async function getSyncedAvailableModelsByConnection(
   providerId: string
 ): Promise<Record<string, SyncedAvailableModel[]>> {
-  const db = getDbInstance();
   const prefix = `${providerId}:`;
-  const rows = db
-    .prepare(
-      "SELECT key, value FROM key_value WHERE namespace = 'syncedAvailableModels' AND key LIKE ?"
-    )
-    .all(`${prefix}%`);
+  const rows = isPostgres()
+    ? await pgGetKeyValueRowsByKeyPrefix("syncedAvailableModels", prefix)
+    : getDbInstance()
+        .prepare(
+          "SELECT key, value FROM key_value WHERE namespace = 'syncedAvailableModels' AND key LIKE ?"
+        )
+        .all(`${prefix}%`);
   const result: Record<string, SyncedAvailableModel[]> = {};
   for (const row of rows) {
     const { key, value } = getKeyValue(row);
@@ -423,10 +559,11 @@ export async function getSyncedAvailableModelsByConnection(
 export async function getAllSyncedAvailableModels(): Promise<
   Record<string, SyncedAvailableModel[]>
 > {
-  const db = getDbInstance();
-  const rows = db
-    .prepare("SELECT key, value FROM key_value WHERE namespace = 'syncedAvailableModels'")
-    .all();
+  const rows = isPostgres()
+    ? await pgGetKeyValueRows("syncedAvailableModels")
+    : getDbInstance()
+        .prepare("SELECT key, value FROM key_value WHERE namespace = 'syncedAvailableModels'")
+        .all();
   // Group by providerId (before the colon)
   const byProvider = new Map<string, Map<string, SyncedAvailableModel>>();
   for (const row of rows) {
@@ -456,7 +593,6 @@ export async function replaceSyncedAvailableModelsForConnection(
   connectionId: string,
   models: SyncedAvailableModelInput[]
 ): Promise<SyncedAvailableModel[]> {
-  const db = getDbInstance();
   const key = `${providerId}:${connectionId}`;
   // #3199: drop ids the operator DELETED (trash) so a re-fetch does not re-import
   // a model that was explicitly removed.
@@ -465,9 +601,24 @@ export async function replaceSyncedAvailableModelsForConnection(
   // the synced store so they remain listed-but-hidden across re-syncs instead of
   // churning back on through the managed-alias path ("Auto Sync Enabling all
   // Models"). See getModelIsDeleted for the legacy-row caveat.
+  //
+  // NOTE: getModelIsDeleted() reads the compat-override layer (models/compat.ts),
+  // which is not yet dual-dialect — under DB_DRIVER=postgres this filter always
+  // sees "not deleted" (compat overrides are still SQLite-only), so a Postgres
+  // deployment does not yet honor deleted-model markers here. Tracked alongside
+  // the rest of the models/compat.ts conversion.
   const normalizedModels = normalizeSyncedAvailableModels(models).filter(
     (m) => !getModelIsDeleted(providerId, m.id)
   );
+  if (isPostgres()) {
+    if (normalizedModels.length === 0) {
+      await pgDeleteKeyValue("syncedAvailableModels", key);
+    } else {
+      await pgSetKeyValue("syncedAvailableModels", key, JSON.stringify(normalizedModels));
+    }
+    return getSyncedAvailableModels(providerId);
+  }
+  const db = getDbInstance();
   if (normalizedModels.length === 0) {
     db.prepare("DELETE FROM key_value WHERE namespace = 'syncedAvailableModels' AND key = ?").run(
       key
@@ -490,8 +641,54 @@ export async function removeSyncedAvailableModel(
   providerId: string,
   modelId: string
 ): Promise<boolean> {
-  const db = getDbInstance();
   const prefix = `${providerId}:`;
+
+  if (isPostgres()) {
+    await ensurePostgresBootstrap();
+    const kdb = getKyselyDb();
+    const rows = await pgGetKeyValueRowsByKeyPrefix("syncedAvailableModels", prefix);
+    let removedAny = false;
+    await kdb.transaction().execute(async (trx) => {
+      for (const row of rows) {
+        const { key, value } = getKeyValue(row);
+        if (!key || value === null) continue;
+
+        let parsedModels: unknown;
+        try {
+          parsedModels = JSON.parse(value);
+        } catch (error) {
+          console.warn(
+            `[DB] Skipping malformed syncedAvailableModels entry for key ${key}:`,
+            error
+          );
+          continue;
+        }
+
+        const models = normalizeSyncedAvailableModels(parsedModels);
+        const filtered = models.filter((m) => m.id !== modelId);
+        if (filtered.length !== models.length) {
+          removedAny = true;
+          if (filtered.length === 0) {
+            await trx
+              .deleteFrom("key_value")
+              .where("namespace", "=", "syncedAvailableModels")
+              .where("key", "=", key)
+              .execute();
+          } else {
+            await trx
+              .updateTable("key_value")
+              .set({ value: JSON.stringify(filtered) })
+              .where("namespace", "=", "syncedAvailableModels")
+              .where("key", "=", key)
+              .execute();
+          }
+        }
+      }
+    });
+    return removedAny;
+  }
+
+  const db = getDbInstance();
   const rows = db
     .prepare(
       "SELECT key, value FROM key_value WHERE namespace = 'syncedAvailableModels' AND key LIKE ?"
@@ -543,8 +740,12 @@ export async function deleteSyncedAvailableModelsForConnection(
   providerId: string,
   connectionId: string
 ): Promise<SyncedAvailableModel[]> {
-  const db = getDbInstance();
   const key = `${providerId}:${connectionId}`;
+  if (isPostgres()) {
+    await pgDeleteKeyValue("syncedAvailableModels", key);
+    return getSyncedAvailableModels(providerId);
+  }
+  const db = getDbInstance();
   db.prepare("DELETE FROM key_value WHERE namespace = 'syncedAvailableModels' AND key = ?").run(
     key
   );
@@ -557,8 +758,18 @@ export async function deleteSyncedAvailableModelsForConnection(
  * Returns the number of connection-scoped synced model lists removed.
  */
 export async function deleteSyncedAvailableModelsForProvider(providerId: string): Promise<number> {
-  const db = getDbInstance();
   const keyPrefix = `${providerId}:`;
+  if (isPostgres()) {
+    await ensurePostgresBootstrap();
+    const kdb = getKyselyDb();
+    const result = await kdb
+      .deleteFrom("key_value")
+      .where("namespace", "=", "syncedAvailableModels")
+      .where("key", "like", `${keyPrefix}%`)
+      .executeTakeFirst();
+    return Number(result.numDeletedRows ?? 0);
+  }
+  const db = getDbInstance();
   const result = db
     .prepare(
       "DELETE FROM key_value WHERE namespace = 'syncedAvailableModels' AND substr(key, 1, ?) = ?"
@@ -576,13 +787,26 @@ export async function pruneStaleSyncedAvailableModelsForProvider(
   providerId: string,
   allowedConnectionIds: string[]
 ): Promise<number> {
-  const db = getDbInstance();
   if (allowedConnectionIds.length === 0) {
     return deleteSyncedAvailableModelsForProvider(providerId);
   }
-  const placeholders = allowedConnectionIds.map(() => "?").join(",");
   const keyPrefix = `${providerId}:`;
   const allowedKeys = allowedConnectionIds.map((id) => `${providerId}:${id}`);
+
+  if (isPostgres()) {
+    await ensurePostgresBootstrap();
+    const kdb = getKyselyDb();
+    const result = await kdb
+      .deleteFrom("key_value")
+      .where("namespace", "=", "syncedAvailableModels")
+      .where("key", "like", `${keyPrefix}%`)
+      .where("key", "not in", allowedKeys)
+      .executeTakeFirst();
+    return Number(result.numDeletedRows ?? 0);
+  }
+
+  const db = getDbInstance();
+  const placeholders = allowedConnectionIds.map(() => "?").join(",");
   const result = db
     .prepare(
       `DELETE FROM key_value WHERE namespace = 'syncedAvailableModels' AND key LIKE ? AND key NOT IN (${placeholders})`
@@ -616,13 +840,13 @@ export async function updateCustomModel(
   modelId: string,
   updates: Record<string, unknown> = {}
 ) {
-  const db = getDbInstance();
-  const row = db
-    .prepare("SELECT value FROM key_value WHERE namespace = 'customModels' AND key = ?")
-    .get(providerId);
-  if (!row) return null;
-
-  const value = getKeyValue(row).value;
+  const value = isPostgres()
+    ? await pgGetKeyValue("customModels", providerId)
+    : getKeyValue(
+        getDbInstance()
+          .prepare("SELECT value FROM key_value WHERE namespace = 'customModels' AND key = ?")
+          .get(providerId)
+      ).value;
   if (!value) return null;
 
   const models = JSON.parse(value);
@@ -685,10 +909,14 @@ export async function updateCustomModel(
 
   models[index] = next;
 
-  db.prepare("UPDATE key_value SET value = ? WHERE namespace = 'customModels' AND key = ?").run(
-    JSON.stringify(models),
-    providerId
-  );
+  if (isPostgres()) {
+    await pgSetKeyValue("customModels", providerId, JSON.stringify(models));
+    return next;
+  }
+
+  getDbInstance()
+    .prepare("UPDATE key_value SET value = ? WHERE namespace = 'customModels' AND key = ?")
+    .run(JSON.stringify(models), providerId);
 
   backupDbFile("pre-write");
   return next;
