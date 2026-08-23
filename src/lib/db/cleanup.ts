@@ -8,11 +8,17 @@ import { getDbInstance } from "./core";
 import { getUserDatabaseSettings } from "./databaseSettings";
 import { rollupUsageHistoryBeforeDate } from "@/lib/usage/aggregateHistory";
 import { purgeCallLogArtifactDirectory } from "@/lib/usage/callLogArtifacts";
+import { resolveDbDriverConfig } from "./driverConfig";
+import { ensurePostgresBootstrap, getKyselyDb } from "./kysely/client";
 
 interface CleanupResult {
   deleted: number;
   deletedArtifacts?: number;
   errors: number;
+}
+
+function isPostgres(): boolean {
+  return resolveDbDriverConfig().driver === "postgres";
 }
 
 function getRetentionSettings() {
@@ -23,7 +29,6 @@ function getRetentionSettings() {
  * Clean up old quota_snapshots based on retention settings.
  */
 export async function cleanupQuotaSnapshots(): Promise<CleanupResult> {
-  const db = getDbInstance();
   const retention = getRetentionSettings();
 
   const retentionDays = retention.quotaSnapshots;
@@ -34,9 +39,20 @@ export async function cleanupQuotaSnapshots(): Promise<CleanupResult> {
   const result: CleanupResult = { deleted: 0, errors: 0 };
 
   try {
-    const stmt = db.prepare("DELETE FROM quota_snapshots WHERE created_at < ?");
-    const runResult = stmt.run(cutoffISO);
-    result.deleted = runResult.changes;
+    if (isPostgres()) {
+      await ensurePostgresBootstrap();
+      const kdb = getKyselyDb();
+      const del = await kdb
+        .deleteFrom("quota_snapshots")
+        .where("created_at", "<", cutoffISO)
+        .executeTakeFirst();
+      result.deleted = Number(del.numDeletedRows);
+    } else {
+      const db = getDbInstance();
+      const stmt = db.prepare("DELETE FROM quota_snapshots WHERE created_at < ?");
+      const runResult = stmt.run(cutoffISO);
+      result.deleted = runResult.changes;
+    }
 
     console.log(
       `[Cleanup] Deleted ${result.deleted} quota_snapshots older than ${retentionDays} days`
@@ -53,7 +69,6 @@ export async function cleanupQuotaSnapshots(): Promise<CleanupResult> {
  * Clean up old call_logs based on retention settings.
  */
 export async function cleanupCallLogs(): Promise<CleanupResult> {
-  const db = getDbInstance();
   const retention = getRetentionSettings();
 
   const retentionDays = retention.callLogs;
@@ -64,9 +79,20 @@ export async function cleanupCallLogs(): Promise<CleanupResult> {
   const result: CleanupResult = { deleted: 0, errors: 0 };
 
   try {
-    const stmt = db.prepare("DELETE FROM call_logs WHERE timestamp < ?");
-    const runResult = stmt.run(cutoffISO);
-    result.deleted = runResult.changes;
+    if (isPostgres()) {
+      await ensurePostgresBootstrap();
+      const kdb = getKyselyDb();
+      const del = await kdb
+        .deleteFrom("call_logs")
+        .where("timestamp", "<", cutoffISO)
+        .executeTakeFirst();
+      result.deleted = Number(del.numDeletedRows);
+    } else {
+      const db = getDbInstance();
+      const stmt = db.prepare("DELETE FROM call_logs WHERE timestamp < ?");
+      const runResult = stmt.run(cutoffISO);
+      result.deleted = runResult.changes;
+    }
 
     console.log(`[Cleanup] Deleted ${result.deleted} call_logs older than ${retentionDays} days`);
   } catch (err: unknown) {
@@ -79,6 +105,10 @@ export async function cleanupCallLogs(): Promise<CleanupResult> {
 
 /**
  * Clean up old usage_history based on retention settings.
+ *
+ * SQLite-only for now: depends on rollupUsageHistoryBeforeDate()
+ * (src/lib/usage/aggregateHistory.ts), which is a separate, still-SQLite-only
+ * module. Deferred until that module is converted.
  */
 export async function cleanupUsageHistory(): Promise<CleanupResult> {
   const db = getDbInstance();
@@ -130,7 +160,6 @@ export async function cleanupUsageHistory(): Promise<CleanupResult> {
  * Clean up old compression_analytics based on retention settings.
  */
 export async function cleanupCompressionAnalytics(): Promise<CleanupResult> {
-  const db = getDbInstance();
   const retention = getRetentionSettings();
 
   const retentionDays = retention.compressionAnalytics;
@@ -141,9 +170,20 @@ export async function cleanupCompressionAnalytics(): Promise<CleanupResult> {
   const result: CleanupResult = { deleted: 0, errors: 0 };
 
   try {
-    const stmt = db.prepare("DELETE FROM compression_analytics WHERE timestamp < ?");
-    const runResult = stmt.run(cutoffISO);
-    result.deleted = runResult.changes;
+    if (isPostgres()) {
+      await ensurePostgresBootstrap();
+      const kdb = getKyselyDb();
+      const del = await kdb
+        .deleteFrom("compression_analytics")
+        .where("timestamp", "<", cutoffISO)
+        .executeTakeFirst();
+      result.deleted = Number(del.numDeletedRows);
+    } else {
+      const db = getDbInstance();
+      const stmt = db.prepare("DELETE FROM compression_analytics WHERE timestamp < ?");
+      const runResult = stmt.run(cutoffISO);
+      result.deleted = runResult.changes;
+    }
 
     console.log(
       `[Cleanup] Deleted ${result.deleted} compression_analytics older than ${retentionDays} days`
@@ -160,7 +200,6 @@ export async function cleanupCompressionAnalytics(): Promise<CleanupResult> {
  * Clean up old mcp_audit_log based on retention settings.
  */
 export async function cleanupMcpAudit(): Promise<CleanupResult> {
-  const db = getDbInstance();
   const retention = getRetentionSettings();
 
   const retentionDays = retention.mcpAudit;
@@ -171,9 +210,24 @@ export async function cleanupMcpAudit(): Promise<CleanupResult> {
   const result: CleanupResult = { deleted: 0, errors: 0 };
 
   try {
-    const stmt = db.prepare("DELETE FROM mcp_tool_audit WHERE timestamp < ?");
-    const runResult = stmt.run(cutoffISO);
-    result.deleted = runResult.changes;
+    // mcp_tool_audit's timestamp column is `created_at` (see
+    // migrations/002_mcp_a2a_tables.sql) — a prior `WHERE timestamp < ?` here
+    // referenced a nonexistent column and silently no-opped every run
+    // (caught by the catch block below, surfaced only as a errors++).
+    if (isPostgres()) {
+      await ensurePostgresBootstrap();
+      const kdb = getKyselyDb();
+      const del = await kdb
+        .deleteFrom("mcp_tool_audit")
+        .where("created_at", "<", cutoffISO)
+        .executeTakeFirst();
+      result.deleted = Number(del.numDeletedRows);
+    } else {
+      const db = getDbInstance();
+      const stmt = db.prepare("DELETE FROM mcp_tool_audit WHERE created_at < ?");
+      const runResult = stmt.run(cutoffISO);
+      result.deleted = runResult.changes;
+    }
 
     console.log(
       `[Cleanup] Deleted ${result.deleted} mcp_audit_log older than ${retentionDays} days`
@@ -190,7 +244,6 @@ export async function cleanupMcpAudit(): Promise<CleanupResult> {
  * Clean up old a2a_events based on retention settings.
  */
 export async function cleanupA2aEvents(): Promise<CleanupResult> {
-  const db = getDbInstance();
   const retention = getRetentionSettings();
 
   const retentionDays = retention.a2aEvents;
@@ -201,9 +254,23 @@ export async function cleanupA2aEvents(): Promise<CleanupResult> {
   const result: CleanupResult = { deleted: 0, errors: 0 };
 
   try {
-    const stmt = db.prepare("DELETE FROM a2a_task_events WHERE timestamp < ?");
-    const runResult = stmt.run(cutoffISO);
-    result.deleted = runResult.changes;
+    // a2a_task_events' timestamp column is `created_at` (see
+    // migrations/002_mcp_a2a_tables.sql) — same nonexistent-column bug as
+    // cleanupMcpAudit above.
+    if (isPostgres()) {
+      await ensurePostgresBootstrap();
+      const kdb = getKyselyDb();
+      const del = await kdb
+        .deleteFrom("a2a_task_events")
+        .where("created_at", "<", cutoffISO)
+        .executeTakeFirst();
+      result.deleted = Number(del.numDeletedRows);
+    } else {
+      const db = getDbInstance();
+      const stmt = db.prepare("DELETE FROM a2a_task_events WHERE created_at < ?");
+      const runResult = stmt.run(cutoffISO);
+      result.deleted = runResult.changes;
+    }
 
     console.log(`[Cleanup] Deleted ${result.deleted} a2a_events older than ${retentionDays} days`);
   } catch (err: unknown) {
@@ -218,7 +285,6 @@ export async function cleanupA2aEvents(): Promise<CleanupResult> {
  * Clean up old memory_entries based on retention settings.
  */
 export async function cleanupMemoryEntries(): Promise<CleanupResult> {
-  const db = getDbInstance();
   const retention = getRetentionSettings();
 
   const retentionDays = retention.memoryEntries;
@@ -229,9 +295,20 @@ export async function cleanupMemoryEntries(): Promise<CleanupResult> {
   const result: CleanupResult = { deleted: 0, errors: 0 };
 
   try {
-    const stmt = db.prepare("DELETE FROM memories WHERE created_at < ?");
-    const runResult = stmt.run(cutoffISO);
-    result.deleted = runResult.changes;
+    if (isPostgres()) {
+      await ensurePostgresBootstrap();
+      const kdb = getKyselyDb();
+      const del = await kdb
+        .deleteFrom("memories")
+        .where("created_at", "<", cutoffISO)
+        .executeTakeFirst();
+      result.deleted = Number(del.numDeletedRows);
+    } else {
+      const db = getDbInstance();
+      const stmt = db.prepare("DELETE FROM memories WHERE created_at < ?");
+      const runResult = stmt.run(cutoffISO);
+      result.deleted = runResult.changes;
+    }
 
     console.log(
       `[Cleanup] Deleted ${result.deleted} memory_entries older than ${retentionDays} days`
@@ -285,13 +362,20 @@ export async function runAutoCleanup(): Promise<{
  * Purge ALL quota_snapshots immediately (no retention check).
  */
 export async function purgeQuotaSnapshots(): Promise<CleanupResult> {
-  const db = getDbInstance();
   const result: CleanupResult = { deleted: 0, errors: 0 };
 
   try {
-    const stmt = db.prepare("DELETE FROM quota_snapshots");
-    const runResult = stmt.run();
-    result.deleted = runResult.changes;
+    if (isPostgres()) {
+      await ensurePostgresBootstrap();
+      const kdb = getKyselyDb();
+      const del = await kdb.deleteFrom("quota_snapshots").executeTakeFirst();
+      result.deleted = Number(del.numDeletedRows);
+    } else {
+      const db = getDbInstance();
+      const stmt = db.prepare("DELETE FROM quota_snapshots");
+      const runResult = stmt.run();
+      result.deleted = runResult.changes;
+    }
 
     console.log(`[Cleanup] Purged ${result.deleted} quota_snapshots`);
   } catch (err: unknown) {
@@ -306,12 +390,19 @@ export async function purgeQuotaSnapshots(): Promise<CleanupResult> {
  * Purge ALL call_logs immediately (no retention check).
  */
 export async function purgeCallLogs(): Promise<CleanupResult> {
-  const db = getDbInstance();
   const result: CleanupResult = { deleted: 0, deletedArtifacts: 0, errors: 0 };
 
   try {
-    const runResult = db.prepare("DELETE FROM call_logs").run();
-    result.deleted = runResult.changes;
+    if (isPostgres()) {
+      await ensurePostgresBootstrap();
+      const kdb = getKyselyDb();
+      const del = await kdb.deleteFrom("call_logs").executeTakeFirst();
+      result.deleted = Number(del.numDeletedRows);
+    } else {
+      const db = getDbInstance();
+      const runResult = db.prepare("DELETE FROM call_logs").run();
+      result.deleted = runResult.changes;
+    }
 
     console.log(`[Cleanup] Purged ${result.deleted} call_logs`);
   } catch (err: unknown) {
@@ -334,13 +425,20 @@ export async function purgeCallLogs(): Promise<CleanupResult> {
  * Purge ALL request_detail_logs immediately (no retention check).
  */
 export async function purgeDetailedLogs(): Promise<CleanupResult> {
-  const db = getDbInstance();
   const result: CleanupResult = { deleted: 0, errors: 0 };
 
   try {
-    const stmt = db.prepare("DELETE FROM request_detail_logs");
-    const runResult = stmt.run();
-    result.deleted = runResult.changes;
+    if (isPostgres()) {
+      await ensurePostgresBootstrap();
+      const kdb = getKyselyDb();
+      const del = await kdb.deleteFrom("request_detail_logs").executeTakeFirst();
+      result.deleted = Number(del.numDeletedRows);
+    } else {
+      const db = getDbInstance();
+      const stmt = db.prepare("DELETE FROM request_detail_logs");
+      const runResult = stmt.run();
+      result.deleted = runResult.changes;
+    }
 
     console.log(`[Cleanup] Purged ${result.deleted} request_detail_logs`);
   } catch (err: unknown) {
@@ -410,7 +508,6 @@ export async function resetUsageHistory(period: string): Promise<ResetUsageHisto
     throw new Error(`Invalid reset period: ${period}`);
   }
 
-  const db = getDbInstance();
   const result: ResetUsageHistoryResult = {
     deleted: 0,
     deletedUsageHistory: 0,
@@ -420,43 +517,83 @@ export async function resetUsageHistory(period: string): Promise<ResetUsageHisto
   };
 
   try {
-    const runReset = db.transaction(() => {
-      if (period === "all") {
-        const usageHistory = db.prepare("DELETE FROM usage_history").run();
-        const dailySummary = db.prepare("DELETE FROM daily_usage_summary").run();
-        const hourlySummary = db.prepare("DELETE FROM hourly_usage_summary").run();
+    if (isPostgres()) {
+      await ensurePostgresBootstrap();
+      const kdb = getKyselyDb();
+      await kdb.transaction().execute(async (trx) => {
+        if (period === "all") {
+          const usageHistory = await trx.deleteFrom("usage_history").executeTakeFirst();
+          const dailySummary = await trx.deleteFrom("daily_usage_summary").executeTakeFirst();
+          const hourlySummary = await trx.deleteFrom("hourly_usage_summary").executeTakeFirst();
+          result.deletedUsageHistory = Number(usageHistory.numDeletedRows);
+          result.deletedDailySummary = Number(dailySummary.numDeletedRows);
+          result.deletedHourlySummary = Number(hourlySummary.numDeletedRows);
+          return;
+        }
+
+        const cutoffMs = Date.now() - RESET_USAGE_HISTORY_PERIOD_MS[period];
+        const cutoffIso = new Date(cutoffMs).toISOString();
+        const cutoffDate = cutoffIso.slice(0, 10);
+        const cutoffDateHour = `${cutoffIso.slice(0, 10)} ${cutoffIso.slice(11, 13)}:00:00`;
+
+        const usageHistory = await trx
+          .deleteFrom("usage_history")
+          .where("timestamp", "<", cutoffIso)
+          .executeTakeFirst();
+        const dailySummary = await trx
+          .deleteFrom("daily_usage_summary")
+          .where("date", "<", cutoffDate)
+          .executeTakeFirst();
+        const hourlySummary = await trx
+          .deleteFrom("hourly_usage_summary")
+          .where("date_hour", "<", cutoffDateHour)
+          .executeTakeFirst();
+
+        result.deletedUsageHistory = Number(usageHistory.numDeletedRows);
+        result.deletedDailySummary = Number(dailySummary.numDeletedRows);
+        result.deletedHourlySummary = Number(hourlySummary.numDeletedRows);
+      });
+    } else {
+      const db = getDbInstance();
+      const runReset = db.transaction(() => {
+        if (period === "all") {
+          const usageHistory = db.prepare("DELETE FROM usage_history").run();
+          const dailySummary = db.prepare("DELETE FROM daily_usage_summary").run();
+          const hourlySummary = db.prepare("DELETE FROM hourly_usage_summary").run();
+          result.deletedUsageHistory = usageHistory.changes;
+          result.deletedDailySummary = dailySummary.changes;
+          result.deletedHourlySummary = hourlySummary.changes;
+          return;
+        }
+
+        const cutoffMs = Date.now() - RESET_USAGE_HISTORY_PERIOD_MS[period];
+        const cutoffIso = new Date(cutoffMs).toISOString();
+        // usage_history.timestamp is a full ISO string; daily_usage_summary.date is
+        // "YYYY-MM-DD"; hourly_usage_summary.date_hour is "YYYY-MM-DD HH:00:00" (see
+        // src/lib/usage/aggregateHistory.ts, which derives both with SQLite's UTC-based
+        // DATE()/strftime()). Slicing the UTC ISO cutoff keeps all three comparisons
+        // consistent without re-deriving timezone-sensitive date math by hand.
+        const cutoffDate = cutoffIso.slice(0, 10);
+        const cutoffDateHour = `${cutoffIso.slice(0, 10)} ${cutoffIso.slice(11, 13)}:00:00`;
+
+        const usageHistory = db
+          .prepare("DELETE FROM usage_history WHERE timestamp < ?")
+          .run(cutoffIso);
+        const dailySummary = db
+          .prepare("DELETE FROM daily_usage_summary WHERE date < ?")
+          .run(cutoffDate);
+        const hourlySummary = db
+          .prepare("DELETE FROM hourly_usage_summary WHERE date_hour < ?")
+          .run(cutoffDateHour);
+
         result.deletedUsageHistory = usageHistory.changes;
         result.deletedDailySummary = dailySummary.changes;
         result.deletedHourlySummary = hourlySummary.changes;
-        return;
-      }
+      });
 
-      const cutoffMs = Date.now() - RESET_USAGE_HISTORY_PERIOD_MS[period];
-      const cutoffIso = new Date(cutoffMs).toISOString();
-      // usage_history.timestamp is a full ISO string; daily_usage_summary.date is
-      // "YYYY-MM-DD"; hourly_usage_summary.date_hour is "YYYY-MM-DD HH:00:00" (see
-      // src/lib/usage/aggregateHistory.ts, which derives both with SQLite's UTC-based
-      // DATE()/strftime()). Slicing the UTC ISO cutoff keeps all three comparisons
-      // consistent without re-deriving timezone-sensitive date math by hand.
-      const cutoffDate = cutoffIso.slice(0, 10);
-      const cutoffDateHour = `${cutoffIso.slice(0, 10)} ${cutoffIso.slice(11, 13)}:00:00`;
+      runReset();
+    }
 
-      const usageHistory = db
-        .prepare("DELETE FROM usage_history WHERE timestamp < ?")
-        .run(cutoffIso);
-      const dailySummary = db
-        .prepare("DELETE FROM daily_usage_summary WHERE date < ?")
-        .run(cutoffDate);
-      const hourlySummary = db
-        .prepare("DELETE FROM hourly_usage_summary WHERE date_hour < ?")
-        .run(cutoffDateHour);
-
-      result.deletedUsageHistory = usageHistory.changes;
-      result.deletedDailySummary = dailySummary.changes;
-      result.deletedHourlySummary = hourlySummary.changes;
-    });
-
-    runReset();
     result.deleted =
       result.deletedUsageHistory + result.deletedDailySummary + result.deletedHourlySummary;
 
@@ -477,7 +614,6 @@ export async function resetUsageHistory(period: string): Promise<ResetUsageHisto
  * Uses the same retention period as call_logs (30 days default).
  */
 export async function cleanupProxyLogs(): Promise<CleanupResult> {
-  const db = getDbInstance();
   const retention = getRetentionSettings();
 
   const retentionDays = retention.callLogs;
@@ -488,13 +624,22 @@ export async function cleanupProxyLogs(): Promise<CleanupResult> {
   const result: CleanupResult = { deleted: 0, errors: 0 };
 
   try {
-    const stmt = db.prepare("DELETE FROM proxy_logs WHERE timestamp < ?");
-    const runResult = stmt.run(cutoffISO);
-    result.deleted = runResult.changes;
+    if (isPostgres()) {
+      await ensurePostgresBootstrap();
+      const kdb = getKyselyDb();
+      const del = await kdb
+        .deleteFrom("proxy_logs")
+        .where("timestamp", "<", cutoffISO)
+        .executeTakeFirst();
+      result.deleted = Number(del.numDeletedRows);
+    } else {
+      const db = getDbInstance();
+      const stmt = db.prepare("DELETE FROM proxy_logs WHERE timestamp < ?");
+      const runResult = stmt.run(cutoffISO);
+      result.deleted = runResult.changes;
+    }
 
-    console.log(
-      `[Cleanup] Deleted ${result.deleted} proxy_logs older than ${retentionDays} days`
-    );
+    console.log(`[Cleanup] Deleted ${result.deleted} proxy_logs older than ${retentionDays} days`);
   } catch (err: unknown) {
     console.error("[Cleanup] Error cleaning proxy_logs:", err);
     result.errors++;
@@ -525,10 +670,8 @@ export function startCleanupScheduler(): void {
       const result = await runAutoCleanup();
       const proxyResult = await cleanupProxyLogs();
       const totalDeleted = result.totalDeleted + proxyResult.deleted;
-      if (totalDeleted > 0) {
-        console.log(
-          `[Cleanup] Startup cleanup freed ${totalDeleted} rows. Running VACUUM...`
-        );
+      if (totalDeleted > 0 && !isPostgres()) {
+        console.log(`[Cleanup] Startup cleanup freed ${totalDeleted} rows. Running VACUUM...`);
         try {
           const db = getDbInstance();
           db.exec("VACUUM");
@@ -548,10 +691,8 @@ export function startCleanupScheduler(): void {
       const result = await runAutoCleanup();
       const proxyResult = await cleanupProxyLogs();
       const totalDeleted = result.totalDeleted + proxyResult.deleted;
-      if (totalDeleted > 0) {
-        console.log(
-          `[Cleanup] Periodic cleanup freed ${totalDeleted} rows. Running VACUUM...`
-        );
+      if (totalDeleted > 0 && !isPostgres()) {
+        console.log(`[Cleanup] Periodic cleanup freed ${totalDeleted} rows. Running VACUUM...`);
         try {
           const db = getDbInstance();
           db.exec("VACUUM");

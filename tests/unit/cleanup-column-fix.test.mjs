@@ -57,10 +57,7 @@ test("cleanup: has background scheduler (startCleanupScheduler)", () => {
     source.includes("startCleanupScheduler"),
     "must export startCleanupScheduler for periodic background cleanup"
   );
-  assert.ok(
-    source.includes("CLEANUP_INTERVAL_MS"),
-    "must have a cleanup interval constant"
-  );
+  assert.ok(source.includes("CLEANUP_INTERVAL_MS"), "must have a cleanup interval constant");
   assert.ok(
     source.includes("VACUUM"),
     "scheduler must run VACUUM after deletes to reclaim disk space"
@@ -102,11 +99,23 @@ test("cleanup: a2a_task_events uses correct table name (not 'a2a_events')", () =
   );
 });
 
-test("cleanup: memories uses correct table name (not 'memory_entries')", () => {
+test("cleanup: mcp_tool_audit and a2a_task_events use created_at (not the nonexistent 'timestamp' column)", () => {
+  // migrations/002_mcp_a2a_tables.sql defines both tables with a `created_at`
+  // column and no `timestamp` column — a prior `WHERE timestamp < ?` here
+  // silently failed every run (caught by the catch block, surfaced only as
+  // errors++, never crashing the scheduler).
   assert.ok(
-    source.includes("DELETE FROM memories WHERE"),
-    "must use correct table name memories"
+    source.includes("DELETE FROM mcp_tool_audit WHERE created_at < ?"),
+    "mcp_tool_audit cleanup must use created_at column"
   );
+  assert.ok(
+    source.includes("DELETE FROM a2a_task_events WHERE created_at < ?"),
+    "a2a_task_events cleanup must use created_at column"
+  );
+});
+
+test("cleanup: memories uses correct table name (not 'memory_entries')", () => {
+  assert.ok(source.includes("DELETE FROM memories WHERE"), "must use correct table name memories");
   assert.ok(
     !source.includes("DELETE FROM memory_entries WHERE"),
     "must NOT use non-existent table name memory_entries"
