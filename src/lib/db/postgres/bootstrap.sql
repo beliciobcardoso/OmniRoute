@@ -452,6 +452,8 @@ CREATE TABLE IF NOT EXISTS daily_usage_summary (
   total_cost DOUBLE PRECISION NOT NULL DEFAULT 0.0,
   created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
+CREATE UNIQUE INDEX IF NOT EXISTS idx_daily_usage_unique
+  ON daily_usage_summary(provider, model, date);
 
 CREATE TABLE IF NOT EXISTS db_meta (
   "key" TEXT PRIMARY KEY,
@@ -624,6 +626,8 @@ CREATE TABLE IF NOT EXISTS hourly_usage_summary (
   total_cost DOUBLE PRECISION NOT NULL DEFAULT 0.0,
   created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
+CREATE UNIQUE INDEX IF NOT EXISTS idx_hourly_usage_unique
+  ON hourly_usage_summary(provider, model, date_hour);
 
 CREATE TABLE IF NOT EXISTS inspector_custom_hosts (
   host TEXT PRIMARY KEY,

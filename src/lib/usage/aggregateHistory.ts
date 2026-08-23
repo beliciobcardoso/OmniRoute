@@ -5,13 +5,20 @@
  * @module lib/usage/aggregateHistory
  */
 
+import { sql } from "kysely";
 import { getDbInstance } from "../db/core";
 import { getUserDatabaseSettings } from "../db/databaseSettings";
+import { resolveDbDriverConfig } from "../db/driverConfig";
+import { ensurePostgresBootstrap, getKyselyDb } from "../db/kysely/client";
 
 interface AggregationResult {
   processed: number;
   inserted: number;
   errors: number;
+}
+
+function isPostgres(): boolean {
+  return resolveDbDriverConfig().driver === "postgres";
 }
 
 /**
@@ -26,8 +33,6 @@ export async function rollupDailyUsage(
   fromDate: string,
   toDate: string
 ): Promise<AggregationResult> {
-  const db = getDbInstance();
-
   const result: AggregationResult = {
     processed: 0,
     inserted: 0,
@@ -35,32 +40,60 @@ export async function rollupDailyUsage(
   };
 
   try {
-    // Aggregate quota_snapshots by provider, model, and date
-    const aggregateQuery = `
-      INSERT INTO daily_usage_summary (provider, model, date, total_requests, total_input_tokens, total_output_tokens, total_cost)
-      SELECT 
-        provider,
-        COALESCE(json_extract(raw_data, '$.model'), 'unknown') as model,
-        DATE(created_at) as date,
-        COUNT(*) as total_requests,
-        COALESCE(SUM(CAST(json_extract(raw_data, '$.input_tokens') AS INTEGER)), 0) as total_input_tokens,
-        COALESCE(SUM(CAST(json_extract(raw_data, '$.output_tokens') AS INTEGER)), 0) as total_output_tokens,
-        COALESCE(SUM(CAST(json_extract(raw_data, '$.cost') AS REAL)), 0.0) as total_cost
-      FROM quota_snapshots
-      WHERE DATE(created_at) >= ? AND DATE(created_at) <= ?
-      GROUP BY provider, model, DATE(created_at)
-      ON CONFLICT(provider, model, date) DO UPDATE SET
-        total_requests = excluded.total_requests,
-        total_input_tokens = excluded.total_input_tokens,
-        total_output_tokens = excluded.total_output_tokens,
-        total_cost = excluded.total_cost
-    `;
+    if (isPostgres()) {
+      await ensurePostgresBootstrap();
+      const kdb = getKyselyDb();
+      const queryResult = await sql`
+        INSERT INTO daily_usage_summary (provider, model, date, total_requests, total_input_tokens, total_output_tokens, total_cost)
+        SELECT
+          provider,
+          COALESCE(raw_data::jsonb ->> 'model', 'unknown') as model,
+          (created_at)::date as date,
+          COUNT(*) as total_requests,
+          COALESCE(SUM((raw_data::jsonb ->> 'input_tokens')::bigint), 0) as total_input_tokens,
+          COALESCE(SUM((raw_data::jsonb ->> 'output_tokens')::bigint), 0) as total_output_tokens,
+          COALESCE(SUM((raw_data::jsonb ->> 'cost')::double precision), 0.0) as total_cost
+        FROM quota_snapshots
+        WHERE (created_at)::date >= ${fromDate} AND (created_at)::date <= ${toDate}
+        GROUP BY provider, model, date
+        ON CONFLICT(provider, model, date) DO UPDATE SET
+          total_requests = excluded.total_requests,
+          total_input_tokens = excluded.total_input_tokens,
+          total_output_tokens = excluded.total_output_tokens,
+          total_cost = excluded.total_cost
+      `.execute(kdb);
 
-    const stmt = db.prepare(aggregateQuery);
-    const runResult = stmt.run(fromDate, toDate);
+      result.processed = Number(queryResult.numAffectedRows ?? 0);
+      result.inserted = result.processed;
+    } else {
+      const db = getDbInstance();
+      // Aggregate quota_snapshots by provider, model, and date
+      const aggregateQuery = `
+        INSERT INTO daily_usage_summary (provider, model, date, total_requests, total_input_tokens, total_output_tokens, total_cost)
+        SELECT
+          provider,
+          COALESCE(json_extract(raw_data, '$.model'), 'unknown') as model,
+          DATE(created_at) as date,
+          COUNT(*) as total_requests,
+          COALESCE(SUM(CAST(json_extract(raw_data, '$.input_tokens') AS INTEGER)), 0) as total_input_tokens,
+          COALESCE(SUM(CAST(json_extract(raw_data, '$.output_tokens') AS INTEGER)), 0) as total_output_tokens,
+          COALESCE(SUM(CAST(json_extract(raw_data, '$.cost') AS REAL)), 0.0) as total_cost
+        FROM quota_snapshots
+        WHERE DATE(created_at) >= ? AND DATE(created_at) <= ?
+        GROUP BY provider, model, DATE(created_at)
+        ON CONFLICT(provider, model, date) DO UPDATE SET
+          total_requests = excluded.total_requests,
+          total_input_tokens = excluded.total_input_tokens,
+          total_output_tokens = excluded.total_output_tokens,
+          total_cost = excluded.total_cost
+      `;
 
-    result.processed = runResult.changes;
-    result.inserted = runResult.changes;
+      const stmt = db.prepare(aggregateQuery);
+      const runResult = stmt.run(fromDate, toDate);
+
+      result.processed = runResult.changes;
+      result.inserted = runResult.changes;
+    }
 
     console.log(`[Aggregation] Daily rollup: ${result.inserted} rows for ${fromDate} to ${toDate}`);
   } catch (err: any) {
@@ -83,8 +116,6 @@ export async function rollupHourlyQuota(
   fromDate: string,
   toDate: string
 ): Promise<AggregationResult> {
-  const db = getDbInstance();
-
   const result: AggregationResult = {
     processed: 0,
     inserted: 0,
@@ -92,32 +123,59 @@ export async function rollupHourlyQuota(
   };
 
   try {
-    // Aggregate quota_snapshots by provider, model, and hour
-    const aggregateQuery = `
-      INSERT INTO hourly_usage_summary (provider, model, date_hour, total_requests, total_input_tokens, total_output_tokens, total_cost)
-      SELECT 
-        provider,
-        COALESCE(json_extract(raw_data, '$.model'), 'unknown') as model,
-        datetime(strftime('%Y-%m-%d %H:00:00', created_at)) as date_hour,
-        COUNT(*) as total_requests,
-        COALESCE(SUM(CAST(json_extract(raw_data, '$.input_tokens') AS INTEGER)), 0) as total_input_tokens,
-        COALESCE(SUM(CAST(json_extract(raw_data, '$.output_tokens') AS INTEGER)), 0) as total_output_tokens,
-        COALESCE(SUM(CAST(json_extract(raw_data, '$.cost') AS REAL)), 0.0) as total_cost
-      FROM quota_snapshots
-      WHERE created_at >= ? AND created_at <= ?
-      GROUP BY provider, model, datetime(strftime('%Y-%m-%d %H:00:00', created_at))
-      ON CONFLICT(provider, model, date_hour) DO UPDATE SET
-        total_requests = excluded.total_requests,
-        total_input_tokens = excluded.total_input_tokens,
-        total_output_tokens = excluded.total_output_tokens,
-        total_cost = excluded.total_cost
-    `;
+    if (isPostgres()) {
+      await ensurePostgresBootstrap();
+      const kdb = getKyselyDb();
+      const queryResult = await sql`
+        INSERT INTO hourly_usage_summary (provider, model, date_hour, total_requests, total_input_tokens, total_output_tokens, total_cost)
+        SELECT
+          provider,
+          COALESCE(raw_data::jsonb ->> 'model', 'unknown') as model,
+          to_char((created_at)::timestamptz, 'YYYY-MM-DD HH24:00:00') as date_hour,
+          COUNT(*) as total_requests,
+          COALESCE(SUM((raw_data::jsonb ->> 'input_tokens')::bigint), 0) as total_input_tokens,
+          COALESCE(SUM((raw_data::jsonb ->> 'output_tokens')::bigint), 0) as total_output_tokens,
+          COALESCE(SUM((raw_data::jsonb ->> 'cost')::double precision), 0.0) as total_cost
+        FROM quota_snapshots
+        WHERE created_at >= ${fromDate} AND created_at <= ${toDate}
+        GROUP BY provider, model, date_hour
+        ON CONFLICT(provider, model, date_hour) DO UPDATE SET
+          total_requests = excluded.total_requests,
+          total_input_tokens = excluded.total_input_tokens,
+          total_output_tokens = excluded.total_output_tokens,
+          total_cost = excluded.total_cost
+      `.execute(kdb);
 
-    const stmt = db.prepare(aggregateQuery);
-    const runResult = stmt.run(fromDate, toDate);
+      result.processed = Number(queryResult.numAffectedRows ?? 0);
+      result.inserted = result.processed;
+    } else {
+      const db = getDbInstance();
+      const aggregateQuery = `
+        INSERT INTO hourly_usage_summary (provider, model, date_hour, total_requests, total_input_tokens, total_output_tokens, total_cost)
+        SELECT
+          provider,
+          COALESCE(json_extract(raw_data, '$.model'), 'unknown') as model,
+          datetime(strftime('%Y-%m-%d %H:00:00', created_at)) as date_hour,
+          COUNT(*) as total_requests,
+          COALESCE(SUM(CAST(json_extract(raw_data, '$.input_tokens') AS INTEGER)), 0) as total_input_tokens,
+          COALESCE(SUM(CAST(json_extract(raw_data, '$.output_tokens') AS INTEGER)), 0) as total_output_tokens,
+          COALESCE(SUM(CAST(json_extract(raw_data, '$.cost') AS REAL)), 0.0) as total_cost
+        FROM quota_snapshots
+        WHERE created_at >= ? AND created_at <= ?
+        GROUP BY provider, model, date_hour
+        ON CONFLICT(provider, model, date_hour) DO UPDATE SET
+          total_requests = excluded.total_requests,
+          total_input_tokens = excluded.total_input_tokens,
+          total_output_tokens = excluded.total_output_tokens,
+          total_cost = excluded.total_cost
+      `;
 
-    result.processed = runResult.changes;
-    result.inserted = runResult.changes;
+      const stmt = db.prepare(aggregateQuery);
+      const runResult = stmt.run(fromDate, toDate);
+
+      result.processed = runResult.changes;
+      result.inserted = runResult.changes;
+    }
 
     console.log(
       `[Aggregation] Hourly rollup: ${result.inserted} rows for ${fromDate} to ${toDate}`
@@ -142,8 +200,6 @@ export async function rollupHourlyQuota(
  * @returns Aggregation result with counts
  */
 export async function rollupUsageHistoryBeforeDate(beforeDate: string): Promise<AggregationResult> {
-  const db = getDbInstance();
-
   const result: AggregationResult = {
     processed: 0,
     inserted: 0,
@@ -151,32 +207,61 @@ export async function rollupUsageHistoryBeforeDate(beforeDate: string): Promise<
   };
 
   try {
-    const aggregateQuery = `
-      INSERT INTO daily_usage_summary (provider, model, date, total_requests, total_input_tokens, total_output_tokens, total_cost)
-      SELECT
-        LOWER(provider) as provider,
-        LOWER(model) as model,
-        DATE(timestamp) as date,
-        COUNT(*) as total_requests,
-        COALESCE(SUM(tokens_input), 0) as total_input_tokens,
-        COALESCE(SUM(tokens_output), 0) as total_output_tokens,
-        0.0 as total_cost
-      FROM usage_history
-      WHERE timestamp < ?
-        AND provider IS NOT NULL AND provider != ''
-        AND model IS NOT NULL AND model != ''
-      GROUP BY LOWER(provider), LOWER(model), DATE(timestamp)
-      ON CONFLICT(provider, model, date) DO UPDATE SET
-        total_requests = daily_usage_summary.total_requests + excluded.total_requests,
-        total_input_tokens = daily_usage_summary.total_input_tokens + excluded.total_input_tokens,
-        total_output_tokens = daily_usage_summary.total_output_tokens + excluded.total_output_tokens
-    `;
+    if (isPostgres()) {
+      await ensurePostgresBootstrap();
+      const kdb = getKyselyDb();
+      const queryResult = await sql`
+        INSERT INTO daily_usage_summary (provider, model, date, total_requests, total_input_tokens, total_output_tokens, total_cost)
+        SELECT
+          LOWER(provider) as provider,
+          LOWER(model) as model,
+          (timestamp)::date as date,
+          COUNT(*) as total_requests,
+          COALESCE(SUM(tokens_input), 0) as total_input_tokens,
+          COALESCE(SUM(tokens_output), 0) as total_output_tokens,
+          0.0 as total_cost
+        FROM usage_history
+        WHERE timestamp < ${beforeDate}
+          AND provider IS NOT NULL AND provider != ''
+          AND model IS NOT NULL AND model != ''
+        GROUP BY LOWER(provider), LOWER(model), date
+        ON CONFLICT(provider, model, date) DO UPDATE SET
+          total_requests = daily_usage_summary.total_requests + excluded.total_requests,
+          total_input_tokens = daily_usage_summary.total_input_tokens + excluded.total_input_tokens,
+          total_output_tokens = daily_usage_summary.total_output_tokens + excluded.total_output_tokens
+      `.execute(kdb);
 
-    const stmt = db.prepare(aggregateQuery);
-    const runResult = stmt.run(beforeDate);
+      result.processed = Number(queryResult.numAffectedRows ?? 0);
+      result.inserted = result.processed;
+    } else {
+      const db = getDbInstance();
+      const aggregateQuery = `
+        INSERT INTO daily_usage_summary (provider, model, date, total_requests, total_input_tokens, total_output_tokens, total_cost)
+        SELECT
+          LOWER(provider) as provider,
+          LOWER(model) as model,
+          DATE(timestamp) as date,
+          COUNT(*) as total_requests,
+          COALESCE(SUM(tokens_input), 0) as total_input_tokens,
+          COALESCE(SUM(tokens_output), 0) as total_output_tokens,
+          0.0 as total_cost
+        FROM usage_history
+        WHERE timestamp < ?
+          AND provider IS NOT NULL AND provider != ''
+          AND model IS NOT NULL AND model != ''
+        GROUP BY LOWER(provider), LOWER(model), DATE(timestamp)
+        ON CONFLICT(provider, model, date) DO UPDATE SET
+          total_requests = daily_usage_summary.total_requests + excluded.total_requests,
+          total_input_tokens = daily_usage_summary.total_input_tokens + excluded.total_input_tokens,
+          total_output_tokens = daily_usage_summary.total_output_tokens + excluded.total_output_tokens
+      `;
 
-    result.processed = runResult.changes;
-    result.inserted = runResult.changes;
+      const stmt = db.prepare(aggregateQuery);
+      const runResult = stmt.run(beforeDate);
+
+      result.processed = runResult.changes;
+      result.inserted = runResult.changes;
+    }
 
     console.log(
       `[Aggregation] usage_history rollup: ${result.inserted} rows for dates before ${beforeDate}`

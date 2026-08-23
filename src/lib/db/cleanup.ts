@@ -105,13 +105,8 @@ export async function cleanupCallLogs(): Promise<CleanupResult> {
 
 /**
  * Clean up old usage_history based on retention settings.
- *
- * SQLite-only for now: depends on rollupUsageHistoryBeforeDate()
- * (src/lib/usage/aggregateHistory.ts), which is a separate, still-SQLite-only
- * module. Deferred until that module is converted.
  */
 export async function cleanupUsageHistory(): Promise<CleanupResult> {
-  const db = getDbInstance();
   const retention = getRetentionSettings();
 
   const retentionDays = retention.usageHistory;
@@ -141,9 +136,20 @@ export async function cleanupUsageHistory(): Promise<CleanupResult> {
   }
 
   try {
-    const stmt = db.prepare("DELETE FROM usage_history WHERE timestamp < ?");
-    const runResult = stmt.run(cutoffDateStr);
-    result.deleted = runResult.changes;
+    if (isPostgres()) {
+      await ensurePostgresBootstrap();
+      const kdb = getKyselyDb();
+      const del = await kdb
+        .deleteFrom("usage_history")
+        .where("timestamp", "<", cutoffDateStr)
+        .executeTakeFirst();
+      result.deleted = Number(del.numDeletedRows);
+    } else {
+      const db = getDbInstance();
+      const stmt = db.prepare("DELETE FROM usage_history WHERE timestamp < ?");
+      const runResult = stmt.run(cutoffDateStr);
+      result.deleted = runResult.changes;
+    }
 
     console.log(
       `[Cleanup] Deleted ${result.deleted} usage_history older than ${retentionDays} days`
