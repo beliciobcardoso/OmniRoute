@@ -97,6 +97,12 @@ Reciprocal Rank Fusion (RRF) approach used today for the SQLite `hybrid-rrf` tie
 - `pgvector` as an alternative to Qdrant.
 - Support for database engines other than SQLite and PostgreSQL.
 
+## Known gaps / follow-ups
+
+Deferred module conversions, out-of-scope-by-design decisions, and test-suite
+gaps found while validating the conversion: see
+[`POSTGRES_TECH_DEBT.md`](./POSTGRES_TECH_DEBT.md).
+
 ## Implementation plan
 
 Full phased plan (fundação, adapters, migrações, módulos de domínio, memória, testes,
