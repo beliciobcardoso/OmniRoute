@@ -1,9 +1,8 @@
 /**
- * db/jsonMigration.ts — Shared helper to hydrate an SQLite database from a
+ * db/jsonMigration.ts — Shared helper to hydrate a database from a
  * legacy OmniRoute JSON backup object.
  *
  * Used by:
- *  - db/core.ts  (auto-migration at startup when db.json is found)
  *  - api/settings/import-json/route.ts  (on-demand import via dashboard)
  *
  * 🔒 Security: the caller is responsible for stripping sensitive keys
@@ -11,10 +10,15 @@
  * here, so this function never touches authentication configuration.
  */
 
+import { sql, type Kysely, type Transaction } from "kysely";
 import type { SqliteAdapter } from "./adapters/types";
+import type { SqliteBoolean, Database } from "./kysely/types";
 import { normalizeRoutingStrategy } from "@/shared/constants/routingStrategies";
+import { resolveDbDriverConfig } from "./driverConfig";
+import { ensurePostgresBootstrap, getKyselyDb } from "./kysely/client";
 
 type SqliteDatabase = SqliteAdapter;
+type KyselyOrTrx = Kysely<Database> | Transaction<Database>;
 
 export interface LegacyJsonData {
   providerConnections?: Record<string, unknown>[];
@@ -28,25 +32,16 @@ export interface LegacyJsonData {
   customModels?: Record<string, unknown>;
   proxyConfig?: {
     global?: unknown;
-    providers?: unknown;
-    combos?: unknown;
-    keys?: unknown;
+    providers?: Record<string, unknown>;
+    combos?: Record<string, unknown>;
+    keys?: Record<string, unknown>;
   };
-  usageHistory?: Record<string, unknown>[];
-  domainCostHistory?: Record<string, unknown>[];
-  domainBudgets?: Record<string, unknown>[];
+  usageHistory?: Record<string, any>[];
+  domainCostHistory?: Record<string, any>[];
+  domainBudgets?: Record<string, any>[];
 }
 
-/**
- * Runs a single SQLite transaction that upserts all entities from a legacy
- * JSON backup into the provided database instance.
- *
- * Returns counts of what was inserted/replaced for logging.
- */
-export function runJsonMigration(
-  db: SqliteDatabase,
-  data: LegacyJsonData
-): {
+interface MigrationCounts {
   connections: number;
   nodes: number;
   combos: number;
@@ -54,7 +49,285 @@ export function runJsonMigration(
   usageHistory: number;
   domainCostHistory: number;
   domainBudgets: number;
-} {
+}
+
+function isPostgres(): boolean {
+  return resolveDbDriverConfig().driver === "postgres";
+}
+
+function normalizeCombo(combo: Record<string, unknown>, index: number) {
+  const config =
+    combo.config && typeof combo.config === "object" && !Array.isArray(combo.config)
+      ? { ...(combo.config as Record<string, unknown>) }
+      : combo.config;
+  if (config && typeof config === "object" && !Array.isArray(config) && "strategy" in config) {
+    (config as Record<string, unknown>).strategy = normalizeRoutingStrategy(
+      (config as Record<string, unknown>).strategy
+    );
+  }
+  const normalizedCombo: Record<string, unknown> = {
+    ...combo,
+    strategy: normalizeRoutingStrategy(combo.strategy),
+    config,
+    sortOrder: typeof combo.sortOrder === "number" ? combo.sortOrder : index + 1,
+  };
+  return normalizedCombo;
+}
+
+async function migratePg(data: LegacyJsonData): Promise<MigrationCounts> {
+  await ensurePostgresBootstrap();
+  const kdb = getKyselyDb();
+
+  await kdb.transaction().execute(async (trx: KyselyOrTrx) => {
+    // 1. Provider Connections
+    for (const conn of data.providerConnections ?? []) {
+      const values = {
+        id: conn.id as string,
+        provider: conn.provider as string,
+        auth_type: (conn.authType as string) ?? "oauth",
+        name: (conn.name as string) ?? null,
+        email: (conn.email as string) ?? null,
+        priority: (conn.priority as number) ?? 0,
+        is_active: conn.isActive !== false,
+        access_token: (conn.accessToken as string) ?? null,
+        refresh_token: (conn.refreshToken as string) ?? null,
+        expires_at: (conn.expiresAt as string) ?? null,
+        token_expires_at: (conn.tokenExpiresAt as string) ?? null,
+        scope: (conn.scope as string) ?? null,
+        project_id: (conn.projectId as string) ?? null,
+        test_status: (conn.testStatus as string) ?? null,
+        error_code: (conn.errorCode as string) ?? null,
+        last_error: (conn.lastError as string) ?? null,
+        last_error_at: (conn.lastErrorAt as string) ?? null,
+        last_error_type: (conn.lastErrorType as string) ?? null,
+        last_error_source: (conn.lastErrorSource as string) ?? null,
+        backoff_level: (conn.backoffLevel as number) ?? 0,
+        rate_limited_until: (conn.rateLimitedUntil as string) ?? null,
+        health_check_interval: (conn.healthCheckInterval as number) ?? null,
+        last_health_check_at: (conn.lastHealthCheckAt as string) ?? null,
+        last_tested: (conn.lastTested as string) ?? null,
+        api_key: (conn.apiKey as string) ?? null,
+        id_token: (conn.idToken as string) ?? null,
+        provider_specific_data: (conn.providerSpecificData as string) ?? null,
+        expires_in: (conn.expiresIn as number) ?? null,
+        display_name: (conn.displayName as string) ?? null,
+        global_priority: (conn.globalPriority as number) ?? null,
+        default_model: (conn.defaultModel as string) ?? null,
+        token_type: (conn.tokenType as string) ?? null,
+        consecutive_use_count: (conn.consecutiveUseCount as number) ?? 0,
+        rate_limit_protection: conn.rateLimitProtection === true || conn.rateLimitProtection === 1,
+        last_used_at: (conn.lastUsedAt as string) ?? null,
+        created_at: (conn.createdAt as string) ?? new Date().toISOString(),
+        updated_at: (conn.updatedAt as string) ?? new Date().toISOString(),
+      };
+      const { id, ...updateValues } = values;
+      await trx
+        .insertInto("provider_connections")
+        .values({
+          ...values,
+          is_active: values.is_active as unknown as SqliteBoolean,
+          rate_limit_protection: values.rate_limit_protection as unknown as SqliteBoolean,
+        })
+        .onConflict((oc) => oc.column("id").doUpdateSet(updateValues))
+        .execute();
+    }
+
+    // 2. Provider Nodes
+    for (const node of data.providerNodes ?? []) {
+      const values = {
+        id: node.id as string,
+        type: node.type as string,
+        name: node.name as string,
+        prefix: (node.prefix as string) ?? null,
+        api_type: (node.apiType as string) ?? null,
+        base_url: (node.baseUrl as string) ?? null,
+        created_at: (node.createdAt as string) ?? new Date().toISOString(),
+        updated_at: (node.updatedAt as string) ?? new Date().toISOString(),
+      };
+      const { id, ...updateValues } = values;
+      await trx
+        .insertInto("provider_nodes")
+        .values(values)
+        .onConflict((oc) => oc.column("id").doUpdateSet(updateValues))
+        .execute();
+    }
+
+    // 3. Key-Value Settings (caller must have stripped password / requireLogin)
+    for (const [key, value] of Object.entries(data.settings ?? {})) {
+      await trx
+        .insertInto("key_value")
+        .values({ namespace: "settings", key, value: JSON.stringify(value) })
+        .onConflict((oc) =>
+          oc.columns(["namespace", "key"]).doUpdateSet({ value: JSON.stringify(value) })
+        )
+        .execute();
+    }
+
+    // 4. Legacy key-value namespaces
+    const kvNamespaces: Array<[string, Record<string, unknown> | undefined]> = [
+      ["modelAliases", data.modelAliases],
+      ["mitmAlias", data.mitmAlias],
+      ["pricing", data.pricing],
+      ["customModels", data.customModels],
+    ];
+    for (const [namespace, entries] of kvNamespaces) {
+      for (const [key, value] of Object.entries(entries ?? {})) {
+        await trx
+          .insertInto("key_value")
+          .values({ namespace, key, value: JSON.stringify(value) })
+          .onConflict((oc) =>
+            oc.columns(["namespace", "key"]).doUpdateSet({ value: JSON.stringify(value) })
+          )
+          .execute();
+      }
+    }
+    if (data.proxyConfig) {
+      const proxyConfigRows: Array<[string, unknown]> = [
+        ["global", data.proxyConfig.global ?? null],
+        ["providers", data.proxyConfig.providers ?? {}],
+        ["combos", data.proxyConfig.combos ?? {}],
+        ["keys", data.proxyConfig.keys ?? {}],
+      ];
+      for (const [key, value] of proxyConfigRows) {
+        await trx
+          .insertInto("key_value")
+          .values({ namespace: "proxyConfig", key, value: JSON.stringify(value) })
+          .onConflict((oc) =>
+            oc.columns(["namespace", "key"]).doUpdateSet({ value: JSON.stringify(value) })
+          )
+          .execute();
+      }
+    }
+
+    // 5. Combos
+    for (const [index, combo] of (data.combos ?? []).entries()) {
+      const normalizedCombo = normalizeCombo(combo, index);
+      const values = {
+        id: normalizedCombo.id as string,
+        name: normalizedCombo.name as string,
+        data: JSON.stringify(normalizedCombo),
+        sort_order: normalizedCombo.sortOrder as number,
+        created_at: (normalizedCombo.createdAt as string) ?? new Date().toISOString(),
+        updated_at: (normalizedCombo.updatedAt as string) ?? new Date().toISOString(),
+      };
+      const { id, ...updateValues } = values;
+      await trx
+        .insertInto("combos")
+        .values(values)
+        .onConflict((oc) => oc.column("id").doUpdateSet(updateValues))
+        .execute();
+    }
+
+    // 6. API Keys
+    for (const apiKey of data.apiKeys ?? []) {
+      const values = {
+        id: apiKey.id as string,
+        name: apiKey.name as string,
+        key: apiKey.key as string,
+        machine_id: (apiKey.machineId as string) ?? null,
+        allowed_models: JSON.stringify(apiKey.allowedModels ?? []),
+        no_log: Boolean(apiKey.noLog),
+        created_at: (apiKey.createdAt as string) ?? new Date().toISOString(),
+      };
+      const { id, ...updateValues } = values;
+      await trx
+        .insertInto("api_keys")
+        .values({ ...values, no_log: values.no_log as unknown as SqliteBoolean })
+        .onConflict((oc) => oc.column("id").doUpdateSet(updateValues))
+        .execute();
+    }
+
+    // 7. Usage History — usage_history.id is GENERATED ALWAYS AS IDENTITY on
+    // Postgres, so explicit legacy ids need OVERRIDING SYSTEM VALUE (Kysely
+    // has no builder method for this yet; raw SQL is the documented escape
+    // hatch).
+    for (const row of data.usageHistory ?? []) {
+      await sql`
+        INSERT INTO usage_history (
+          id, provider, model, connection_id, api_key_id, api_key_name,
+          tokens_input, tokens_output, tokens_cache_read, tokens_cache_creation,
+          tokens_reasoning, status, success, latency_ms, ttft_ms, error_code, combo_strategy, timestamp
+        ) OVERRIDING SYSTEM VALUE VALUES (
+          ${row.id}, ${row.provider ?? null}, ${row.model ?? null}, ${row.connection_id ?? null},
+          ${row.api_key_id ?? null}, ${row.api_key_name ?? null},
+          ${row.tokens_input ?? 0}, ${row.tokens_output ?? 0}, ${row.tokens_cache_read ?? 0},
+          ${row.tokens_cache_creation ?? 0}, ${row.tokens_reasoning ?? 0}, ${row.status ?? null},
+          ${row.success ?? 1}, ${row.latency_ms ?? 0}, ${row.ttft_ms ?? 0}, ${row.error_code ?? null},
+          ${row.combo_strategy ?? "direct"}, ${row.timestamp}
+        )
+        ON CONFLICT (id) DO UPDATE SET
+          provider = excluded.provider, model = excluded.model, connection_id = excluded.connection_id,
+          api_key_id = excluded.api_key_id, api_key_name = excluded.api_key_name,
+          tokens_input = excluded.tokens_input, tokens_output = excluded.tokens_output,
+          tokens_cache_read = excluded.tokens_cache_read, tokens_cache_creation = excluded.tokens_cache_creation,
+          tokens_reasoning = excluded.tokens_reasoning, status = excluded.status, success = excluded.success,
+          latency_ms = excluded.latency_ms, ttft_ms = excluded.ttft_ms, error_code = excluded.error_code,
+          combo_strategy = excluded.combo_strategy, timestamp = excluded.timestamp
+      `.execute(trx);
+    }
+
+    // 8. Domain Cost History — same GENERATED ALWAYS AS IDENTITY situation as usage_history.
+    for (const row of data.domainCostHistory ?? []) {
+      await sql`
+        INSERT INTO domain_cost_history (id, api_key_id, cost, timestamp)
+        OVERRIDING SYSTEM VALUE VALUES (${row.id}, ${row.api_key_id}, ${row.cost}, ${row.timestamp})
+        ON CONFLICT (id) DO UPDATE SET
+          api_key_id = excluded.api_key_id, cost = excluded.cost, timestamp = excluded.timestamp
+      `.execute(trx);
+    }
+
+    // 9. Domain Budgets
+    for (const row of data.domainBudgets ?? []) {
+      const values = {
+        api_key_id: row.api_key_id as string,
+        daily_limit_usd: row.daily_limit_usd as number,
+        weekly_limit_usd: (row.weekly_limit_usd as number) ?? 0,
+        monthly_limit_usd: (row.monthly_limit_usd as number) ?? 0,
+        warning_threshold: (row.warning_threshold as number) ?? 0.8,
+        reset_interval: (row.reset_interval as string) ?? "daily",
+        reset_time: (row.reset_time as string) ?? "00:00",
+        budget_reset_at: (row.budget_reset_at as number) ?? null,
+        last_budget_reset_at: (row.last_budget_reset_at as number) ?? null,
+        warning_emitted_at: (row.warning_emitted_at as number) ?? null,
+        warning_period_start: (row.warning_period_start as number) ?? null,
+      };
+      const { api_key_id, ...updateValues } = values;
+      await trx
+        .insertInto("domain_budgets")
+        .values(values)
+        .onConflict((oc) => oc.column("api_key_id").doUpdateSet(updateValues))
+        .execute();
+    }
+  });
+
+  return {
+    connections: (data.providerConnections ?? []).length,
+    nodes: (data.providerNodes ?? []).length,
+    combos: (data.combos ?? []).length,
+    apiKeys: (data.apiKeys ?? []).length,
+    usageHistory: (data.usageHistory ?? []).length,
+    domainCostHistory: (data.domainCostHistory ?? []).length,
+    domainBudgets: (data.domainBudgets ?? []).length,
+  };
+}
+
+/**
+ * Hydrates the active database (SQLite or Postgres) from a legacy JSON
+ * backup object. `db` is only used (and required) on the SQLite path — pass
+ * `null` when running under Postgres.
+ */
+export async function runJsonMigration(
+  db: SqliteDatabase | null,
+  data: LegacyJsonData
+): Promise<MigrationCounts> {
+  if (isPostgres()) {
+    return migratePg(data);
+  }
+
+  if (!db) {
+    throw new Error("runJsonMigration: db is required on the SQLite path");
+  }
+
   const insertConn = db.prepare(`
     INSERT OR REPLACE INTO provider_connections (
       id, provider, auth_type, name, email, priority, is_active,
@@ -126,16 +399,13 @@ export function runJsonMigration(
         lastTested: conn.lastTested ?? null,
         apiKey: conn.apiKey ?? null,
         idToken: conn.idToken ?? null,
-        providerSpecificData: conn.providerSpecificData
-          ? JSON.stringify(conn.providerSpecificData)
-          : null,
+        providerSpecificData: conn.providerSpecificData ?? null,
         expiresIn: conn.expiresIn ?? null,
         displayName: conn.displayName ?? null,
         globalPriority: conn.globalPriority ?? null,
         defaultModel: conn.defaultModel ?? null,
         tokenType: conn.tokenType ?? null,
         consecutiveUseCount: conn.consecutiveUseCount ?? 0,
-        lastUsedAt: conn.lastUsedAt ?? null,
         rateLimitProtection:
           conn.rateLimitProtection === true || conn.rateLimitProtection === 1 ? 1 : 0,
         createdAt: conn.createdAt ?? new Date().toISOString(),
@@ -184,21 +454,7 @@ export function runJsonMigration(
 
     // 5. Combos
     for (const [index, combo] of (data.combos ?? []).entries()) {
-      const config =
-        combo.config && typeof combo.config === "object" && !Array.isArray(combo.config)
-          ? { ...(combo.config as Record<string, unknown>) }
-          : combo.config;
-      if (config && typeof config === "object" && !Array.isArray(config) && "strategy" in config) {
-        (config as Record<string, unknown>).strategy = normalizeRoutingStrategy(
-          (config as Record<string, unknown>).strategy
-        );
-      }
-      const normalizedCombo: Record<string, unknown> = {
-        ...combo,
-        strategy: normalizeRoutingStrategy(combo.strategy),
-        config,
-        sortOrder: typeof combo.sortOrder === "number" ? combo.sortOrder : index + 1,
-      };
+      const normalizedCombo = normalizeCombo(combo, index);
       insertCombo.run({
         id: normalizedCombo.id,
         name: normalizedCombo.name,
@@ -276,6 +532,7 @@ export function runJsonMigration(
         });
       }
     }
+
     // 9. Domain Budgets
     if (data.domainBudgets && data.domainBudgets.length > 0) {
       const insertBudgets = db.prepare(`

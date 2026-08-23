@@ -1,6 +1,7 @@
 import { NextResponse } from "next/server";
 import { getDbInstance } from "@/lib/db/core";
 import { backupDbFile } from "@/lib/db/backup";
+import { resolveDbDriverConfig } from "@/lib/db/driverConfig";
 import { isAuthRequired, isAuthenticated } from "@/shared/utils/apiAuth";
 import { runJsonMigration, type LegacyJsonData } from "@/lib/db/jsonMigration";
 import { getSettings } from "@/lib/db/settings";
@@ -60,13 +61,17 @@ export async function POST(request: Request) {
       data = { ...data, settings: safeSettings };
     }
 
-    const db = getDbInstance();
+    const isPostgres = resolveDbDriverConfig().driver === "postgres";
 
-    // Create a safety backup before writing anything
-    backupDbFile("pre-json-import");
+    // Create a safety backup before writing anything. backupDbFile() operates on the
+    // local SQLite file and has no Postgres equivalent (pg_dump would be a separate,
+    // operator-driven backup strategy) — skip it under Postgres.
+    if (!isPostgres) {
+      backupDbFile("pre-json-import");
+    }
 
     // Delegate the actual migration to the shared helper (avoids duplication with core.ts)
-    const counts = runJsonMigration(db, data);
+    const counts = await runJsonMigration(isPostgres ? null : getDbInstance(), data);
 
     // Re-hydrate the in-memory Global System Prompt config — the migration writes it to
     // the DB but the in-memory state would stay stale until a restart otherwise (#2470).

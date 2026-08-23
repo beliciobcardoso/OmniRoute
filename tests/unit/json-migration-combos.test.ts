@@ -18,10 +18,10 @@ test.after(() => {
   else process.env.DATA_DIR = ORIGINAL_DATA_DIR;
 });
 
-test("runJsonMigration normalizes legacy combo strategy names at the import boundary", () => {
+test("runJsonMigration normalizes legacy combo strategy names at the import boundary", async () => {
   const db = core.getDbInstance();
 
-  runJsonMigration(db, {
+  await runJsonMigration(db, {
     combos: [
       {
         id: "combo-usage",
