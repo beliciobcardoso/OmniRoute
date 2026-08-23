@@ -7,6 +7,7 @@ import {
   getRecentSearchLogs,
   getSearchAggregateStats,
   getSearchProviderCounts,
+  getFallbackStats,
 } from "../../../src/lib/db/callLogStats";
 import {
   ensurePostgresBootstrap,
@@ -65,6 +66,36 @@ test(
             request_summary: "search summary",
             duration: 3,
           },
+          {
+            ...baseRow,
+            id: "pg-cls-fb-1",
+            provider: "pg-fallback-test",
+            status: 200,
+            request_type: "chat",
+            combo_name: null,
+            requested_model: "openai/gpt-4",
+            model: "gpt-4",
+          },
+          {
+            ...baseRow,
+            id: "pg-cls-fb-2",
+            provider: "pg-fallback-test",
+            status: 200,
+            request_type: "chat",
+            combo_name: null,
+            requested_model: "openai/gpt-4",
+            model: "gpt-4o",
+          },
+          {
+            ...baseRow,
+            id: "pg-cls-fb-3",
+            provider: "pg-fallback-test",
+            status: 200,
+            request_type: "chat",
+            combo_name: "my-combo",
+            requested_model: "openai/gpt-4",
+            model: "gpt-4o",
+          },
         ])
         .execute();
 
@@ -89,10 +120,18 @@ test(
 
       const counts = await getSearchProviderCounts();
       assert.ok(counts.some((c) => c.provider === "pg-openai" && c.cnt >= 1));
+
+      const fallbackStats = await getFallbackStats("WHERE provider = @provider", {
+        provider: "pg-fallback-test",
+      });
+      assert.equal(Number(fallbackStats.total), 2);
+      assert.equal(Number(fallbackStats.with_requested), 2);
+      assert.equal(Number(fallbackStats.fallback_eligible), 2);
+      assert.equal(Number(fallbackStats.fallbacks), 1);
     } finally {
       await kdb
         .deleteFrom("call_logs")
-        .where("provider", "=", "pg-openai")
+        .where("provider", "in", ["pg-openai", "pg-fallback-test"])
         .execute()
         .catch(() => {});
       await resetKyselyDb();

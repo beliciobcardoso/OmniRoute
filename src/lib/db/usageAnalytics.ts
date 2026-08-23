@@ -42,7 +42,7 @@ function isPostgres(): boolean {
 // totalrequests does not exist"). So: collect every camelCase alias
 // introduced via `as <alias>`, then quote *every* occurrence of that exact
 // word throughout the text — the definition and every later reference alike.
-function toPostgresAnalyticsSql(
+export function toPostgresAnalyticsSql(
   sqlText: string,
   params: Record<string, unknown>
 ): { text: string; values: unknown[] } {

@@ -506,7 +506,7 @@ export async function GET(request: Request) {
       Record<string, unknown>
     >;
 
-    const fallbackRow = getFallbackStats(whereClause, params) as Record<string, unknown>;
+    const fallbackRow = (await getFallbackStats(whereClause, params)) as Record<string, unknown>;
 
     const summary = {
       totalRequests: Number(summaryRow?.totalRequests || 0),

@@ -1,6 +1,8 @@
+import { CompiledQuery } from "kysely";
 import { getDbInstance } from "./core";
 import { resolveDbDriverConfig } from "./driverConfig";
 import { ensurePostgresBootstrap, getKyselyDb } from "./kysely/client";
+import { toPostgresAnalyticsSql } from "./usageAnalytics";
 
 function isPostgres(): boolean {
   return resolveDbDriverConfig().driver === "postgres";
@@ -24,12 +26,9 @@ function toNum(value: unknown, fallback = 0): number {
  *
  * Sliced out of #3500 (call_logs cluster).
  *
- * getFallbackStats stays SQLite-only/synchronous: it shares the dynamic
- * whereClause/named-@param convention used throughout the much larger
- * usageAnalytics.ts query cluster (also not yet converted), and the two need
- * a single, consistent WHERE-clause translation strategy for Postgres rather
- * than two independent ad-hoc ones. Deferred to when usageAnalytics.ts is
- * converted.
+ * getFallbackStats reuses usageAnalytics.ts's toPostgresAnalyticsSql() (dynamic
+ * whereClause/named-@param → positional-$N translation) since both modules
+ * build the same WHERE-clause/@param query shape.
  */
 
 // ---------------------------------------------------------------------------
@@ -360,21 +359,15 @@ export interface FallbackStatsRow {
 /**
  * Scalar fallback-rate stats over `call_logs` for the usage analytics endpoint.
  *
- * SQLite-only — see module docstring (shares usageAnalytics.ts's dynamic
- * whereClause/@param convention, deferred to that module's conversion).
- *
  * @param whereClause - SQL WHERE clause (may be empty string) using the same
  *                      named params as the usage_history queries.
  * @param params      - Named params object (string values).
  */
-export function getFallbackStats(
+export async function getFallbackStats(
   whereClause: string,
   params: Record<string, string>
-): FallbackStatsRow {
-  const db = getDbInstance();
-  const row = db
-    .prepare(
-      `
+): Promise<FallbackStatsRow> {
+  const sqlText = `
       SELECT
         SUM(CASE WHEN (combo_name IS NULL OR combo_name = '') THEN 1 ELSE 0 END) as total,
         SUM(CASE WHEN requested_model IS NOT NULL AND requested_model != '' AND (combo_name IS NULL OR combo_name = '') THEN 1 ELSE 0 END) as with_requested,
@@ -397,8 +390,30 @@ export function getFallbackStats(
         ) as fallbacks
       FROM call_logs
       ${whereClause}
-    `
-    )
-    .get(params) as FallbackStatsRow | undefined;
+    `;
+
+  if (isPostgres()) {
+    await ensurePostgresBootstrap();
+    const kdb = getKyselyDb();
+    // instr(str, '/') is SQLite-only; Postgres's equivalent is position('/' in str).
+    const pgSqlText = sqlText.replace(
+      /instr\(([a-zA-Z_][a-zA-Z0-9_.]*),\s*'\/'\)/g,
+      "position('/' in $1)"
+    );
+    const { text, values } = toPostgresAnalyticsSql(pgSqlText, params);
+    const result = await kdb.executeQuery(CompiledQuery.raw(text, values));
+    const row = result.rows[0] as FallbackStatsRow | undefined;
+    return row
+      ? {
+          total: Number(row.total) || 0,
+          with_requested: Number(row.with_requested) || 0,
+          fallback_eligible: Number(row.fallback_eligible) || 0,
+          fallbacks: Number(row.fallbacks) || 0,
+        }
+      : { total: 0, with_requested: 0, fallback_eligible: 0, fallbacks: 0 };
+  }
+
+  const db = getDbInstance();
+  const row = db.prepare(sqlText).get(params) as FallbackStatsRow | undefined;
   return row ?? { total: 0, with_requested: 0, fallback_eligible: 0, fallbacks: 0 };
 }
