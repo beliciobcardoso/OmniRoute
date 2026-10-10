@@ -9,6 +9,7 @@
  *   - stream.ts: request.completed, request.failed
  *   - combo.ts: combo.target.*
  *   - credentialGate.ts: credential.health.changed
+ *   - proxyTransitionBridge.ts: proxy.set_aside
  *
  * Consumers (WebSocket server, dashboard hooks, etc.) subscribe
  * to specific event types via on/off.
@@ -134,53 +135,6 @@ export function onAny(listener: (event: DashboardEventName, payload: unknown) =>
   state.wildcardListeners.add(listener);
   return () => {
     state.wildcardListeners.delete(listener);
-  };
-}
-
-/**
- * Remove a specific listener.
- */
-export function off<E extends DashboardEventName>(
-  event: E,
-  listener: DashboardEventListener<E>
-): void {
-  getBusState()
-    .listeners.get(event)
-    ?.delete(listener as Function);
-}
-
-/**
- * Remove all listeners for an event.
- */
-export function removeAllListeners(event?: DashboardEventName): void {
-  const state = getBusState();
-  if (event) {
-    state.listeners.delete(event);
-  } else {
-    state.listeners.clear();
-    state.wildcardListeners.clear();
-  }
-}
-
-/**
- * Get bus stats for monitoring.
- */
-export function getBusStats(): {
-  totalListeners: number;
-  eventsWithListeners: number;
-  totalEmitted: number;
-  historySize: number;
-} {
-  const state = getBusState();
-  let totalListeners = state.wildcardListeners.size;
-  for (const set of state.listeners.values()) {
-    totalListeners += set.size;
-  }
-  return {
-    totalListeners,
-    eventsWithListeners: state.listeners.size,
-    totalEmitted: state.emitCount,
-    historySize: state.history.length,
   };
 }
 

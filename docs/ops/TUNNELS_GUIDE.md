@@ -1,13 +1,13 @@
 ---
 title: "Tunnels Guide"
-version: 3.8.2
-lastUpdated: 2026-05-13
+version: 3.8.40
+lastUpdated: 2026-06-28
 ---
 
 # Tunnels Guide
 
 > **Source of truth:** `src/lib/{cloudflaredTunnel,ngrokTunnel,tailscaleTunnel}.ts`, `src/app/api/tunnels/`
-> **Last updated:** 2026-05-13 — v3.8.0
+> **Last updated:** 2026-06-28 — v3.8.40
 
 OmniRoute can expose its local server (`http://localhost:20128`) to the public
 internet via three tunnel backends. This is useful for:
@@ -34,11 +34,21 @@ The implementations live in `src/lib/cloudflaredTunnel.ts`,
 common-shaped `status` object with `phase`, `running`, `publicUrl`, `apiUrl`,
 `targetUrl`, and `lastError` fields, so the dashboard can render them uniformly.
 
-## 1. Cloudflare Tunnel (Quick Tunnel)
+## 1. Cloudflare Tunnel (Quick Tunnel + Named Tunnel)
 
-`src/lib/cloudflaredTunnel.ts` runs `cloudflared tunnel --url
-http://localhost:<apiPort>` as a child process and parses the assigned
-`*.trycloudflare.com` URL from stdout.
+`src/lib/cloudflaredTunnel.ts` runs `cloudflared` as a child process. It supports
+two modes, selected by whether a named-tunnel config is provided:
+
+- **Quick tunnel (default).** Runs `cloudflared tunnel --url
+http://localhost:<apiPort>` and parses the assigned `*.trycloudflare.com` URL
+  from stdout. URLs are ephemeral and change on every restart.
+- **Named tunnel (opt-in).** When `CLOUDFLARED_CONFIG` points at a locally-managed
+  cloudflared `config.yml`, OmniRoute runs `cloudflared tunnel --no-autoupdate
+--config <path> run`, giving you a **stable, named hostname**. The config
+  supplies the tunnel UUID, `credentials-file`, and `ingress` routing, so no
+  `--url` is passed and no Zero Trust dashboard token is required. `run` reads
+  credentials from the config's absolute `credentials-file` path — no `cert.pem`
+  is needed (that is only used for tunnel lifecycle management).
 
 Key behaviors:
 
@@ -46,12 +56,44 @@ Key behaviors:
   binary from the official GitHub releases (managed install lives under
   `DATA_DIR/cloudflared/`). SHA256 of the downloaded asset is verified against the
   release manifest before execution.
-- **Quick-tunnel only.** The current implementation runs only the
-  `--url`-style quick tunnel. Named/persistent tunnels (`cloudflared tunnel
-login` + `cloudflared tunnel route dns ...`) are not orchestrated by
-  OmniRoute. URLs are ephemeral and will change every restart.
 - **Process supervision.** The cloudflared PID and resolved URL are persisted to
-  `cloudflared-state.json` so the dashboard can resume status across reloads.
+  `quick-tunnel-state.json` so the dashboard can resume status across reloads.
+
+### Named tunnel setup (stable hostname)
+
+1. Create a locally-managed tunnel with the cloudflared CLI (one-time):
+
+   ```bash
+   cloudflared tunnel login
+   cloudflared tunnel create omniroute
+   cloudflared tunnel route dns omniroute ai.example.com
+   ```
+
+2. Write a `~/.cloudflared/config.yml` routing your hostname to OmniRoute's local
+   API port (default 20128):
+
+   ```yaml
+   tunnel: <UUID-from-create>
+   credentials-file: /home/you/.cloudflared/<UUID>.json
+   ingress:
+     - hostname: ai.example.com
+       service: http://127.0.0.1:20128
+     - service: http_status:404
+   ```
+
+3. Point OmniRoute at the config and (re)start the tunnel:
+
+   ```bash
+   export CLOUDFLARED_CONFIG="/home/you/.cloudflared/config.yml"
+   # optional — overrides the hostname OmniRoute reports; otherwise read from the
+   # config's first ingress rule:
+   # export CLOUDFLARED_HOSTNAME="ai.example.com"
+   ```
+
+   Enable the tunnel the same way as a quick tunnel (REST / dashboard / CLI
+   below). A named tunnel emits no public URL to scrape, so readiness is detected
+   from cloudflared's registered edge connection, and `publicUrl`/`apiUrl` are
+   reported from `CLOUDFLARED_HOSTNAME` (or the config's first ingress hostname).
 
 ### Enable / disable via REST
 
@@ -81,10 +123,12 @@ Or via dashboard: **Settings → Tunnels → Cloudflare**.
 
 ### Optional env vars
 
-| Variable                                             | Purpose                                                                               |
-| ---------------------------------------------------- | ------------------------------------------------------------------------------------- |
-| `CLOUDFLARED_BIN`                                    | Override the binary path. If set and valid, OmniRoute uses it instead of downloading. |
-| `CLOUDFLARED_PROTOCOL` / `TUNNEL_TRANSPORT_PROTOCOL` | Transport protocol (default `http2`).                                                 |
+| Variable                                             | Purpose                                                                                                                                                              |
+| ---------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `CLOUDFLARED_BIN`                                    | Override the binary path. If set and valid, OmniRoute uses it instead of downloading.                                                                                |
+| `CLOUDFLARED_PROTOCOL` / `TUNNEL_TRANSPORT_PROTOCOL` | Transport protocol (default `http2`; also `quic`, `auto`).                                                                                                           |
+| `CLOUDFLARED_CONFIG`                                 | Path to a locally-managed cloudflared `config.yml`. When set, OmniRoute runs a **named/persistent** tunnel (`tunnel --config <path> run`) instead of a quick tunnel. |
+| `CLOUDFLARED_HOSTNAME`                               | Overrides the named tunnel's reported public hostname (e.g. `ai.example.com`). When unset, read from the config's first `ingress` hostname.                          |
 
 ## 2. ngrok
 
@@ -217,6 +261,11 @@ When you expose OmniRoute through a tunnel, the dashboard and OAuth flows must
 build callback URLs against the **public** hostname, not `localhost`. Otherwise
 the OAuth provider redirects the user back to a URL its servers cannot reach,
 and the handshake fails.
+
+Dashboard edits and settings saves do not require pinning the tunnel hostname in
+`NEXT_PUBLIC_BASE_URL`. The authenticated dashboard sends same-origin unsafe
+requests with a session-bound CSRF token, so ephemeral Cloudflare Quick Tunnel
+hosts can still be used for normal UI management after logging in.
 
 Set:
 

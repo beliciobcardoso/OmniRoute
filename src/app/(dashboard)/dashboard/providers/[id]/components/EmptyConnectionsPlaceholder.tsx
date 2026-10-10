@@ -14,6 +14,7 @@ interface EmptyConnectionsPlaceholderProps {
   isCompatible: boolean;
   isCommandCode: boolean;
   providerId: string;
+  supportsDualAuth: boolean;
   providerSupportsPat: boolean;
   commandCodeAuthState: CommandCodeAuthState;
   gateConnectionFlow: (callback: () => void) => void;
@@ -24,6 +25,7 @@ interface EmptyConnectionsPlaceholderProps {
   onOpenImportCodex: () => void;
   onOpenImportClaude: () => void;
   onOpenImportGemini: () => void;
+  onOpenImportGrokCli: () => void;
   t: ProviderMessageTranslator;
 }
 
@@ -32,6 +34,7 @@ export default function EmptyConnectionsPlaceholder({
   isCompatible,
   isCommandCode,
   providerId,
+  supportsDualAuth,
   providerSupportsPat,
   commandCodeAuthState,
   gateConnectionFlow,
@@ -42,29 +45,33 @@ export default function EmptyConnectionsPlaceholder({
   onOpenImportCodex,
   onOpenImportClaude,
   onOpenImportGemini,
+  onOpenImportGrokCli,
   t,
 }: EmptyConnectionsPlaceholderProps) {
   return (
     <div className="text-center py-12">
       <div className="inline-flex items-center justify-center w-16 h-16 rounded-full bg-primary/10 text-primary mb-4">
-        <span className="material-symbols-outlined text-[32px]">
-          {isOAuth ? "lock" : "key"}
-        </span>
+        <span className="material-symbols-outlined text-[32px]">{isOAuth ? "lock" : "key"}</span>
       </div>
       <p className="text-text-main font-medium mb-1">{t("noConnectionsYet")}</p>
       <p className="text-sm text-text-muted mb-4">{t("addFirstConnectionHint")}</p>
       {!isCompatible && (
         <div className="flex items-center justify-center gap-2">
-          {isCommandCode ? (
+          {isCommandCode || supportsDualAuth ? (
             <>
               <Button
                 icon="open_in_new"
                 loading={
-                  commandCodeAuthState.phase === "starting" ||
-                  commandCodeAuthState.phase === "polling" ||
-                  commandCodeAuthState.phase === "applying"
+                  isCommandCode &&
+                  (commandCodeAuthState.phase === "starting" ||
+                    commandCodeAuthState.phase === "polling" ||
+                    commandCodeAuthState.phase === "applying")
                 }
-                onClick={() => gateConnectionFlow(handleOpenCommandCodeConnect)}
+                onClick={() =>
+                  gateConnectionFlow(
+                    isCommandCode ? handleOpenCommandCodeConnect : openPrimaryAddFlow
+                  )
+                }
               >
                 Connect
               </Button>
@@ -82,10 +89,7 @@ export default function EmptyConnectionsPlaceholder({
                 {providerSupportsPat ? "Add PAT" : t("addConnection")}
               </Button>
               {providerId === "qoder" && (
-                <Button
-                  variant="secondary"
-                  onClick={() => gateConnectionFlow(onOpenOAuthModal)}
-                >
+                <Button variant="secondary" onClick={() => gateConnectionFlow(onOpenOAuthModal)}>
                   Experimental OAuth
                 </Button>
               )}
@@ -111,15 +115,13 @@ export default function EmptyConnectionsPlaceholder({
                     : "Import auth"}
                 </Button>
               )}
-              {providerId === "gemini-cli" && (
+              {providerId === "grok-cli" && (
                 <Button
                   variant="secondary"
                   icon="upload_file"
-                  onClick={() => gateConnectionFlow(onOpenImportGemini)}
+                  onClick={() => gateConnectionFlow(onOpenImportGrokCli)}
                 >
-                  {typeof t.has === "function" && t.has("importGeminiAuth")
-                    ? t("importGeminiAuth")
-                    : "Import auth"}
+                  Import auth
                 </Button>
               )}
             </>

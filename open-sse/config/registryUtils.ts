@@ -1,3 +1,4 @@
+import { hasUnsafeModelIdSyntax } from "../utils/modelIdSafety.ts";
 import { randomUUID } from "crypto";
 /**
  * Shared Registry Utilities
@@ -53,7 +54,7 @@ export function parseModelFromRegistry<P extends BaseProvider>(
   modelStr: string | null,
   registry: Record<string, P>
 ): { provider: string | null; model: string | null } {
-  if (!modelStr) return { provider: null, model: null };
+  if (!modelStr || hasUnsafeModelIdSyntax(modelStr)) return { provider: null, model: null };
 
   // Try each provider prefix
   for (const [providerId, config] of Object.entries(registry)) {
@@ -127,6 +128,8 @@ export function buildAuthHeaders(
       return { "xi-api-key": token };
     case "x-api-key":
       return { "x-api-key": token };
+    case "x-gladia-key":
+      return { "x-gladia-key": token };
     case "bearer":
     default:
       return { Authorization: `Bearer ${token}` };

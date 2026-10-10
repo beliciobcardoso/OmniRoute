@@ -1,14 +1,21 @@
 import { createCompressionStats, estimateCompressionTokens } from "../../stats.ts";
 import { DEFAULT_RTK_CONFIG, type CompressionResult, type RtkConfig } from "../../types.ts";
-import type { CompressionEngine, EngineConfigField, EngineValidationResult } from "../types.ts";
+import type { CompressionEngine } from "../types.ts";
 import { detectCommandType } from "./commandDetector.ts";
+import { RTK_SCHEMA, validateRtkEngineConfig } from "./configSchema.ts";
 import { deduplicateRepeatedLines } from "./deduplicator.ts";
 import { groupSimilarLines } from "./grouper.ts";
 import { matchRtkFilter } from "./filterLoader.ts";
 import { applyLineFilter } from "./lineFilter.ts";
 import { smartTruncate } from "./smartTruncate.ts";
 import { normalizeCodeLanguage, stripCode } from "./codeStripper.ts";
-import { maybePersistRtkRawOutput, type RtkRawOutputPointer } from "./rawOutput.ts";
+import {
+  maybePersistRtkRawOutput,
+  scheduleRtkRawOutputPurge,
+  type RtkRawOutputPointer,
+} from "./rawOutput.ts";
+import { applyRenderer } from "./renderers/index.ts";
+import { severityPattern } from "./severityVocabulary.ts";
 import { isTextBlock } from "../../messageContent.ts";
 import { adaptBodyForCompression } from "../../bodyAdapter.ts";
 import { isAnthropicToolResultBlock } from "../../toolResultCompressor.ts";
@@ -60,115 +67,6 @@ function resolveToolMeta(
     return { command: meta.command, skipFilters: false };
   }
   return { command: null, skipFilters: true };
-}
-
-const RTK_SCHEMA: EngineConfigField[] = [
-  {
-    key: "intensity",
-    type: "select",
-    label: "Intensity",
-    defaultValue: DEFAULT_RTK_CONFIG.intensity,
-    options: [
-      { value: "minimal", label: "minimal" },
-      { value: "standard", label: "standard" },
-      { value: "aggressive", label: "aggressive" },
-    ],
-  },
-  {
-    key: "applyToToolResults",
-    type: "boolean",
-    label: "Apply to tool results",
-    defaultValue: DEFAULT_RTK_CONFIG.applyToToolResults,
-  },
-  {
-    key: "applyToAssistantMessages",
-    type: "boolean",
-    label: "Apply to assistant messages",
-    defaultValue: DEFAULT_RTK_CONFIG.applyToAssistantMessages,
-  },
-  {
-    key: "applyToCodeBlocks",
-    type: "boolean",
-    label: "Apply to code blocks",
-    defaultValue: DEFAULT_RTK_CONFIG.applyToCodeBlocks,
-  },
-  {
-    key: "maxLinesPerResult",
-    type: "number",
-    label: "Max lines per result",
-    defaultValue: DEFAULT_RTK_CONFIG.maxLinesPerResult,
-    min: 0,
-    max: 5000,
-  },
-  {
-    key: "maxCharsPerResult",
-    type: "number",
-    label: "Max chars per result",
-    defaultValue: DEFAULT_RTK_CONFIG.maxCharsPerResult,
-    min: 0,
-    max: 500000,
-  },
-  {
-    key: "deduplicateThreshold",
-    type: "number",
-    label: "Deduplicate threshold",
-    defaultValue: DEFAULT_RTK_CONFIG.deduplicateThreshold,
-    min: 2,
-    max: 100,
-  },
-  {
-    key: "rawOutputRetention",
-    type: "select",
-    label: "Raw output retention",
-    defaultValue: DEFAULT_RTK_CONFIG.rawOutputRetention,
-    options: [
-      { value: "never", label: "never" },
-      { value: "failures", label: "failures" },
-      { value: "always", label: "always" },
-    ],
-  },
-];
-
-function validateRtkEngineConfig(config: Record<string, unknown>): EngineValidationResult {
-  const errors: string[] = [];
-  if (
-    config.intensity !== undefined &&
-    config.intensity !== "minimal" &&
-    config.intensity !== "standard" &&
-    config.intensity !== "aggressive"
-  ) {
-    errors.push("intensity must be minimal, standard, or aggressive");
-  }
-  for (const key of [
-    "enabled",
-    "applyToToolResults",
-    "applyToAssistantMessages",
-    "applyToCodeBlocks",
-  ]) {
-    if (config[key] !== undefined && typeof config[key] !== "boolean") {
-      errors.push(`${key} must be a boolean`);
-    }
-  }
-  for (const key of ["maxLinesPerResult", "maxCharsPerResult", "deduplicateThreshold"]) {
-    if (config[key] !== undefined && (typeof config[key] !== "number" || config[key] < 0)) {
-      errors.push(`${key} must be a non-negative number`);
-    }
-  }
-  if (config.enabledFilters !== undefined && !Array.isArray(config.enabledFilters)) {
-    errors.push("enabledFilters must be an array");
-  }
-  if (config.disabledFilters !== undefined && !Array.isArray(config.disabledFilters)) {
-    errors.push("disabledFilters must be an array");
-  }
-  if (
-    config.rawOutputRetention !== undefined &&
-    config.rawOutputRetention !== "never" &&
-    config.rawOutputRetention !== "failures" &&
-    config.rawOutputRetention !== "always"
-  ) {
-    errors.push("rawOutputRetention must be never, failures, or always");
-  }
-  return { valid: errors.length === 0, errors };
 }
 
 export interface RtkProcessResult {
@@ -228,6 +126,14 @@ function mergeRtkConfig(base?: Partial<RtkConfig>, override?: Record<string, unk
       typeof merged.rawOutputMaxBytes === "number" && Number.isFinite(merged.rawOutputMaxBytes)
         ? Math.max(1024, Math.floor(merged.rawOutputMaxBytes))
         : DEFAULT_RTK_CONFIG.rawOutputMaxBytes,
+    rawOutputMaxFiles:
+      typeof merged.rawOutputMaxFiles === "number" && Number.isFinite(merged.rawOutputMaxFiles)
+        ? Math.max(1, Math.floor(merged.rawOutputMaxFiles))
+        : DEFAULT_RTK_CONFIG.rawOutputMaxFiles,
+    rawOutputMaxAgeDays:
+      typeof merged.rawOutputMaxAgeDays === "number" && Number.isFinite(merged.rawOutputMaxAgeDays)
+        ? Math.max(1, Math.floor(merged.rawOutputMaxAgeDays))
+        : DEFAULT_RTK_CONFIG.rawOutputMaxAgeDays,
   };
 }
 
@@ -354,7 +260,10 @@ export function processRtkText(
       if (config.enabledFilters.length === 0 || config.enabledFilters.includes(filter.id)) {
         const filtered = applyLineFilter(result, {
           ...filter,
-          maxLines: effectiveMaxLines(filter.maxLines || config.maxLinesPerResult, config.intensity),
+          maxLines: effectiveMaxLines(
+            filter.maxLines || config.maxLinesPerResult,
+            config.intensity
+          ),
         });
         result = filtered.text;
         if (filtered.appliedRules.length > 0) {
@@ -363,6 +272,20 @@ export function processRtkText(
         }
         matchedFilterPatterns = filter.priorityPatterns;
       }
+    }
+  }
+
+  // #10: semantic renderers — opt-in via enableRenderers flag (default OFF), fail-open
+  if (config.enableRenderers) {
+    try {
+      const rendered = applyRenderer(result, detection, config);
+      if (rendered.changed) {
+        result = rendered.text;
+        techniquesUsed.push(`rtk-render:${rendered.renderer}`);
+        rulesApplied.push(`rtk:render:${rendered.renderer}`);
+      }
+    } catch {
+      // fail-open: renderer never brings down the request
     }
   }
 
@@ -389,7 +312,13 @@ export function processRtkText(
     }
   }
 
-  const deduped = deduplicateRepeatedLines(result, { threshold: config.deduplicateThreshold });
+  // #13388: skip dedup for non-shell tool results (file reads, grep, glob, etc.)
+  // where repeated structural lines are semantically meaningful. Also skip when
+  // the content is a document-like read to avoid false-positive dedup on code files.
+  const shouldSkipDedup = Boolean(options.skipFilters);
+  const deduped = shouldSkipDedup
+    ? { text: result, collapsed: 0 }
+    : deduplicateRepeatedLines(result, { threshold: config.deduplicateThreshold });
   if (deduped.collapsed > 0) {
     result = deduped.text;
     techniquesUsed.push("rtk-dedup");
@@ -408,7 +337,11 @@ export function processRtkText(
     }
   }
 
-  const defaultPriorityPatterns: RegExp[] = [/error|failed|exception|traceback|TS\d{4}|FAIL|✖/i];
+  // One shared severity vocabulary (./severityVocabulary.ts). It used to be an inline regex
+  // here, a separate array in filterSchema.ts and a THIRD list in rawOutput.ts — three
+  // spellings of the same idea, so whether a diagnostic line survived depended on which
+  // layer happened to run. Everything below now derives from that single file.
+  const defaultPriorityPatterns: RegExp[] = [severityPattern()];
   const filterPriorityPatterns: RegExp[] = matchedFilterPatterns.flatMap((pattern) => {
     try {
       return [new RegExp(pattern, "i")];
@@ -418,6 +351,10 @@ export function processRtkText(
   });
   // #4559: skip the generic line/char hard-cap for document/file reads (see
   // isDocumentLikeRead above) so the middle of a code/prose read is not dropped.
+  // Non-shell results that are NOT document-like (grep/glob/search output) still
+  // get the generic cap — #13388 only exempted dedup, which is what corrupts
+  // structured JSON; unlimited truncation-skip would reopen the problem #4559 fixed
+  // for a different class of tools.
   const truncated = isDocumentLikeRead
     ? { text: result, truncated: false, droppedLines: 0 }
     : smartTruncate(result, {
@@ -444,6 +381,14 @@ export function processRtkText(
       rawOutputPointers.push(pointer);
       techniquesUsed.push("rtk-raw-output-retention");
       rulesApplied.push("rtk:raw-output-retention");
+    }
+    // #10659: bounded retention — schedule a throttled async purge whenever retention is
+    // on so the store cannot grow unbounded again. Never blocks the hot path.
+    if (config.rawOutputRetention !== "never") {
+      scheduleRtkRawOutputPurge({
+        maxFiles: config.rawOutputMaxFiles,
+        maxAgeDays: config.rawOutputMaxAgeDays,
+      });
     }
   }
   return {
@@ -727,6 +672,18 @@ export function applyRtkCompression(
       content: processed.content,
     };
   });
+
+  // Mirror the sibling stacked engines (headroom, session-dedup, ccr, relevance,
+  // ionizer, readLifecycle): skip the expensive createCompressionStats() pass
+  // (full JSON.stringify + tokenizer over the whole body, twice) when nothing
+  // actually changed. Untouched messages keep their original reference above,
+  // so a reference-identity scan is enough to detect the no-op case (#10765).
+  const anyMessageChanged = compressedMessages.some(
+    (message, index) => message !== messages[index]
+  );
+  if (!anyMessageChanged) {
+    return { body, compressed: false, stats: null };
+  }
 
   const compressedBody = { ...adapter.body, messages: compressedMessages };
   const stats = createCompressionStats(

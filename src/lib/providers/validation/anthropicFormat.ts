@@ -9,16 +9,14 @@ import {
   joinClaudeCodeCompatibleUrl,
   joinBaseUrlAndPath,
 } from "@omniroute/open-sse/services/claudeCodeCompatible.ts";
+import { getDefaultExecutor } from "@omniroute/open-sse/executors/defaultResolver.ts";
 import {
+  addModelsSuffix,
   normalizeAnthropicBaseUrl,
   normalizeClaudeCodeCompatibleBaseUrl,
 } from "./urlHelpers";
 import { applyCustomUserAgent } from "./headers";
-import {
-  toValidationErrorResult,
-  validationRead,
-  validationWrite,
-} from "./transport";
+import { toValidationErrorResult, validationRead, validationWrite } from "./transport";
 
 export async function validateAnthropicLikeProvider({
   apiKey,
@@ -41,7 +39,7 @@ export async function validateAnthropicLikeProvider({
       typeof providerSpecificData?.modelsUrl === "string" &&
       providerSpecificData.modelsUrl.trim() !== ""
         ? providerSpecificData.modelsUrl.trim()
-        : `${baseUrl}/models`;
+        : addModelsSuffix(baseUrl);
 
     // Best-effort /models probe. It must not fail validation: canonical Claude
     // base URLs can already include a path/query (…/messages?beta=true).
@@ -126,7 +124,6 @@ export async function validateAnthropicLikeProvider({
   }
 }
 
-
 export async function validateClaudeOAuthInline({
   apiKey,
   modelId,
@@ -136,12 +133,12 @@ export async function validateClaudeOAuthInline({
   modelId: string | null | undefined;
   providerSpecificData?: Record<string, unknown>;
 }) {
-  const testModelId =
-    providerSpecificData?.validationModelId || modelId || "claude-haiku-4-5-20251001";
+  const override = providerSpecificData?.validationModelId;
+  const testModelId: string =
+    typeof override === "string" && override ? override : modelId || "claude-haiku-4-5-20251001";
 
   try {
-    const { getExecutor } = await import("@omniroute/open-sse/executors/index.ts");
-    const { response } = await getExecutor("claude").execute({
+    const executed = await getDefaultExecutor("claude").execute({
       model: testModelId,
       body: {
         model: testModelId,
@@ -152,6 +149,7 @@ export async function validateClaudeOAuthInline({
       credentials: { accessToken: apiKey, providerSpecificData },
     });
 
+    const response = executed instanceof Response ? executed : executed.response;
     if (response.status === 401 || response.status === 403) {
       return { valid: false, error: "Invalid OAuth token" };
     }
@@ -163,7 +161,6 @@ export async function validateClaudeOAuthInline({
     return toValidationErrorResult(error);
   }
 }
-
 
 export async function validateAnthropicCompatibleProvider({
   apiKey,
@@ -235,7 +232,6 @@ export async function validateAnthropicCompatibleProvider({
     return toValidationErrorResult(error);
   }
 }
-
 
 export async function validateClaudeCodeCompatibleProvider({
   apiKey,
@@ -316,4 +312,3 @@ export async function validateClaudeCodeCompatibleProvider({
     return toValidationErrorResult(error);
   }
 }
-

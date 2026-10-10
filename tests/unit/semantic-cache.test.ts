@@ -6,7 +6,16 @@ import {
   isCacheableForWrite,
 } from "../../src/lib/semanticCache.ts";
 
+const semanticCachePublicApi = await import("../../src/lib/semanticCache.ts");
+
 describe("Semantic Cache", () => {
+  it("public surface excludes unused maintenance timer helpers", () => {
+    assert.equal("startAutoCleanup" in semanticCachePublicApi, false);
+    assert.equal("stopAutoCleanup" in semanticCachePublicApi, false);
+    assert.equal("cleanExpiredEntries" in semanticCachePublicApi, false);
+    assert.equal("cleanOldMetrics" in semanticCachePublicApi, false);
+  });
+
   describe("generateSignature", () => {
     it("generates consistent signatures for same inputs", () => {
       const messages = [{ role: "user", content: "hello" }];
@@ -77,7 +86,11 @@ describe("Semantic Cache", () => {
       const messages = [{ role: "user", content: "what is 2+2?" }];
       const sigKeyA = generateSignature("gpt-4o", messages, 0, 1, "key-id-alice");
       const sigKeyB = generateSignature("gpt-4o", messages, 0, 1, "key-id-bob");
-      assert.notEqual(sigKeyA, sigKeyB, "different API keys must produce different cache signatures");
+      assert.notEqual(
+        sigKeyA,
+        sigKeyB,
+        "different API keys must produce different cache signatures"
+      );
     });
 
     it("generates consistent signatures for same API key ID (#3740)", () => {
@@ -93,6 +106,81 @@ describe("Semantic Cache", () => {
       const sigKeyed = generateSignature("gpt-4o", messages, 0, 1, "some-key-id");
       const sigKeyless = generateSignature("gpt-4o", messages, 0, 1, undefined);
       assert.notEqual(sigKeyed, sigKeyless);
+    });
+
+    // #12734: tool_choice/tools/response_format change model behavior and must not be
+    // ignored by the signature — otherwise a cached tool_calls response can be replayed
+    // for a request whose tool policy forbids it.
+    describe("tool_choice / tools / response_format (#12734)", () => {
+      const messages = [{ role: "user", content: "what is 2+2?" }];
+
+      it("generates different signatures for different tool_choice ('auto' vs 'none')", () => {
+        const sig1 = generateSignature("gpt-4o", messages, 0, 1, undefined, {
+          toolChoice: "auto",
+        });
+        const sig2 = generateSignature("gpt-4o", messages, 0, 1, undefined, {
+          toolChoice: "none",
+        });
+        assert.notEqual(sig1, sig2);
+      });
+
+      it("generates different signatures for a forced-function tool_choice", () => {
+        const sig1 = generateSignature("gpt-4o", messages, 0, 1, undefined, {
+          toolChoice: "auto",
+        });
+        const sig2 = generateSignature("gpt-4o", messages, 0, 1, undefined, {
+          toolChoice: { type: "function", function: { name: "get_weather" } },
+        });
+        assert.notEqual(sig1, sig2);
+      });
+
+      it("generates different signatures for no tool_choice vs an explicit one (the #12734 collision)", () => {
+        const sigNoToolChoice = generateSignature("gpt-4o", messages, 0, 1);
+        const sigWithToolChoice = generateSignature("gpt-4o", messages, 0, 1, undefined, {
+          toolChoice: "none",
+        });
+        assert.notEqual(sigNoToolChoice, sigWithToolChoice);
+      });
+
+      it("generates different signatures for different tools arrays", () => {
+        const tools1 = [{ type: "function", function: { name: "get_weather", parameters: {} } }];
+        const tools2 = [{ type: "function", function: { name: "get_stock_price", parameters: {} } }];
+        const sig1 = generateSignature("gpt-4o", messages, 0, 1, undefined, { tools: tools1 });
+        const sig2 = generateSignature("gpt-4o", messages, 0, 1, undefined, { tools: tools2 });
+        assert.notEqual(sig1, sig2);
+      });
+
+      it("generates different signatures for different response_format", () => {
+        const sig1 = generateSignature("gpt-4o", messages, 0, 1, undefined, {
+          responseFormat: { type: "text" },
+        });
+        const sig2 = generateSignature("gpt-4o", messages, 0, 1, undefined, {
+          responseFormat: { type: "json_object" },
+        });
+        assert.notEqual(sig1, sig2);
+      });
+
+      it("generates identical signatures when constraints are identical (no hit-rate regression)", () => {
+        const tools = [{ type: "function", function: { name: "get_weather", parameters: {} } }];
+        const constraints = {
+          toolChoice: "auto",
+          tools,
+          responseFormat: { type: "json_object" },
+        };
+        const sig1 = generateSignature("gpt-4o", messages, 0, 1, undefined, constraints);
+        const sig2 = generateSignature("gpt-4o", messages, 0, 1, undefined, {
+          toolChoice: "auto",
+          tools: [{ type: "function", function: { name: "get_weather", parameters: {} } }],
+          responseFormat: { type: "json_object" },
+        });
+        assert.equal(sig1, sig2);
+      });
+
+      it("generates identical signatures for omitted constraints vs an explicitly empty constraints object", () => {
+        const sig1 = generateSignature("gpt-4o", messages, 0, 1, undefined);
+        const sig2 = generateSignature("gpt-4o", messages, 0, 1, undefined, {});
+        assert.equal(sig1, sig2);
+      });
     });
   });
 

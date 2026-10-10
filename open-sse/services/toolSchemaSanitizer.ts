@@ -110,8 +110,31 @@ function sanitizeSchema(value: unknown, depth = 0): Record<string, unknown> {
   return result;
 }
 
+/**
+ * OpenAI's Responses API strict validator requires the ROOT parameters schema to
+ * declare `type: "object"` explicitly. Clients like the Codex app emit
+ * `type: null` (rejected upstream as: schema must be a JSON Schema of
+ * 'type: "object"', got 'type: null' — issue #6359). sanitizeSchema drops the
+ * null, so at the root we re-add the mandatory "object". Combinator roots
+ * (anyOf/oneOf/allOf) are left alone — injecting a sibling `type` would change
+ * their meaning — and explicit root types are preserved as-is.
+ */
+function ensureRootObjectType(schema: Record<string, unknown>): void {
+  if (hasOwn(schema, "type")) return;
+  if (hasOwn(schema, "anyOf") || hasOwn(schema, "oneOf") || hasOwn(schema, "allOf")) return;
+  schema.type = "object";
+  if (!isPlainObject(schema.properties)) {
+    schema.properties = {};
+    if (!hasOwn(schema, "additionalProperties")) schema.additionalProperties = true;
+  }
+}
+
 function normalizeParameters(parameters: unknown): unknown {
-  if (isPlainObject(parameters)) return sanitizeSchema(parameters);
+  if (isPlainObject(parameters)) {
+    const sanitized = sanitizeSchema(parameters);
+    ensureRootObjectType(sanitized);
+    return sanitized;
+  }
   if (parameters === null || parameters === undefined) {
     return { type: "object", properties: {}, additionalProperties: true };
   }
@@ -139,4 +162,21 @@ export function sanitizeOpenAITool(tool: unknown): unknown {
 
 export function sanitizeOpenAITools(tools: unknown[]): unknown[] {
   return tools.map(sanitizeOpenAITool);
+}
+
+export function flattenOpenAIToolRootAnyOf(tools: unknown): unknown {
+  if (!Array.isArray(tools)) return tools;
+  return tools.map((tool) => {
+    if (!isPlainObject(tool)) return tool;
+
+    const next = { ...tool };
+    const fn = isPlainObject(next.function) ? { ...next.function } : next;
+    if (!isPlainObject(fn.parameters) || !hasOwn(fn.parameters, "anyOf")) return tool;
+
+    const parameters = { ...fn.parameters };
+    delete parameters.anyOf;
+    fn.parameters = parameters;
+    if (fn !== next) next.function = fn;
+    return next;
+  });
 }

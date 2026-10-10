@@ -1,6 +1,10 @@
 import { getProviderAlias } from "@/shared/constants/providers";
 import { OMNIROUTE_RESPONSE_HEADERS } from "@/shared/constants/headers";
 import { APP_CONFIG } from "@/shared/constants/appConfig";
+import {
+  generationDurationMs,
+  tokensPerSecond,
+} from "@omniroute/open-sse/utils/generationThroughput";
 
 type UsageLike = Record<string, unknown> | null | undefined;
 
@@ -15,6 +19,40 @@ function toFiniteNumber(value: unknown): number {
 
 function toNonNegativeInteger(value: unknown): number {
   return Math.max(0, Math.round(toFiniteNumber(value)));
+}
+
+const INVALID_HEADER_VALUE_CONTROL_CHARS = /[\u0000-\u001f\u007f]/g;
+const ASCII_HEADER_VALUE_PATTERN = /^[\u0020-\u007e]*$/;
+
+function toWellFormedUnicode(value: string): string {
+  let result = "";
+
+  for (let i = 0; i < value.length; i += 1) {
+    const code = value.charCodeAt(i);
+    if (code >= 0xd800 && code <= 0xdbff) {
+      const next = value.charCodeAt(i + 1);
+      if (next >= 0xdc00 && next <= 0xdfff) {
+        result += value[i] + value[i + 1];
+        i += 1;
+      } else {
+        result += "\uFFFD";
+      }
+      continue;
+    }
+    if (code >= 0xdc00 && code <= 0xdfff) {
+      result += "\uFFFD";
+      continue;
+    }
+    result += value[i];
+  }
+
+  return result;
+}
+
+function toHeaderValue(value: string): string {
+  const withoutControls = value.replace(INVALID_HEADER_VALUE_CONTROL_CHARS, "");
+  if (ASCII_HEADER_VALUE_PATTERN.test(withoutControls)) return withoutControls;
+  return encodeURIComponent(toWellFormedUnicode(withoutControls));
 }
 
 export function getOmniRouteTokenCounts(usage: UsageLike): { input: number; output: number } {
@@ -45,6 +83,39 @@ export function formatOmniRouteCost(costUsd: unknown): string {
   return normalized > 0 ? normalized.toFixed(10) : "0.0000000000";
 }
 
+/**
+ * Build the `X-OmniRoute-Decision` composite header value: `strategy=<name>;
+ * provider=<alias>; latency_ms=<n>`. Returns `null` when both `strategy` and
+ * `provider` are absent/blank (mirrors the per-field guard pattern used for the
+ * other optional headers). Reuses `getProviderAlias()` for the provider segment
+ * (same alias normalization the `X-OmniRoute-Provider` header already applies)
+ * and `toNonNegativeInteger()` for latency. The whole formatted string is passed
+ * through `toHeaderValue()` before returning, so a strategy/provider id
+ * containing control chars cannot corrupt the header line (Hard Rule #12 — this
+ * header only ever carries a routing strategy name, the already-public provider
+ * alias, and a latency integer; never an error message, stack trace, or secret).
+ */
+export function buildOmniRouteDecisionHeaderValue({
+  strategy = null,
+  provider = null,
+  latencyMs = 0,
+}: {
+  strategy?: string | null;
+  provider?: string | null;
+  latencyMs?: unknown;
+}): string | null {
+  const hasStrategy = typeof strategy === "string" && strategy.trim().length > 0;
+  const hasProvider = typeof provider === "string" && provider.trim().length > 0;
+  if (!hasStrategy && !hasProvider) return null;
+
+  const parts: string[] = [];
+  if (hasStrategy) parts.push(`strategy=${strategy}`);
+  if (hasProvider) parts.push(`provider=${getProviderAlias(provider as string)}`);
+  parts.push(`latency_ms=${toNonNegativeInteger(latencyMs)}`);
+
+  return toHeaderValue(parts.join("; "));
+}
+
 export function buildOmniRouteResponseMetaHeaders({
   cacheHit = false,
   costUsd = 0,
@@ -54,7 +125,9 @@ export function buildOmniRouteResponseMetaHeaders({
   model = null,
   provider = null,
   requestId = null,
+  strategy = null,
   usage = null,
+  ttftMs = null,
 }: {
   cacheHit?: boolean;
   costUsd?: unknown;
@@ -71,39 +144,66 @@ export function buildOmniRouteResponseMetaHeaders({
   model?: string | null;
   provider?: string | null;
   requestId?: string | null;
+  /**
+   * Routing decision (combo strategy name, or `"single"` for a non-combo
+   * request) surfaced via `X-OmniRoute-Decision`. See #6022.
+   */
+  strategy?: string | null;
   usage?: UsageLike;
+  /**
+   * First-token latency in ms. Required to emit tok/s: generation speed is
+   * `output_tokens / (latencyMs - ttftMs)` and MUST omit the field when TTFT
+   * is unknown so plugins do not treat `tokens / total_latency` as speed.
+   */
+  ttftMs?: number | null;
 }): Record<string, string> {
   const tokens = getOmniRouteTokenCounts(usage);
   const headers: Record<string, string> = {
-    [OMNIROUTE_RESPONSE_HEADERS.cacheHit]: String(cacheHit),
-    [OMNIROUTE_RESPONSE_HEADERS.latencyMs]: String(toNonNegativeInteger(latencyMs)),
-    [OMNIROUTE_RESPONSE_HEADERS.responseCost]: formatOmniRouteCost(costUsd),
-    [OMNIROUTE_RESPONSE_HEADERS.tokensIn]: String(tokens.input),
-    [OMNIROUTE_RESPONSE_HEADERS.tokensOut]: String(tokens.output),
-    [OMNIROUTE_RESPONSE_HEADERS.version]: APP_CONFIG.version,
+    [OMNIROUTE_RESPONSE_HEADERS.cacheHit]: toHeaderValue(String(cacheHit)),
+    [OMNIROUTE_RESPONSE_HEADERS.latencyMs]: toHeaderValue(String(toNonNegativeInteger(latencyMs))),
+    [OMNIROUTE_RESPONSE_HEADERS.responseCost]: toHeaderValue(formatOmniRouteCost(costUsd)),
+    [OMNIROUTE_RESPONSE_HEADERS.tokensIn]: toHeaderValue(String(tokens.input)),
+    [OMNIROUTE_RESPONSE_HEADERS.tokensOut]: toHeaderValue(String(tokens.output)),
+    [OMNIROUTE_RESPONSE_HEADERS.version]: toHeaderValue(APP_CONFIG.version),
   };
 
   if (typeof model === "string" && model.trim().length > 0) {
-    headers[OMNIROUTE_RESPONSE_HEADERS.model] = model;
+    headers[OMNIROUTE_RESPONSE_HEADERS.model] = toHeaderValue(model);
   }
 
   if (typeof requestId === "string" && requestId.trim().length > 0) {
-    headers[OMNIROUTE_RESPONSE_HEADERS.requestId] = requestId;
+    headers[OMNIROUTE_RESPONSE_HEADERS.requestId] = toHeaderValue(requestId);
   }
 
   if (typeof provider === "string" && provider.trim().length > 0) {
-    headers[OMNIROUTE_RESPONSE_HEADERS.provider] = getProviderAlias(provider);
+    headers[OMNIROUTE_RESPONSE_HEADERS.provider] = toHeaderValue(getProviderAlias(provider));
   }
 
   // Cache-saved cost: emitted only when the caller passes a value (cache HITs), so
   // non-cache responses keep their existing header shape. `0` is a valid saved cost.
   if (costSavedUsd != null) {
-    headers[OMNIROUTE_RESPONSE_HEADERS.costSaved] = formatOmniRouteCost(costSavedUsd);
+    headers[OMNIROUTE_RESPONSE_HEADERS.costSaved] = toHeaderValue(
+      formatOmniRouteCost(costSavedUsd)
+    );
   }
 
   const attempts = toNonNegativeInteger(fallbackAttempts);
   if (attempts > 0) {
-    headers[OMNIROUTE_RESPONSE_HEADERS.fallbackAttempts] = String(attempts);
+    headers[OMNIROUTE_RESPONSE_HEADERS.fallbackAttempts] = toHeaderValue(String(attempts));
+  }
+
+  const decisionValue = buildOmniRouteDecisionHeaderValue({ strategy, provider, latencyMs });
+  if (decisionValue !== null) {
+    headers[OMNIROUTE_RESPONSE_HEADERS.decision] = decisionValue;
+  }
+
+  let tps = tokensPerSecond(tokens.output, generationDurationMs(toFiniteNumber(latencyMs), ttftMs));
+  if (tps == null && usage && typeof usage === "object") {
+    const fromUsage = toFiniteNumber((usage as Record<string, unknown>).tokens_per_second);
+    if (fromUsage > 0) tps = fromUsage;
+  }
+  if (tps != null) {
+    headers[OMNIROUTE_RESPONSE_HEADERS.tokensPerSecond] = toHeaderValue(tps.toFixed(3));
   }
 
   return headers;

@@ -9,6 +9,9 @@ import { EXPECTED_CODE_COUNT } from "@/shared/schemas/cliCatalog";
 import { CliToolCard, CliConceptCard, CliComparisonCard } from "@/shared/components/cli";
 import { useToolBatchStatuses } from "@/shared/hooks/cli/useToolBatchStatuses";
 import type { CliCatalogEntry } from "@/shared/schemas/cliCatalog";
+import CliProfileAutoSyncToggles from "./components/CliProfileAutoSyncToggles";
+import CliCompanionPanel from "./components/CliCompanionPanel";
+import type { CompanionTarget } from "@/shared/utils/cliCompanion";
 
 // ── Static catalogue slice ────────────────────────────────────────────────────
 
@@ -42,14 +45,18 @@ interface ProvidersResponse {
 
 interface CliCodePageClientProps {
   machineId: string;
+  companionTargets?: CompanionTarget[];
 }
 
-export default function CliCodePageClient({ machineId: _machineId }: CliCodePageClientProps) {
+export default function CliCodePageClient({
+  machineId: _machineId,
+  companionTargets = [],
+}: CliCodePageClientProps) {
   const t = useTranslations("cliCode");
   const tCommon = useTranslations("cliCommon");
 
   // ── Batch statuses ──────────────────────────────────────────────────────────
-  const { statuses, loading, refetch } = useToolBatchStatuses();
+  const { statuses, loading, error, refetch } = useToolBatchStatuses();
 
   // ── Providers ───────────────────────────────────────────────────────────────
   const [hasActiveProviders, setHasActiveProviders] = useState<boolean>(false);
@@ -58,7 +65,9 @@ export default function CliCodePageClient({ machineId: _machineId }: CliCodePage
   useEffect(() => {
     let cancelled = false;
     fetch("/api/providers")
-      .then<ProvidersResponse>((res) => (res.ok ? res.json() : Promise.resolve({ connections: [] })))
+      .then<ProvidersResponse>((res) =>
+        res.ok ? res.json() : Promise.resolve({ connections: [] })
+      )
       .then((data) => {
         if (cancelled) return;
         const active = (data.connections ?? []).filter((c) => c.isActive !== false);
@@ -99,8 +108,7 @@ export default function CliCodePageClient({ machineId: _machineId }: CliCodePage
     return CODE_TOOLS.filter(([id, tool]) => {
       // Search filter
       if (q) {
-        const haystack =
-          `${tool.name} ${tool.vendor} ${tool.description}`.toLowerCase();
+        const haystack = `${tool.name} ${tool.vendor} ${tool.description}`.toLowerCase();
         if (!haystack.includes(q)) return false;
       }
 
@@ -131,6 +139,8 @@ export default function CliCodePageClient({ machineId: _machineId }: CliCodePage
       {/* Comparison card */}
       <CliComparisonCard currentType="code" />
 
+      <CliProfileAutoSyncToggles />
+
       {/* Header bar */}
       <div className="flex flex-col sm:flex-row sm:items-center gap-3 flex-wrap">
         {/* Title + subtitle */}
@@ -150,6 +160,13 @@ export default function CliCodePageClient({ machineId: _machineId }: CliCodePage
           {tCommon("card.refreshDetection")}
         </Button>
       </div>
+
+      <CliCompanionPanel
+        targets={companionTargets}
+        statuses={statuses}
+        loading={loading}
+        error={Boolean(error)}
+      />
 
       {/* Filter row */}
       <div className="flex flex-col sm:flex-row gap-3 items-start sm:items-center">

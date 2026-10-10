@@ -23,7 +23,7 @@ async function resetStorage() {
   for (let attempt = 0; attempt < 10; attempt++) {
     try {
       if (fs.existsSync(TEST_DATA_DIR)) {
-        fs.rmSync(TEST_DATA_DIR, { recursive: true, force: true });
+        fs.rmSync(TEST_DATA_DIR, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
       }
       break;
     } catch (error: any) {
@@ -37,6 +37,99 @@ async function resetStorage() {
 
   fs.mkdirSync(TEST_DATA_DIR, { recursive: true });
 }
+
+test("GitHub access-token health demotes only a verified 401 and stores no secrets", async () => {
+  for (const status of [200, 401, 403, 429, 500]) {
+    await resetStorage();
+    const accessToken = `ghp_status_${status}_secret`;
+    const responseSecret = `response-${status}-secret`;
+    const originalFetch = globalThis.fetch;
+    const consoleOutput: unknown[] = [];
+    const originalError = console.error;
+    console.error = (...args: unknown[]) => consoleOutput.push(args);
+    globalThis.fetch = (async () =>
+      status === 200
+        ? new Response(
+            JSON.stringify({
+              token: `copilot-${status}-secret`,
+              expires_at: Math.floor(Date.now() / 1000) + 1800,
+            }),
+            { status, headers: { "content-type": "application/json" } }
+          )
+        : new Response(responseSecret, { status })) as typeof fetch;
+
+    try {
+      const connection = await providersDb.createProviderConnection({
+        provider: "github",
+        authType: "oauth",
+        name: `GitHub ${status}`,
+        accessToken,
+        healthCheckInterval: 60,
+        isActive: true,
+        testStatus: "active",
+        providerSpecificData: {
+          copilotToken: "existing-copilot-secret",
+          copilotTokenExpiresAt: Math.floor(Date.now() / 1000) + 3600,
+        },
+      });
+
+      await tokenHealthCheck.checkConnection({
+        ...connection,
+        lastHealthCheckAt: new Date(Date.now() - 61 * 60 * 1000).toISOString(),
+      });
+
+      const updated = await providersDb.getProviderConnectionById(connection.id);
+      assert.equal(updated?.testStatus, status === 401 ? "expired" : "active");
+      assert.equal(updated?.lastHealthCheckAt !== connection.lastHealthCheckAt, true);
+      assert.equal(JSON.stringify(updated).includes(responseSecret), false);
+      assert.equal(JSON.stringify(consoleOutput).includes(accessToken), false);
+      assert.equal(JSON.stringify(consoleOutput).includes(responseSecret), false);
+      if (status === 401) {
+        assert.equal(updated?.errorCode, "github_access_token_invalid");
+        assert.equal(updated?.lastErrorType, "github_access_token_invalid");
+        assert.equal(updated?.lastErrorSource, "oauth");
+      }
+    } finally {
+      globalThis.fetch = originalFetch;
+      console.error = originalError;
+    }
+  }
+});
+
+test("GitHub access-token health keeps network failures active", async () => {
+  await resetStorage();
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = (async () => {
+    throw new Error("network down");
+  }) as typeof fetch;
+
+  try {
+    const connection = await providersDb.createProviderConnection({
+      provider: "github",
+      authType: "oauth",
+      name: "GitHub network",
+      accessToken: "ghp_network_secret",
+      healthCheckInterval: 60,
+      isActive: true,
+      testStatus: "active",
+      providerSpecificData: {
+        copilotToken: "existing-copilot-secret",
+        copilotTokenExpiresAt: Math.floor(Date.now() / 1000) + 3600,
+      },
+    });
+
+    await tokenHealthCheck.checkConnection({
+      ...connection,
+      lastHealthCheckAt: new Date(Date.now() - 61 * 60 * 1000).toISOString(),
+    });
+
+    const updated = await providersDb.getProviderConnectionById(connection.id);
+    assert.equal(updated?.testStatus, "active");
+    assert.equal(updated?.lastHealthCheckAt !== connection.lastHealthCheckAt, true);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
 
 async function withHttpServer(handler, fn) {
   const server = http.createServer(handler);
@@ -134,8 +227,54 @@ async function withPatchedProvider(providerId, config, fn) {
 
 test.after(async () => {
   core.resetDbInstance();
-  fs.rmSync(TEST_DATA_DIR, { recursive: true, force: true });
+  fs.rmSync(TEST_DATA_DIR, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
 });
+
+for (const concurrent of [false, true]) {
+  test(`successful OAuth refresh preserves ${concurrent ? "concurrent" : "existing"} quota cooldown diagnostics`, async () => {
+    await resetStorage();
+    const providerId = "healthcheck-quota-test";
+    let connectionId = "";
+    const cooldown = {
+      testStatus: "unavailable",
+      rateLimitedUntil: new Date(Date.now() + 3600_000).toISOString(),
+      lastError: "Weekly quota exhausted",
+      lastErrorAt: new Date().toISOString(),
+      lastErrorType: "quota_exhausted",
+      lastErrorSource: "upstream",
+      errorCode: "429",
+      backoffLevel: 2,
+    };
+    await withHttpServer(
+      async (_req, res) => {
+        if (concurrent) await providersDb.updateProviderConnection(connectionId, cooldown);
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ access_token: "fresh-test-token", expires_in: 3600 }));
+      },
+      async (server) => {
+        await withPatchedProvider(providerId, { tokenUrl: `${server.url}/token` }, async () => {
+          const connection = await providersDb.createProviderConnection({
+            provider: providerId,
+            authType: "oauth",
+            accessToken: "expired-test-token",
+            refreshToken: "test-refresh-token",
+            expiresAt: new Date(Date.now() - 60_000).toISOString(),
+            isActive: true,
+            ...(concurrent ? { testStatus: "active" } : cooldown),
+          });
+          connectionId = connection.id;
+          if (!concurrent) await providersDb.updateProviderConnection(connectionId, cooldown);
+          await tokenHealthCheck.checkConnection(connection);
+          const updated = await providersDb.getProviderConnectionById(connectionId);
+          assert.equal(updated?.accessToken, "fresh-test-token");
+          for (const [key, value] of Object.entries(cooldown)) {
+            assert.equal(updated?.[key], value, `refresh must preserve ${key}`);
+          }
+        });
+      }
+    );
+  });
+}
 
 test("extractResolvedProxyConfig unwraps proxy resolution metadata", () => {
   const proxy = {
@@ -529,13 +668,13 @@ test("checkConnection preserves refresh_token for non-rotating providers on unre
 
 // Regression for #3850 (continuation of #3679): the #3679 test above uses a SYNTHETIC
 // provider that routes through the generic refreshAccessToken/tokenUrl path. The real
-// Google-family providers (gemini-cli / antigravity) instead dispatch through
+// Google-family providers (Antigravity) dispatch through
 // refreshGoogleToken() against the HARDCODED OAUTH_ENDPOINTS.google.token — a path the
 // synthetic test never exercised, which left #3766's correctness unproven for the
-// actual reported providers. This drives checkConnection through the REAL gemini-cli /
-// antigravity dispatch and asserts the refresh_token is preserved (NOT nulled) when
+// actual reported provider. This drives checkConnection through the REAL Antigravity
+// dispatch and asserts the refresh_token is preserved (NOT nulled) when
 // Google rejects the refresh with invalid_grant.
-for (const providerId of ["gemini-cli", "antigravity"]) {
+for (const providerId of ["antigravity"]) {
   test(`checkConnection preserves refresh_token for ${providerId} on invalid_grant (#3850)`, async () => {
     await resetStorage();
 
@@ -550,7 +689,7 @@ for (const providerId of ["gemini-cli", "antigravity"]) {
         res.end(JSON.stringify({ error: "invalid_grant", error_description: "Bad Request" }));
       },
       async (tokenServer) => {
-        // gemini-cli / antigravity refresh hits OAUTH_ENDPOINTS.google.token directly
+        // Antigravity refresh hits OAUTH_ENDPOINTS.google.token directly
         // (not a per-provider tokenUrl), so redirect that hardcoded endpoint.
         OAUTH_ENDPOINTS.google.token = `${tokenServer.url}/token`;
         try {

@@ -8,7 +8,6 @@ const REPO = "diegosouzapw/OmniRoute";
 const BRANCH = "main";
 const SKILL_PATH = "skills";
 
-export const AGENT_SKILLS_REPO_URL = `https://github.com/${REPO}`;
 export const AGENT_SKILLS_RAW_BASE = `https://raw.githubusercontent.com/${REPO}/refs/heads/${BRANCH}/${SKILL_PATH}`;
 export const AGENT_SKILLS_BLOB_BASE = `https://github.com/${REPO}/blob/${BRANCH}/${SKILL_PATH}`;
 
@@ -36,11 +35,11 @@ export interface CuratedSkillEntry {
   isNew?: boolean;
 }
 
-// ── Canonical 42-entry curated list (D28) ────────────────────────────────────
+// ── Canonical 46-entry curated list (D28) ────────────────────────────────────
 
-/** Curated metadata for all 42 agent skills. Source-of-truth for the catalog. */
+/** Curated metadata for all 46 agent skills. Source-of-truth for the catalog. */
 export const CURATED_SKILLS: CuratedSkillEntry[] = [
-  // ── API Skills (22) ─────────────────────────────────────────────────────────
+  // ── API Skills (23) ─────────────────────────────────────────────────────────
 
   {
     id: "omni-auth",
@@ -56,7 +55,7 @@ export const CURATED_SKILLS: CuratedSkillEntry[] = [
     id: "omni-providers",
     name: "Providers",
     description:
-      "Manage provider connections, API keys, OAuth flows, and connection tests via the REST API. List, add, update, remove, and test AI provider integrations (OpenAI, Anthropic, Gemini, and 160+).",
+      "Manage provider connections, API keys, OAuth flows, and connection tests via the REST API. List, add, update, remove, and test AI provider integrations across OmniRoute's 327-provider catalog.",
     category: "api",
     area: "providers",
     icon: "key",
@@ -74,7 +73,7 @@ export const CURATED_SKILLS: CuratedSkillEntry[] = [
     id: "omni-combos-routing",
     name: "Combos & Routing",
     description:
-      "Create and manage routing combos with 14 strategies (priority, weighted, round-robin, Auto-combo, etc.). Configure fallback chains, test routing outcomes, and retrieve combo metrics.",
+      "Create and manage routing combos with 19 strategies (priority, weighted, round-robin, Auto-combo, and more). Configure fallback chains, test routing outcomes, and retrieve combo metrics.",
     category: "api",
     area: "combos-routing",
     icon: "route",
@@ -204,7 +203,7 @@ export const CURATED_SKILLS: CuratedSkillEntry[] = [
     id: "omni-webhooks",
     name: "Webhooks",
     description:
-      "Register, list, test, and remove webhook endpoints. Configure event subscriptions (request.completed, provider.error, budget.exceeded, etc.) and manage delivery retries.",
+      "Register, list, test, and remove webhook endpoints. Configure event subscriptions (request.completed, request.failed, quota.exceeded, etc.) and manage delivery retries.",
     category: "api",
     area: "webhooks",
     icon: "webhook",
@@ -213,7 +212,7 @@ export const CURATED_SKILLS: CuratedSkillEntry[] = [
     id: "omni-mcp",
     name: "MCP Server",
     description:
-      "Connect to the OmniRoute MCP server (37 tools, 3 transports: SSE/stdio/HTTP). Covers routing, cache, compression, memory, skills, providers, and audit tools across 16 permission scopes.",
+      "Connect to the OmniRoute MCP server (110 tools, 3 transports: SSE/stdio/HTTP). Covers routing, cache, compression, memory, skills, providers, and audit tools across 33 permission scopes.",
     category: "api",
     area: "mcp",
     icon: "electrical_services",
@@ -246,7 +245,7 @@ export const CURATED_SKILLS: CuratedSkillEntry[] = [
     icon: "hub",
   },
 
-  // ── CLI Skills (20) ──────────────────────────────────────────────────────────
+  // ── CLI Skills (21) ──────────────────────────────────────────────────────────
 
   {
     id: "cli-serve",
@@ -429,6 +428,15 @@ export const CURATED_SKILLS: CuratedSkillEntry[] = [
     area: "cli-setup",
     icon: "build",
   },
+  {
+    id: "cli-skill-collector",
+    name: "CLI: Agent Skill Collector",
+    description:
+      "Detect installed CLI coding tools (Claude Code, Codex, Cursor, Copilot, Cline and more), search GitHub for matching agent skills, and install them to the detected tools via OmniRoute's built-in APIs.",
+    category: "cli",
+    area: "cli-setup",
+    icon: "extension",
+  },
 
   // ── Config Skills ────────────────────────────────────────────────────────────
 
@@ -442,5 +450,30 @@ export const CURATED_SKILLS: CuratedSkillEntry[] = [
     icon: "terminal",
     isNew: true,
   },
-];
 
+  // ── GitHub Skills ─────────────────────────────────────────────────────────
+
+  {
+    id: "omni-github-skills",
+    name: "GitHub Skill Discovery",
+    description:
+      "Search, score, scan, and import agent skills from GitHub repositories that contain SKILL.md, CLAUDE.md, .cursorrules, and similar agent skill files. Discover community skills across many tool and provider categories, evaluate relevance with heuristic scoring, check for malware or hardcoded secrets, and install into Hermes, Claude Code, Gemini CLI, or OpenCode agent directories.",
+    category: "api",
+    area: "github-skills",
+    icon: "explore",
+    isNew: true,
+  },
+
+  // ── External (third-party) Skills ─────────────────────────────────────────
+
+  {
+    id: "ponytail",
+    name: "Ponytail (Minimalism Ladder)",
+    description:
+      "External agent skill (MIT, github.com/DietrichGebert/ponytail). Forces the laziest solution that actually works: question whether the task needs to exist at all (YAGNI), reuse what is already in the codebase, reach for the standard library before custom code, native platform features before dependencies, one line before fifty. Climb the ladder on every coding task — writing, adding, refactoring, fixing, reviewing, or designing code, and choosing libraries or dependencies. Supports intensity levels: lite, full (default), ultra. Never cut validation, error handling, security, or accessibility.",
+    category: "external",
+    area: "external",
+    icon: "compress",
+    isNew: true,
+  },
+];

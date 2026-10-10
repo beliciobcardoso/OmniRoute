@@ -1,5 +1,7 @@
 import { DefaultExecutor } from "./default.ts";
+import type { ProviderCredentials } from "./base.ts";
 import { stripTrailingSlashes } from "../utils/urlSanitize.ts";
+import { applyAzureParamRules } from "./azureParamRules.ts";
 
 const DEFAULT_API_VERSION = "2024-12-01-preview";
 
@@ -17,11 +19,20 @@ export class AzureOpenAIExecutor extends DefaultExecutor {
     super("azure-openai");
   }
 
-  buildUrl(model: string, stream: boolean, urlIndex = 0, credentials: any = null) {
+  buildUrl(
+    model: string,
+    stream: boolean,
+    urlIndex = 0,
+    credentials: ProviderCredentials | null = null
+  ) {
     void urlIndex;
 
     const providerSpecificData = credentials?.providerSpecificData || {};
-    const baseUrl = normalizeAzureBaseUrl(providerSpecificData.baseUrl || this.config.baseUrl);
+    const baseUrl = normalizeAzureBaseUrl(
+      typeof providerSpecificData.baseUrl === "string"
+        ? providerSpecificData.baseUrl
+        : this.config.baseUrl
+    );
     const apiVersion =
       typeof providerSpecificData.apiVersion === "string" && providerSpecificData.apiVersion.trim()
         ? providerSpecificData.apiVersion.trim()
@@ -29,7 +40,7 @@ export class AzureOpenAIExecutor extends DefaultExecutor {
     return `${baseUrl}/openai/deployments/${encodeURIComponent(model)}/chat/completions?api-version=${encodeURIComponent(apiVersion)}`;
   }
 
-  buildHeaders(credentials: any, stream = true) {
+  buildHeaders(credentials: ProviderCredentials | null, stream = true) {
     const apiKey = credentials?.apiKey || credentials?.accessToken || "";
     const headers: Record<string, string> = {
       "Content-Type": "application/json",
@@ -38,5 +49,18 @@ export class AzureOpenAIExecutor extends DefaultExecutor {
 
     headers.Accept = stream ? "text/event-stream" : "application/json";
     return headers;
+  }
+
+  override transformRequest(
+    model: string,
+    body: unknown,
+    stream: boolean,
+    credentials: ProviderCredentials
+  ): unknown {
+    return applyAzureParamRules(
+      model,
+      body,
+      super.transformRequest(model, body, stream, credentials)
+    );
   }
 }

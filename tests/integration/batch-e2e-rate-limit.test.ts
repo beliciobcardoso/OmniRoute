@@ -7,11 +7,25 @@ import http from "node:http";
 import net from "node:net";
 import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
+import { stopTestProcess } from "../_helpers/stopTestProcess.ts";
 
 const TEST_DATA_DIR = fs.mkdtempSync(path.join(os.tmpdir(), "omniroute-batch-e2e-rl-"));
 const REPO_ROOT = fileURLToPath(new URL("../..", import.meta.url));
 const RELAY_PORT = await getFreePort();
 const SERVER_PORT = await getFreePort();
+
+type FileUploadResponse = {
+  id?: string;
+};
+
+type BatchResponse = {
+  id?: string;
+  status?: string;
+  request_counts?: {
+    completed?: number;
+    failed?: number;
+  };
+};
 
 function getFreePort() {
   return new Promise<number>((resolve, reject) => {
@@ -32,6 +46,47 @@ function getFreePort() {
 
 function sleep(ms: number) {
   return new Promise((r) => setTimeout(r, ms));
+}
+
+function summarizeText(text: string, maxLength = 800) {
+  const compact = text.replace(/\s+/g, " ").trim();
+  return compact.length > maxLength ? `${compact.slice(0, maxLength)}...` : compact;
+}
+
+function formatServerTail(proc: ReturnType<typeof createServerProcess>) {
+  return [
+    "--- stdout ---",
+    ...proc.stdoutLines.slice(-40),
+    "--- stderr ---",
+    ...proc.stderrLines.slice(-40),
+  ].join("\n");
+}
+
+async function readJsonForTest<T>(
+  response: Response,
+  label: string,
+  proc: ReturnType<typeof createServerProcess>
+): Promise<T> {
+  const text = await response.text();
+  let body: T;
+  try {
+    body = JSON.parse(text) as T;
+  } catch {
+    throw new Error(
+      [
+        `${label} returned invalid JSON (${response.status} ${response.statusText}, content-type=${response.headers.get("content-type") || "unknown"})`,
+        summarizeText(text),
+        formatServerTail(proc),
+      ].join("\n")
+    );
+  }
+
+  assert.equal(
+    response.status,
+    200,
+    `${label} failed (${response.status}): ${JSON.stringify(body)}`
+  );
+  return body;
 }
 
 /* ---------- Fake embedding relay ---------- */
@@ -111,7 +166,11 @@ function createServerProcess() {
   const stderrLines: string[] = [];
   let exitInfo: { code: number | null; signal: NodeJS.Signals | null } | null = null;
 
-  const child = spawn(process.execPath, ["scripts/dev/run-next-playwright.mjs", "dev"], {
+  // The management calls below (provider node + API key) only stay open in bootstrap mode for a
+  // loopback peer, and locality comes from the TCP-peer stamp that only the custom server in
+  // run-next.mjs writes. Bare `next dev` (run-next-playwright.mjs) has no stamp, so they fail
+  // closed with 401 — the same trap #11535 and #14403 fixed in the protocol and ecosystem harnesses.
+  const child = spawn(process.execPath, ["scripts/dev/run-next.mjs", "dev"], {
     cwd: REPO_ROOT,
     env: {
       ...process.env,
@@ -162,24 +221,29 @@ function createServerProcess() {
 
 async function waitForServer(baseUrl: string, proc: ReturnType<typeof createServerProcess>) {
   const startedAt = Date.now();
-  while (Date.now() - startedAt < 120_000) {
+  const readinessTimeoutMs = 240_000;
+  const probeTimeoutMs = 15_000;
+  let lastReadiness = "";
+  while (Date.now() - startedAt < readinessTimeoutMs) {
     if (proc.exitInfo) {
       throw new Error(
         [
           `Server exited early (code=${proc.exitInfo.code}, signal=${proc.exitInfo.signal})`,
-          "--- stdout ---",
-          ...proc.stdoutLines.slice(-40),
-          "--- stderr ---",
-          ...proc.stderrLines.slice(-40),
+          formatServerTail(proc),
         ].join("\n")
       );
     }
     try {
-      const resp = await fetch(`${baseUrl}/api/monitoring/health`, {
-        signal: AbortSignal.timeout(5_000),
-      });
-      if (resp.ok) return;
-    } catch {
+      for (const readinessPath of ["/api/health/ping", "/api/monitoring/health"]) {
+        const resp = await fetch(`${baseUrl}${readinessPath}`, {
+          signal: AbortSignal.timeout(probeTimeoutMs),
+        });
+        if (resp.ok) return;
+        const body = await resp.text().catch(() => "");
+        lastReadiness = `${readinessPath} -> ${resp.status}: ${summarizeText(body, 200)}`;
+      }
+    } catch (error) {
+      lastReadiness = error instanceof Error ? error.message : String(error);
       // not ready yet
     }
     await sleep(500);
@@ -187,24 +251,21 @@ async function waitForServer(baseUrl: string, proc: ReturnType<typeof createServ
   throw new Error(
     [
       "Timed out waiting for server",
-      "--- stdout ---",
-      ...proc.stdoutLines.slice(-40),
-      "--- stderr ---",
-      ...proc.stderrLines.slice(-40),
+      `Last readiness probe: ${lastReadiness}`,
+      formatServerTail(proc),
     ].join("\n")
   );
 }
 
-async function stopProcess(child: ReturnType<typeof spawn>) {
-  if (child.killed) return;
-  child.kill("SIGTERM");
-  const exited = await Promise.race([
-    new Promise<boolean>((resolve) => child.once("exit", () => resolve(true))),
-    sleep(5_000).then(() => false),
-  ]);
-  if (!exited && !child.killed) {
-    child.kill("SIGKILL");
-    await new Promise<void>((resolve) => child.once("exit", () => resolve()));
+async function removeDirWithRetry(dir: string) {
+  for (let attempt = 0; attempt < 5; attempt++) {
+    try {
+      fs.rmSync(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
+      return;
+    } catch (error) {
+      if (attempt === 4) throw error;
+      await sleep(250);
+    }
   }
 }
 
@@ -212,6 +273,12 @@ async function stopProcess(child: ReturnType<typeof spawn>) {
 const relay = createFakeEmbeddingRelay();
 let app: ReturnType<typeof createServerProcess>;
 const RELAY_BASE = `http://127.0.0.1:${RELAY_PORT}`;
+// The `/v1/files` + `/v1/batches` flow is owner-scoped: a file uploaded with no
+// key has no owner, and a null-owner record is denied to every non-session
+// caller (GHSA-2jm2-mpx8-6523 / GHSA-m3hp-hq9g-fpmv). Mint a real API key
+// through the management API (open bootstrap mode, same path that seeds the
+// provider node) and present it on every `/v1` call below.
+let clientAuthHeaders: Record<string, string> = {};
 
 test.before(async () => {
   await relay.start();
@@ -238,17 +305,28 @@ test.before(async () => {
       `Failed to create provider node: ${nodeResp.status} ${JSON.stringify(nodeBody)}`
     );
   }
+
+  const keyResp = await fetch(`${app.baseUrl}/api/keys`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ name: "Batch E2E Test Key" }),
+  });
+  const keyBody = (await keyResp.json().catch(() => null)) as { key?: string } | null;
+  if (!keyResp.ok || !keyBody?.key) {
+    throw new Error(`Failed to create API key: ${keyResp.status} ${JSON.stringify(keyBody)}`);
+  }
+  clientAuthHeaders = { Authorization: `Bearer ${keyBody.key}` };
 });
 
 test.after(async () => {
   try {
-    await stopProcess(app.child);
-  } catch {}
-  try {
-    await relay.stop();
-  } catch {}
-  if (fs.existsSync(TEST_DATA_DIR)) {
-    fs.rmSync(TEST_DATA_DIR, { recursive: true, force: true });
+    if (app) await stopTestProcess(app.child);
+  } finally {
+    try {
+      await relay.stop();
+    } finally {
+      if (fs.existsSync(TEST_DATA_DIR)) await removeDirWithRetry(TEST_DATA_DIR);
+    }
   }
 });
 
@@ -279,40 +357,59 @@ test("batch E2E: upload file, create batch, verify rate-limit logs appear", asyn
 
   const uploadResp = await fetch(`${app.baseUrl}/api/v1/files`, {
     method: "POST",
+    headers: clientAuthHeaders,
     body: formData,
   });
-  const uploadText = await uploadResp.text();
-  assert.equal(uploadResp.status, 200, `File upload failed (${uploadResp.status}): ${uploadText}`);
-  const uploadBody = JSON.parse(uploadText);
+  assert.match(
+    uploadResp.headers.get("content-type") || "",
+    /json/i,
+    "File upload should return JSON"
+  );
+  const uploadBody = await readJsonForTest<FileUploadResponse>(uploadResp, "File upload", app);
   const fileId = uploadBody.id;
   assert.ok(fileId, "file id missing from upload response");
 
   // 2. Create batch via HTTP POST
   const batchResp = await fetch(`${app.baseUrl}/api/v1/batches`, {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers: { "Content-Type": "application/json", ...clientAuthHeaders },
     body: JSON.stringify({
       input_file_id: fileId,
       endpoint: "/v1/embeddings",
       completion_window: "24h",
     }),
   });
-  const batchText = await batchResp.text();
-  assert.equal(batchResp.status, 200, `Batch creation failed (${batchResp.status}): ${batchText}`);
-  const batchBody = JSON.parse(batchText);
+  const batchBody = await readJsonForTest<BatchResponse>(batchResp, "Batch creation", app);
   const batchId = batchBody.id;
   assert.ok(batchId, "batch id missing from create response");
 
   // 3. Poll for batch completion
   let batchStatus = "";
   let attempts = 0;
+  let lastPollSummary = "";
   const maxAttempts = 120;
   while (attempts < maxAttempts) {
     await sleep(2_000);
     attempts++;
-    const sr = await fetch(`${app.baseUrl}/api/v1/batches/${batchId}`);
-    const sb = (await sr.json()) as any;
-    batchStatus = sb.status;
+    const sr = await fetch(`${app.baseUrl}/api/v1/batches/${batchId}`, {
+      headers: clientAuthHeaders,
+    });
+    const text = await sr.text();
+    let sb: BatchResponse;
+    try {
+      sb = JSON.parse(text);
+    } catch {
+      lastPollSummary = `poll ${attempts} returned invalid JSON (${sr.status} ${sr.statusText}, content-type=${sr.headers.get("content-type") || "unknown"}): ${summarizeText(text, 300)}`;
+      console.warn(`[poll ${attempts}] ${lastPollSummary}`);
+      continue;
+    }
+    if (!sr.ok) {
+      lastPollSummary = `poll ${attempts} failed (${sr.status} ${sr.statusText}): ${JSON.stringify(sb)}`;
+      console.warn(`[poll ${attempts}] ${lastPollSummary}`);
+      continue;
+    }
+    batchStatus = sb.status || "";
+    lastPollSummary = `poll ${attempts} status=${batchStatus}`;
     console.log(
       `[poll ${attempts}] batch ${batchId} status=${batchStatus} completed=${sb.request_counts?.completed} failed=${sb.request_counts?.failed}`
     );
@@ -322,6 +419,7 @@ test("batch E2E: upload file, create batch, verify rate-limit logs appear", asyn
     batchStatus,
     "completed",
     `Batch did not complete; final status: ${batchStatus}. ` +
+      `Last poll: ${lastPollSummary}\n` +
       `Server [BATCH] logs:\n${[...app.stdoutLines, ...app.stderrLines].filter((l) => l.includes("[BATCH]")).join("\n")}`
   );
 
@@ -347,8 +445,10 @@ test("batch E2E: upload file, create batch, verify rate-limit logs appear", asyn
   );
 
   // 5. Verify batch results
-  const finalResp = await fetch(`${app.baseUrl}/api/v1/batches/${batchId}`);
-  const finalBody = (await finalResp.json()) as any;
+  const finalResp = await fetch(`${app.baseUrl}/api/v1/batches/${batchId}`, {
+    headers: clientAuthHeaders,
+  });
+  const finalBody = await readJsonForTest<BatchResponse>(finalResp, "Final batch fetch", app);
   assert.equal(
     finalBody.request_counts?.completed,
     2,

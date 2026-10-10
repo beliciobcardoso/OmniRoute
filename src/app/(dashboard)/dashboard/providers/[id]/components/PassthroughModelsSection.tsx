@@ -1,4 +1,5 @@
 "use client";
+import { filterUnavailableModelRows } from "@/lib/providers/mergeProviderModelListing";
 /**
  * PassthroughModelsSection — Issue #3501 Phase 1e
  *
@@ -14,6 +15,7 @@
  */
 import React, { useState, useMemo } from "react";
 import { Button } from "@/shared/components";
+import { generateUniqueModelAlias } from "./passthroughAlias.ts";
 import {
   matchesModelCatalogQuery,
   normalizeModelCatalogSource,
@@ -21,6 +23,7 @@ import {
 import { useNotificationStore } from "@/store/notificationStore";
 import {
   buildCompatMap,
+  getDisplayModelAlias,
   providerText,
   testAllResultsText,
   evaluateTestAllEntry,
@@ -30,7 +33,8 @@ import {
   type CompatByProtocolMap,
 } from "../providerPageHelpers";
 import { ModelVisibilityToolbar } from "./ModelRow";
-import { sortModelsFreeFirst, isFreeModel } from "@/shared/utils/freeModels";
+import { sortModelsFreeFirst, isModelFreeBadge } from "@/shared/utils/freeModels";
+import { useStrictFreeBadge } from "./useStrictFreeBadge";
 import PassthroughModelRow from "./PassthroughModelRow";
 
 // ---------------------------------------------------------------------------
@@ -46,7 +50,9 @@ export type ModelCompatSavePatchPassthrough = {
 export interface PassthroughModelsSectionProps {
   providerAlias: string;
   modelAliases: Record<string, string>;
+  catalogModels?: CompatModelRow[];
   availableModels?: CompatModelRow[];
+  syncedCatalogAuthoritative?: boolean;
   customModels?: CompatModelRow[];
   description: string;
   inputLabel: string;
@@ -67,15 +73,20 @@ export interface PassthroughModelsSectionProps {
   bulkTogglePending?: boolean;
   togglingModelId?: string | null;
   onTestModel?: (modelId: string, fullModel: string) => Promise<void>;
-  modelTestStatus?: Record<string, "ok" | "error" | null>;
+  modelTestStatus?: Record<string, "ok" | "error" | "quota" | null>;
   /** Report a model's test-all result so the parent updates the green/red icon. */
-  onModelTestStatusChange?: (modelId: string, status: "ok" | "error") => void;
+  onModelTestStatusChange?: (modelId: string, status: "ok" | "error" | "quota") => void;
   testingModelId?: string | null;
   providerId: string;
   connectionId: string;
   /** Controlled from the outer component so both sections share one checkbox (#3610). */
   autoHideFailed?: boolean;
   onAutoHideFailedChange?: (v: boolean) => void;
+}
+
+function getDefaultModelAlias(model: CompatModelRow): string | null {
+  const [firstAlias] = model.aliases || [];
+  return typeof firstAlias === "string" && firstAlias.trim() ? firstAlias.trim() : null;
 }
 
 // ---------------------------------------------------------------------------
@@ -85,7 +96,9 @@ export interface PassthroughModelsSectionProps {
 export default function PassthroughModelsSection({
   providerAlias,
   modelAliases,
+  catalogModels = [],
   availableModels = [],
+  syncedCatalogAuthoritative = false,
   customModels = [],
   description,
   inputLabel,
@@ -129,6 +142,7 @@ export default function PassthroughModelsSection({
   const [freeFilter, setFreeFilter] = useState<"all" | "free" | "paid">("all");
   const [sortFreeFirst, setSortFreeFirst] = useState(false);
   const notify = useNotificationStore();
+  const strictFreeBadge = useStrictFreeBadge();
   const customModelMap = useMemo(() => buildCompatMap(customModels), [customModels]);
 
   const handleTestAll = async () => {
@@ -150,7 +164,7 @@ export default function PassthroughModelsSection({
           results?: Record<
             string,
             {
-              status?: "ok" | "error";
+              status?: "ok" | "error" | "slow";
               rateLimited?: boolean;
               isTimeout?: boolean;
               error?: string;
@@ -172,8 +186,9 @@ export default function PassthroughModelsSection({
 
         const entry = result.results?.[model.modelId];
         const outcome = evaluateTestAllEntry(entry, autoHideFailed);
-        // Paint the per-model icon green/red, same as the single-model ▶ test.
-        onModelTestStatusChange?.(model.modelId, outcome.status);
+        // #9511: paint "quota" status for quota-exhausted models (amber badge),
+        // "ok" for healthy, "error" for genuine failures.
+        onModelTestStatusChange?.(model.modelId, outcome.isQuota ? "quota" : outcome.status);
         if (outcome.status === "ok") {
           ok++;
         } else {
@@ -228,24 +243,32 @@ export default function PassthroughModelsSection({
     for (const [alias, fullModel] of providerAliases) {
       const fmStr = fullModel as string;
       const modelId = fmStr.startsWith(prefix) ? fmStr.slice(prefix.length) : fmStr;
-      aliasByModelId.set(modelId, alias as string);
+      const displayAlias = getDisplayModelAlias(modelId, alias as string);
+      if (displayAlias) aliasByModelId.set(modelId, displayAlias);
       fullModelByModelId.set(modelId, fmStr);
     }
 
     const addModel = (model: CompatModelRow, source: string) => {
       if (!model?.id || seenModelIds.has(model.id)) return;
-      const fullModel = fullModelByModelId.get(model.id) || `${providerAlias}/${model.id}`;
+      const defaultAlias = getDefaultModelAlias(model);
+      const fullModel =
+        fullModelByModelId.get(model.id) || `${providerAlias}/${defaultAlias || model.id}`;
       rows.push({
         modelId: model.id,
         fullModel,
-        alias: aliasByModelId.get(model.id) || null,
+        alias: aliasByModelId.get(model.id) || defaultAlias,
         displayName: model.name || model.id,
         source,
-        isFree:
-          Boolean((model as any).free) ||
-          model.id.endsWith(":free") ||
-          /\bgr[aá]tis\b|\bfree\b/i.test(model.name || "") ||
-          isFreeModel(providerId, { id: model.id }),
+        isFree: isModelFreeBadge(
+          providerId,
+          {
+            id: model.id,
+            name: model.name,
+            free: (model as { free?: unknown }).free,
+            isFree: model.isFree,
+          },
+          { strict: strictFreeBadge }
+        ),
         isHidden: isModelHidden(model.id),
       });
       seenModelIds.add(model.id);
@@ -253,6 +276,10 @@ export default function PassthroughModelsSection({
 
     for (const model of availableModels) {
       addModel(model, "imported");
+    }
+
+    for (const model of catalogModels) {
+      addModel(model, "system");
     }
 
     for (const model of customModels) {
@@ -266,32 +293,47 @@ export default function PassthroughModelsSection({
       const fmStr = fullModel as string;
       const modelId = fmStr.startsWith(prefix) ? fmStr.slice(prefix.length) : fmStr;
       if (!modelId || seenModelIds.has(modelId)) continue;
+      const displayAlias = getDisplayModelAlias(modelId, alias as string);
+      if (!displayAlias) continue;
       const customModel = customModelMap.get(modelId);
       rows.push({
         modelId,
         fullModel: fmStr,
-        alias: alias as string,
-        displayName: alias as string,
+        alias: displayAlias,
+        displayName: displayAlias,
         source: customModel ? customModel.source || "custom" : "alias",
-        isFree:
-          modelId.endsWith(":free") ||
-          Boolean((customModel as any)?.free) ||
-          /\bgr[aá]tis\b|\bfree\b/i.test(customModel?.name || alias || "") ||
-          isFreeModel(providerId, { id: modelId }),
+        isFree: isModelFreeBadge(
+          providerId,
+          {
+            id: modelId,
+            name: customModel?.name || (alias as string) || "",
+            free: (customModel as { free?: unknown } | undefined)?.free,
+            isFree: customModel?.isFree,
+          },
+          { strict: strictFreeBadge }
+        ),
         isHidden: isModelHidden(modelId),
       });
       seenModelIds.add(modelId);
     }
 
-    return rows;
+    return filterUnavailableModelRows(
+      rows,
+      availableModels,
+      customModels,
+      syncedCatalogAuthoritative
+    );
   }, [
     availableModels,
+    syncedCatalogAuthoritative,
+    catalogModels,
     customModelMap,
     customModels,
     isModelHidden,
     providerAlias,
     providerAliases,
     providerId,
+    strictFreeBadge,
   ]);
 
   const filteredModels = allModels.filter((model) => {
@@ -319,22 +361,18 @@ export default function PassthroughModelsSection({
     : filteredModels;
   const activeCount = allModels.filter((model) => !model.isHidden).length;
 
-  // Generate default alias from modelId (last part after /)
-  const generateDefaultAlias = (modelId: string) => {
-    const parts = modelId.split("/");
-    return parts[parts.length - 1];
-  };
-
   const handleAdd = async () => {
     if (!newModel.trim() || adding) return;
     const modelId = newModel.trim();
-    const defaultAlias = generateDefaultAlias(modelId);
 
-    // Check if alias already exists
-    if (modelAliases[defaultAlias]) {
-      alert(t("aliasExistsAlert", { alias: defaultAlias }));
+    // #1850: block re-adding the SAME model, but disambiguate DISTINCT models
+    // that would otherwise collapse to the same last-segment alias (e.g.
+    // enx/gpt-5.5 vs enx/codebuddy/gpt-5.5 → both "gpt-5.5").
+    if (Object.values(modelAliases).includes(modelId)) {
+      alert(t("aliasExistsAlert", { alias: modelId }));
       return;
     }
+    const defaultAlias = generateUniqueModelAlias(modelId, modelAliases);
 
     setAdding(true);
     try {
@@ -412,12 +450,15 @@ export default function PassthroughModelsSection({
                 key={fullModel as string}
                 modelId={modelId}
                 fullModel={fullModel}
+                provider={providerId}
+                alias={alias}
                 source={source}
                 isFree={isFree}
                 isHidden={isHidden}
                 copied={copied}
                 onCopy={onCopy}
                 onDeleteAlias={source === "alias" && alias ? () => onDeleteAlias(alias) : undefined}
+                onSetAlias={(a) => onSetAlias(modelId, a)}
                 t={t}
                 showDeveloperToggle
                 effectiveModelNormalize={effectiveModelNormalize}

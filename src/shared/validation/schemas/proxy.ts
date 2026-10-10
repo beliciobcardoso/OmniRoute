@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { partialWithoutDefaults } from "@/shared/validation/partialWithoutDefaults";
 import {
   ACCOUNT_FALLBACK_STRATEGY_VALUES,
   ROUTING_STRATEGY_VALUES,
@@ -13,7 +14,7 @@ import {
   isForbiddenCustomHeaderName,
 } from "@/shared/constants/upstreamHeaders";
 import { MAX_TIMER_TIMEOUT_MS } from "@/shared/utils/runtimeTimeouts";
-
+import { PROXY_REGISTRY_STATUS_VALUES } from "@/shared/constants/proxyRegistryStatus";
 
 export const proxyConfigSchema = z
   .object({
@@ -85,21 +86,30 @@ export const testProxySchema = z.object({
   }),
 });
 
+export const SCOPE_ID_REQUIRED_NON_GLOBAL_SCOPE = "scopeId is required for non-global scope";
+export const SCOPE_ID_REQUIRED_SCOPED = "scopeId is required for provider/account/combo/key scope";
+
+// Shared refinement: a non-global scope requires a non-blank scopeId.
+// The message stays per call-site (frozen 400 contract), never unified.
+export function requireScopeIdForNonGlobal(message: string) {
+  return (value: { scope: string; scopeId?: string | null }, ctx: z.RefinementCtx) => {
+    if (value.scope !== "global" && !value.scopeId?.trim()) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message,
+        path: ["scopeId"],
+      });
+    }
+  };
+}
+
 export const inlineProxyAssignmentSchema = z
   .object({
     scope: z.enum(["global", "provider", "account", "combo", "key"]),
     scopeId: z.string().trim().nullable().optional(),
   })
   .strict()
-  .superRefine((value, ctx) => {
-    if (value.scope !== "global" && !value.scopeId?.trim()) {
-      ctx.addIssue({
-        code: z.ZodIssueCode.custom,
-        message: "scopeId is required for non-global scope",
-        path: ["scopeId"],
-      });
-    }
-  });
+  .superRefine(requireScopeIdForNonGlobal(SCOPE_ID_REQUIRED_NON_GLOBAL_SCOPE));
 
 export const proxyRegistryFieldsSchema = z
   .object({
@@ -107,32 +117,51 @@ export const proxyRegistryFieldsSchema = z
     type: z
       .preprocess(
         (value) => (typeof value === "string" ? value.trim().toLowerCase() : value),
-        z.enum(["http", "https", "socks5", "vercel"])
+        z.enum(["http", "https", "socks5", "vercel", "deno", "cloudflare"])
       )
-      .optional()
-      .default("http"),
+      .optional(),
     host: z.string().trim().min(1, "host is required").max(255),
     port: z.coerce.number().int().min(1).max(65535),
     username: z.string().optional(),
     password: z.string().optional(),
     region: z.string().trim().max(64).nullable().optional(),
     notes: z.string().trim().max(1000).nullable().optional(),
-    status: z.enum(["active", "inactive"]).optional().default("active"),
-    source: z.enum(["manual", "oneproxy", "dashboard-custom", "vercel-relay"]).optional(),
+    // No default: zod 4 applies it under .partial() too, which rewrote the stored status
+    // on every update or import that omitted it. New rows still start active in the DB.
+    status: z.enum(PROXY_REGISTRY_STATUS_VALUES).optional(),
+    source: z
+      .enum([
+        "manual",
+        "oneproxy",
+        "dashboard-custom",
+        "vercel-relay",
+        "deno-relay",
+        "cloudflare-relay",
+      ])
+      .optional(),
     // Address-family egress policy (#3777): "auto" keeps the prior dual-stack behavior;
     // "ipv4"/"ipv6" pin the connection to that family (no v4 leak under an IPv6-only proxy).
-    family: z.enum(["auto", "ipv4", "ipv6"]).optional().default("auto"),
+    // Defaulted to "auto" only by createProxyRegistrySchema: an update or a re-import that
+    // omits it keeps the stored family.
+    family: z.enum(["auto", "ipv4", "ipv6"]).optional(),
   })
   .strict();
 
 export const createProxyRegistrySchema = proxyRegistryFieldsSchema
   .extend({
+    type: z
+      .preprocess(
+        (value) => (typeof value === "string" ? value.trim().toLowerCase() : value),
+        z.enum(["http", "https", "socks5", "vercel", "deno", "cloudflare"])
+      )
+      .optional()
+      .default("http"),
+    family: z.enum(["auto", "ipv4", "ipv6"]).optional().default("auto"),
     assignment: inlineProxyAssignmentSchema.optional(),
   })
   .strict();
 
-export const updateProxyRegistrySchema = proxyRegistryFieldsSchema
-  .partial()
+export const updateProxyRegistrySchema = partialWithoutDefaults(proxyRegistryFieldsSchema)
   .extend({
     id: z.string().trim().min(1, "id is required"),
     assignment: inlineProxyAssignmentSchema.optional(),
@@ -155,15 +184,7 @@ export const proxyAssignmentSchema = z
     proxyId: z.string().trim().nullable().optional(),
   })
   .strict()
-  .superRefine((value, ctx) => {
-    if (value.scope !== "global" && !value.scopeId?.trim()) {
-      ctx.addIssue({
-        code: z.ZodIssueCode.custom,
-        message: "scopeId is required for provider/account/combo/key scope",
-        path: ["scopeId"],
-      });
-    }
-  });
+  .superRefine(requireScopeIdForNonGlobal(SCOPE_ID_REQUIRED_SCOPED));
 
 export const bulkProxyAssignmentSchema = z
   .object({
@@ -184,3 +205,70 @@ export const bulkProxyAssignmentSchema = z
       });
     }
   });
+
+// #6365 proxy pools — a scope may hold MULTIPLE proxies (a rotation pool). These
+// schemas gate the pool-membership add/remove and the per-scope rotation strategy.
+// Kept in lockstep with `ProxyRotationStrategy` in src/lib/db/proxies/types.ts.
+export const PROXY_POOL_ROTATION_STRATEGY_VALUES = [
+  "round-robin",
+  "random",
+  "sticky",
+  "latency",
+] as const;
+
+// Add/remove one proxy to/from a scope's pool. proxyId is REQUIRED (unlike the
+// single-assign schema where a null proxyId clears the assignment).
+export const proxyPoolMemberSchema = z
+  .object({
+    scope: z.enum(["global", "provider", "account", "combo", "key"]),
+    scopeId: z.string().trim().nullable().optional(),
+    proxyId: z.string().trim().min(1, "proxyId is required"),
+  })
+  .strict()
+  .superRefine(requireScopeIdForNonGlobal(SCOPE_ID_REQUIRED_SCOPED));
+
+// GET /api/settings/proxies/pool/egress-observation query (#13581). Same scope vocabulary and
+// scopeId rule as the pool routes: an unknown scope is rejected, never read as "global".
+export const proxyPoolEgressObservationQuerySchema = z
+  .object({
+    scope: z.enum(["global", "provider", "account", "combo", "key"]),
+    scopeId: z.string().trim().max(256).nullable().optional(),
+  })
+  .superRefine(requireScopeIdForNonGlobal(SCOPE_ID_REQUIRED_SCOPED));
+
+// Set a scope pool's rotation strategy. Optional sticky window (minutes) only
+// applies to the `sticky` strategy; ignored otherwise.
+export const proxyRotationStrategySchema = z
+  .object({
+    scope: z.enum(["global", "provider", "account", "combo", "key"]),
+    scopeId: z.string().trim().nullable().optional(),
+    strategy: z.enum(PROXY_POOL_ROTATION_STRATEGY_VALUES),
+    stickyWindowMinutes: z.number().int().min(1).max(1440).optional(),
+  })
+  .strict()
+  .superRefine(requireScopeIdForNonGlobal(SCOPE_ID_REQUIRED_SCOPED));
+
+// POST /api/settings/proxies/operator-egress body: dated observed addresses per
+// pool member, pushed by the operator. One `observedAt` per member covers every
+// address in that member's batch; the store keeps the freshest timestamp per
+// address. Bounds: at most 10 addresses per member, at most 100 members per
+// batch. Liveness checks (routable literal, no far-future date) live in the
+// route — Zod pins the shape here.
+export const proxyOperatorEgressPushSchema = z
+  .object({
+    version: z.literal(1),
+    members: z
+      .array(
+        z
+          .object({
+            host: z.string().trim().min(1),
+            port: z.coerce.number().int().min(1).max(65535),
+            addresses: z.array(z.string().trim().min(1)).min(1).max(10),
+            observedAt: z.string().datetime(),
+          })
+          .strict()
+      )
+      .min(1)
+      .max(100),
+  })
+  .strict();

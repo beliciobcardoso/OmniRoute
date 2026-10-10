@@ -1,3 +1,9 @@
+---
+title: "AgentRouter Setup Guide"
+version: 3.8.40
+lastUpdated: 2026-06-28
+---
+
 # AgentRouter Setup Guide
 
 [AgentRouter](https://agentrouter.org) is an Anthropic-compatible relay that resells
@@ -121,16 +127,17 @@ provider.
 For reference, the cc-compatible bridge sends the following on each upstream
 request (see `open-sse/services/claudeCodeCompatible.ts`):
 
-| Header                                      | Value                                                                                               |
-| ------------------------------------------- | --------------------------------------------------------------------------------------------------- |
-| `Authorization`                             | `Bearer <api-key>`                                                                                  |
-| `User-Agent`                                | `claude-cli/2.1.187 (external, sdk-cli)`                                                            |
-| `anthropic-version`                         | `2023-06-01`                                                                                        |
-| `anthropic-beta`                            | `claude-code-20250219,interleaved-thinking-2025-05-14,effort-2025-11-24`                            |
-| Per-connection redact-thinking beta toggle  | Adds `redact-thinking-2026-02-12` for upstreams that specifically require redacted thinking streams |
-| `anthropic-dangerous-direct-browser-access` | `true`                                                                                              |
-| `x-app`                                     | `cli`                                                                                               |
-| `X-Stainless-*`                             | Various Stainless SDK headers (lang, package version, OS, arch, etc.)                               |
+| Header                                      | Value                                                                                                   |
+| ------------------------------------------- | ------------------------------------------------------------------------------------------------------- |
+| `Authorization`                             | `Bearer <api-key>`                                                                                      |
+| `User-Agent`                                | `claude-cli/2.1.280 (external, sdk-cli)`                                                                |
+| `anthropic-version`                         | `2023-06-01`                                                                                            |
+| `anthropic-beta`                            | `claude-code-20250219,interleaved-thinking-2025-05-14,effort-2025-11-24`                                |
+| Per-connection redact-thinking beta toggle  | Adds `redact-thinking-2026-02-12` for upstreams that specifically require redacted thinking streams     |
+| Per-connection summarized thinking toggle   | Adds `display: "summarized"` to CC Compatible thinking requests that did not already set a display mode |
+| `anthropic-dangerous-direct-browser-access` | `true`                                                                                                  |
+| `x-app`                                     | `cli`                                                                                                   |
+| `X-Stainless-*`                             | Various Stainless SDK headers (lang, package version, OS, arch, etc.)                                   |
 
 This is what allows requests to pass the upstream WAF / client whitelist.
 
@@ -164,11 +171,26 @@ the provider ID starts with `anthropic-compatible-cc-` (note the trailing dash �
 see `CLAUDE_CODE_COMPATIBLE_PREFIX` in `open-sse/services/claudeCodeCompatible.ts`)
 and the feature flag is enabled.
 
+**`unauthorized client detected` / HTML error page even though an AgentRouter
+provider already exists** — you likely have **more than one** AgentRouter provider
+and your request is hitting the wrong one. If a leftover hand-made
+`anthropic-compatible-*` (non-`cc`) or `openai-compatible-chat-*` provider was
+created with the `agentrouter` prefix, it can own the `agentrouter/<model>` model
+IDs (and combos may reference it by node ID), so traffic routes to that provider —
+which sends a generic User-Agent and gets rejected — instead of the built-in
+`agentrouter` provider that already ships the correct wire image. Check where the
+model actually resolves in the omniroute logs (`ROUTING` tag shows
+`agentrouter/<model> → <providerId>/<model>`); if `<providerId>` is not
+`agentrouter`, consolidate on the native provider: point combos at
+`agentrouter/<model>` (providerId `agentrouter`) and delete the duplicate
+compatible providers. The native provider needs no wire-image configuration and no
+`customUserAgent`.
+
 ---
 
 ## See also
 
-- [`docs/PROVIDERS.md`](../PROVIDERS.md) — Other provider integration notes
+- [`docs/providers/CLAUDE_WEB.md`](./CLAUDE_WEB.md) — Claude Web provider integration notes
 - [`docs/reference/FREE_TIERS.md`](../reference/FREE_TIERS.md) — Free-tier provider
   catalog
 - [`open-sse/services/claudeCodeCompatible.ts`](../../open-sse/services/claudeCodeCompatible.ts)

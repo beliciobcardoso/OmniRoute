@@ -12,6 +12,8 @@
  *   - Skip remaining hooks
  */
 
+import * as vm from "vm";
+
 import {
   type HookMiddleware,
   type HookConfig,
@@ -51,18 +53,200 @@ function getRegistryState() {
 
 // ── Compile hook code into middleware function ────────────────────────────
 
-function compileHookCode(code: string, hookName: string): HookMiddleware {
+/**
+ * Max wall-clock time a single operator-authored hook may run. With
+ * `microtaskMode: "afterEvaluate"` the vm timeout covers the hook's async
+ * continuations too: the sandbox has no timers or I/O, so every `await` inside it
+ * resolves as a microtask that runs before `runInContext()` returns.
+ */
+const HOOK_EXECUTION_TIMEOUT_MS = 5000;
+
+const HOOK_INPUT_GLOBAL = "__omnirouteHookInput";
+const HOOK_OUTPUT_GLOBAL = "__omnirouteHookOutput";
+
+/**
+ * GHSA-9p9m-h9rj-rhhg — the hook runs in its OWN realm and only JSON crosses the
+ * boundary.
+ *
+ * The previous sandbox handed the hook the host's `Object`, `Array`, `Promise`, … and
+ * the live `context` object, so hook code could write the SERVER's `Object.prototype`
+ * (e.g. `Object.prototype.env = { NODE_OPTIONS: "--require …" }`, which a later
+ * `worker_threads` Worker inherits → code execution). Now:
+ *
+ * - the vm context is created from a null-prototype object, so the hook sees the fresh
+ *   realm's own intrinsics — polluting its `Object.prototype` never reaches the host,
+ *   and `this.constructor.constructor` resolves to that realm's `Function`, which
+ *   `codeGeneration.strings: false` blocks;
+ * - no host object or function is exposed: the request context goes in as a JSON
+ *   string and is parsed inside the realm; `context.log.*` buffers into an array;
+ * - the hook's result, its mutated context and the buffered log lines come back as ONE
+ *   JSON string written to a sandbox global. The host never awaits or calls anything
+ *   from the realm (a hook could replace `Promise.prototype.then`, and a host `await`
+ *   would hand its own resolve functions — and with them the host `Function` — to it).
+ *
+ * Node's `vm` is still not a hard security boundary; the write path stays loopback/LAN
+ * only (`/api/middleware/` in LOCAL_ONLY_API_PREFIXES). This removes the shared-realm
+ * escape, not the need to trust hook authors.
+ */
+function buildHookSource(code: string): string {
+  return `(async () => {
+  const __omnirouteLogs = [];
+  let __omniroutePayload;
   try {
-    // Wrap in async function that returns HookResult
-    // eslint-disable-next-line no-new-func
-    const fn = new Function("context", `return (async () => { ${code} })();`) as (
-      context: PreRequestHookContext
-    ) => Promise<HookResult>;
-    return fn;
+    const context = JSON.parse(${HOOK_INPUT_GLOBAL});
+    context.log = {
+      info: (tag, msg) => { __omnirouteLogs.push(["info", String(tag), String(msg)]); },
+      warn: (tag, msg) => { __omnirouteLogs.push(["warn", String(tag), String(msg)]); },
+      error: (tag, msg) => { __omnirouteLogs.push(["error", String(tag), String(msg)]); },
+    };
+    const __omnirouteResult = await (async () => { ${code}
+    })();
+    delete context.log;
+    __omniroutePayload = {
+      ok: true,
+      result: __omnirouteResult === undefined || __omnirouteResult === null ? {} : __omnirouteResult,
+      context,
+      logs: __omnirouteLogs,
+    };
+  } catch (__omnirouteError) {
+    let message = "Hook threw";
+    try {
+      message = String(
+        __omnirouteError && __omnirouteError.message !== undefined
+          ? __omnirouteError.message
+          : __omnirouteError
+      );
+    } catch {}
+    __omniroutePayload = { ok: false, error: message, logs: __omnirouteLogs };
+  }
+  globalThis.${HOOK_OUTPUT_GLOBAL} = JSON.stringify(__omniroutePayload);
+})();`;
+}
+
+type HookPayload = {
+  ok?: unknown;
+  error?: unknown;
+  result?: unknown;
+  context?: unknown;
+  logs?: unknown;
+};
+
+function isPlainRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+/** Parse realm output on the host; `__proto__` keys are dropped, never assigned. */
+function parseHookPayload(raw: string, hookName: string): HookPayload {
+  try {
+    const parsed: unknown = JSON.parse(raw, (key, value) =>
+      key === "__proto__" ? undefined : value
+    );
+    if (isPlainRecord(parsed)) return parsed as HookPayload;
+  } catch {
+    // fall through
+  }
+  throw new Error(`Hook "${hookName}" returned an unreadable result`);
+}
+
+/** Only an own data property holding a string is accepted — never a getter. */
+function readHookOutput(sandbox: object): string | null {
+  const descriptor = Object.getOwnPropertyDescriptor(sandbox, HOOK_OUTPUT_GLOBAL);
+  return descriptor && "value" in descriptor && typeof descriptor.value === "string"
+    ? descriptor.value
+    : null;
+}
+
+/**
+ * Message of an error that escaped `runInContext()` (the vm timeout is raised from the
+ * realm, so it is not `instanceof Error` here). Read as an own data property only: a
+ * getter would run realm code outside the timeout.
+ */
+function ownStringMessage(err: unknown): string | null {
+  if (err instanceof Error) return err.message;
+  if (typeof err !== "object" || err === null) return null;
+  const descriptor = Object.getOwnPropertyDescriptor(err, "message");
+  return descriptor && "value" in descriptor && typeof descriptor.value === "string"
+    ? descriptor.value
+    : null;
+}
+
+function toHookInput(context: PreRequestHookContext): string {
+  return JSON.stringify({
+    body: context.body,
+    headers: context.headers,
+    model: context.model,
+    combo: context.combo,
+    apiKeyInfo: context.apiKeyInfo,
+    metadata: context.metadata,
+  });
+}
+
+/** Copy the hook's in-place mutations back onto the host context (data fields only). */
+function applyContextMutations(context: PreRequestHookContext, mutated: unknown): void {
+  if (!isPlainRecord(mutated)) return;
+  if (isPlainRecord(mutated.body)) context.body = mutated.body;
+  if (isPlainRecord(mutated.headers)) {
+    context.headers = mutated.headers as PreRequestHookContext["headers"];
+  }
+  if (typeof mutated.model === "string") context.model = mutated.model;
+  if (typeof mutated.combo === "string") context.combo = mutated.combo;
+  else if (mutated.combo === undefined || mutated.combo === null) context.combo = undefined;
+  if (isPlainRecord(mutated.metadata)) context.metadata = mutated.metadata;
+}
+
+function replayHookLogs(context: PreRequestHookContext, logs: unknown): void {
+  if (!Array.isArray(logs)) return;
+  for (const entry of logs) {
+    if (!Array.isArray(entry) || entry.length !== 3) continue;
+    const [level, tag, msg] = entry;
+    if (level !== "info" && level !== "warn" && level !== "error") continue;
+    context.log?.[level]?.(String(tag), String(msg));
+  }
+}
+
+function compileHookCode(code: string, hookName: string): HookMiddleware {
+  // Compile-once: parse the source into a reusable vm.Script. This throws on
+  // syntax errors at registration time (preserving the original behavior) and
+  // is cached in the returned closure so each execution only pays for a fresh
+  // isolated context, not re-parsing.
+  let script: vm.Script;
+  try {
+    script = new vm.Script(buildHookSource(code), {
+      filename: `omniroute-hook:${hookName}`,
+    });
   } catch (err: unknown) {
     const message = err instanceof Error ? err.message : "Compilation error";
     throw new Error(`Failed to compile hook "${hookName}": ${message}`);
   }
+
+  return async (context: PreRequestHookContext): Promise<HookResult> => {
+    const sandbox: Record<string, unknown> = Object.create(null);
+    sandbox[HOOK_INPUT_GLOBAL] = toHookInput(context);
+    const vmContext = vm.createContext(sandbox, {
+      codeGeneration: { strings: false, wasm: false },
+      microtaskMode: "afterEvaluate",
+    });
+
+    try {
+      script.runInContext(vmContext, { timeout: HOOK_EXECUTION_TIMEOUT_MS });
+    } catch (err: unknown) {
+      // A vm timeout / realm error: its constructor is not the host Error. Normalize
+      // to a readable host Error without calling into the realm.
+      throw new Error(ownStringMessage(err) ?? `Hook "${hookName}" failed`);
+    }
+
+    const raw = readHookOutput(sandbox);
+    if (raw === null) {
+      throw new Error(`Hook "${hookName}" did not finish (awaited something that never settles?)`);
+    }
+    const payload = parseHookPayload(raw, hookName);
+    replayHookLogs(context, payload.logs);
+    if (payload.ok !== true) {
+      throw new Error(typeof payload.error === "string" ? payload.error : "Hook threw");
+    }
+    applyContextMutations(context, payload.context);
+    return (isPlainRecord(payload.result) ? payload.result : {}) as HookResult;
+  };
 }
 
 // ── Default context factory ──────────────────────────────────────────────

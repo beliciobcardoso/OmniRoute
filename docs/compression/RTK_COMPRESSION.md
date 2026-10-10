@@ -1,7 +1,7 @@
 ---
 title: "RTK Compression"
-version: 3.8.31
-lastUpdated: 2026-06-20
+version: 3.8.40
+lastUpdated: 2026-06-28
 ---
 
 # RTK Compression
@@ -52,27 +52,58 @@ class is not enough.
 
 RTK loads filters in this order:
 
-1. Project filters from `.rtk/filters.json`, only when trusted.
-2. Global filters from `DATA_DIR/rtk/filters.json`.
+1. Project filters from `.rtk/filters.toml` and `.rtk/filters.json`, only when trusted.
+2. Global filters from `DATA_DIR/rtk/filters.toml` and `DATA_DIR/rtk/filters.json`.
 3. Built-in filters from `open-sse/services/compression/engines/rtk/filters/`.
+
+Within the same scope, RTK TOML schema v1 filters take precedence over OmniRoute JSON filters. TOML
+`match_command` expressions are checked before command-type matching so an imported command-specific
+filter can override a broader filter in that scope. Project scope still takes precedence over global
+scope, regardless of file format.
 
 Project filters are intentionally trust-gated because regex filters can change how tool output is
 shown to agents. A project filter file is accepted when one of these is true:
 
 - `rtkConfig.trustProjectFilters` is `true`.
 - `OMNIROUTE_RTK_TRUST_PROJECT_FILTERS=1` is set.
-- `.rtk/trust.json` contains the SHA-256 hash of `.rtk/filters.json`.
+- `.rtk/trust.json` contains the matching SHA-256 hash for the project filter file.
 
 Trust file example:
 
 ```json
 {
-  "filtersSha256": "0123456789abcdef..."
+  "filtersSha256": "0123456789abcdef...",
+  "filtersTomlSha256": "fedcba9876543210..."
 }
 ```
 
+The hashes are separate: `filtersSha256` trusts `.rtk/filters.json`, while `filtersTomlSha256`
+trusts `.rtk/filters.toml`. Editing either file invalidates only its own trust entry. Global files
+are administrator-installed and use the existing global-filter trust behavior.
+
 Custom filters can be one filter object or an array of filter objects. Invalid custom filters are
 skipped and reported by `/api/context/rtk/filters` diagnostics. Invalid built-in filters fail fast.
+
+## RTK TOML schema v1 compatibility
+
+OmniRoute can parse, validate, test, and install declarative filter files using RTK TOML schema v1.
+The supported fields are `description`, `match_command`, `strip_ansi`, `filter_stderr`,
+`strip_lines_matching`, `keep_lines_matching`, `replace`, `match_output`, `truncate_lines_at`,
+`head_lines`, `tail_lines`, `max_lines`, `on_empty`, and `[[tests.<filter>]]` inline tests.
+Unknown fields, invalid or unsafe regular expressions, simultaneous strip/keep rules, files over
+1 MiB, and references to unknown filters are rejected. A file whose inline tests fail can be
+validated for inspection but cannot be installed or loaded. Custom-file load failures remain
+fail-open: the invalid file is skipped and the remaining filters continue to work.
+
+OmniRoute receives tool output after the client has already captured it, so `filter_stderr = true`
+cannot change process capture. The field is accepted as a no-op and validation returns a warning.
+This is intentionally described as **RTK TOML schema v1 compatibility**, not full compatibility
+with the RTK executable, shell hooks, Rust command implementations, or its trust-store layout.
+
+The dashboard's advanced RTK view accepts pasted or uploaded TOML. Validation is read-only.
+Installation writes `DATA_DIR/rtk/filters.toml` atomically with restrictive permissions and refreshes
+the live filter catalog without a restart. Replacing an existing file requires explicit `overwrite`
+confirmation and creates `DATA_DIR/rtk/filters.toml.bak` first.
 
 ## Filter DSL
 
@@ -109,7 +140,7 @@ them too, especially when they are shared across projects.
 RTK collapses duplicate lines at two independent layers:
 
 1. **Per-filter `deduplicate` (opt-in, default `false`).** A filter can set `rules.deduplicate: true`
-   to collapse consecutive duplicate lines *within that filter's matched output*, before truncation.
+   to collapse consecutive duplicate lines _within that filter's matched output_, before truncation.
    This runs inside `lineFilter.ts`. For legacy filters, it is auto-enabled when the filter defines
    `collapsePatterns`. Schema: `deduplicate: z.boolean().default(false)` in
    `open-sse/services/compression/engines/rtk/filterSchema.ts`.
@@ -124,7 +155,7 @@ output), so the two compose without double-counting.
 ## Line Grouping (`enableGrouping`)
 
 When `rtkConfig.enableGrouping` is `true` (default `false`), RTK runs an additional `groupSimilarLines`
-pass over the post-dedup result that collapses runs of *near-equivalent* (not byte-identical)
+pass over the post-dedup result that collapses runs of _near-equivalent_ (not byte-identical)
 consecutive lines. `rtkConfig.groupingThreshold` (default `3`) is the minimum run length that triggers
 grouping. This is the structural counterpart to `deduplicateThreshold`: dedup handles exact repeats,
 grouping handles "the same shape with small differences". Both flags are part of the `rtkConfig` JSON
@@ -201,13 +232,13 @@ the SQLite `key_value` table under `namespace = "compression"`, `key = "rtkConfi
 — including `enableGrouping`, `groupingThreshold`, `stripCodeComments`, and `preserveDocstrings` —
 round-trips through the same store and survives a restart.
 
-| Key                    | Default | Purpose                                                                       |
-| ---------------------- | ------- | ----------------------------------------------------------------------------- |
-| `deduplicateThreshold` | `3`     | Engine-wide: min consecutive identical lines to collapse (bounded 2–100)      |
-| `enableGrouping`       | `false` | Opt-in: collapse runs of near-equivalent consecutive lines                    |
-| `groupingThreshold`    | `3`     | Min consecutive similar-line run that triggers grouping                       |
-| `stripCodeComments`    | `false` | Opt-in: remove comments from fenced code blocks (needs `applyToCodeBlocks`)   |
-| `preserveDocstrings`   | `true`  | When stripping comments, keep JSDoc/`/** … */` blocks                         |
+| Key                    | Default | Purpose                                                                     |
+| ---------------------- | ------- | --------------------------------------------------------------------------- |
+| `deduplicateThreshold` | `3`     | Engine-wide: min consecutive identical lines to collapse (bounded 2–100)    |
+| `enableGrouping`       | `false` | Opt-in: collapse runs of near-equivalent consecutive lines                  |
+| `groupingThreshold`    | `3`     | Min consecutive similar-line run that triggers grouping                     |
+| `stripCodeComments`    | `false` | Opt-in: remove comments from fenced code blocks (needs `applyToCodeBlocks`) |
+| `preserveDocstrings`   | `true`  | When stripping comments, keep JSDoc/`/** … */` blocks                       |
 
 ## API
 
@@ -216,6 +247,7 @@ round-trips through the same store and survives a restart.
 | `/api/context/rtk/config`          | GET    | Read RTK config                              |
 | `/api/context/rtk/config`          | PUT    | Update RTK config                            |
 | `/api/context/rtk/filters`         | GET    | List filter catalog and load diagnostics     |
+| `/api/context/rtk/import`          | POST   | Validate or install RTK TOML schema v1 files |
 | `/api/context/rtk/test`            | POST   | Preview RTK compression for one text payload |
 | `/api/context/rtk/raw-output/[id]` | GET    | Read retained redacted raw output            |
 | `/api/compression/preview`         | POST   | Preview any compression mode                 |
@@ -252,6 +284,18 @@ Compression preview payload:
 ```
 
 Management routes require dashboard management auth or the matching API-key policy.
+
+RTK TOML validation payload:
+
+```json
+{
+  "action": "validate",
+  "content": "schema_version = 1\n\n[filters.my-tool]\nmatch_command = \"^my-tool\\\\b\"\nmax_lines = 20\n"
+}
+```
+
+Use `"action": "install"` to install the validated file globally. Add `"overwrite": true` only
+after reviewing and confirming replacement of an existing global file.
 
 ## Raw Output Recovery
 
@@ -318,11 +362,11 @@ RTK supports **3 intensity levels** that trade off between **compression aggress
 
 ### The 3 Levels
 
-| Level | Truncation threshold | Token savings | Risk | Best for |
-|-------|---------------------|---------------|------|----------|
-| `minimal` | 24 lines per section | ~20-40% | Very low | Production with critical context |
-| `standard` (default) | 24 lines per section | ~50-70% | Low | Daily coding sessions |
-| `aggressive` | 16 lines per section | ~70-90% | Medium | Long sessions, max savings |
+| Level                | Truncation threshold | Token savings | Risk     | Best for                         |
+| -------------------- | -------------------- | ------------- | -------- | -------------------------------- |
+| `minimal`            | 24 lines per section | ~20-40%       | Very low | Production with critical context |
+| `standard` (default) | 24 lines per section | ~50-70%       | Low      | Daily coding sessions            |
+| `aggressive`         | 16 lines per section | ~70-90%       | Medium   | Long sessions, max savings       |
 
 ### Where the Truncation Happens
 
@@ -338,15 +382,15 @@ Both the **head** and **tail** of each section are preserved; middle content is 
 
 ### What Stays vs. What Gets Cut
 
-| Content | minimal | standard | aggressive |
-|---------|---------|----------|------------|
-| Errors / stack traces | ✅ preserved | ✅ preserved | ✅ preserved |
-| Test failures | ✅ preserved | ✅ preserved | ✅ preserved |
-| Build errors | ✅ preserved | ✅ preserved | ✅ preserved |
-| Test passes (verbose) | ✅ preserved | 🟡 collapsed | 🟡 collapsed |
-| Routine output (info logs) | 🟡 collapsed | 🟡 collapsed | ❌ dropped |
-| Progress bars | 🟡 collapsed | ❌ dropped | ❌ dropped |
-| Banner / ASCII art | 🟡 collapsed | ❌ dropped | ❌ dropped |
+| Content                    | minimal      | standard     | aggressive   |
+| -------------------------- | ------------ | ------------ | ------------ |
+| Errors / stack traces      | ✅ preserved | ✅ preserved | ✅ preserved |
+| Test failures              | ✅ preserved | ✅ preserved | ✅ preserved |
+| Build errors               | ✅ preserved | ✅ preserved | ✅ preserved |
+| Test passes (verbose)      | ✅ preserved | 🟡 collapsed | 🟡 collapsed |
+| Routine output (info logs) | 🟡 collapsed | 🟡 collapsed | ❌ dropped   |
+| Progress bars              | 🟡 collapsed | ❌ dropped   | ❌ dropped   |
+| Banner / ASCII art         | 🟡 collapsed | ❌ dropped   | ❌ dropped   |
 
 ### Choosing the Right Intensity
 
@@ -381,7 +425,9 @@ Both the **head** and **tail** of each section are preserved; middle content is 
 ```json
 {
   "combo": "my-coding-combo",
-  "routing": { /* ... */ },
+  "routing": {
+    /* ... */
+  },
   "compression": {
     "engine": "rtk",
     "intensity": "aggressive"
@@ -402,7 +448,9 @@ updateEngineConfig("rtk", { intensity: "aggressive" });
 ```
 
 ### Verifying the Effect
+
 Use the **Verify Gate** (see below) to confirm your filter is safe at your chosen intensity:
+
 ```ts
 import { runRtkFilterTests } from "omniroute/compression/engines/rtk/verify";
 
@@ -492,24 +540,15 @@ The `engines/rtk/filters/` directory contains **49+ built-in filter JSON files**
       "^\\s*[A-Z][a-zA-Z]+Error:",
       "^\\s*[A-Z][a-zA-Z]+Exception"
     ],
-    "dropPatterns": [
-      "site-packages/",
-      "^\\s+[a-z_]+\\([^)]*\\)$"
-    ],
+    "dropPatterns": ["site-packages/", "^\\s+[a-z_]+\\([^)]*\\)$"],
     "headLines": 5,
     "tailLines": 3,
     "maxLines": 25,
     "filterStderr": true
   },
   "preserve": {
-    "errorPatterns": [
-      "Error:",
-      "Exception:",
-      "Traceback"
-    ],
-    "summaryPatterns": [
-      "^[A-Z][a-zA-Z]+(?:Error|Exception):"
-    ]
+    "errorPatterns": ["Error:", "Exception:", "Traceback"],
+    "summaryPatterns": ["^[A-Z][a-zA-Z]+(?:Error|Exception):"]
   },
   "tests": [
     {
@@ -598,7 +637,7 @@ RTK compress (with rawOutput.enabled=true)
     "intensity": "aggressive",
     "rawOutput": {
       "enabled": true,
-      "maxBytes": 1048576  // 1MB cap
+      "maxBytes": 1048576 // 1MB cap
     }
   }
 }
@@ -608,11 +647,11 @@ RTK compress (with rawOutput.enabled=true)
 
 ### Storage Cost
 
-| Per-request | 1MB cap | 10MB cap |
-|-------------|---------|----------|
-| Average compressed output | ~5KB | ~5KB |
-| Raw output stored | ~50-500KB | ~500KB-5MB |
-| With 1000 requests/day | 50-500MB/day | 500MB-5GB/day |
+| Per-request               | 1MB cap      | 10MB cap      |
+| ------------------------- | ------------ | ------------- |
+| Average compressed output | ~5KB         | ~5KB          |
+| Raw output stored         | ~50-500KB    | ~500KB-5MB    |
+| With 1000 requests/day    | 50-500MB/day | 500MB-5GB/day |
 
 > **Recommendation**: Only enable raw output for **debugging sessions** or **sampled auditing**, not always-on.
 
@@ -621,7 +660,7 @@ RTK compress (with rawOutput.enabled=true)
 ```ts
 import { readRtkRawOutput } from "omniroute/compression/engines/rtk/rawOutput";
 
-const raw = readRtkRawOutput(pointerId);  // pointerId from compression stats
+const raw = readRtkRawOutput(pointerId); // pointerId from compression stats
 if (raw) {
   console.log("Original output:", raw);
 }
@@ -640,13 +679,17 @@ The **RTK Filter Verification** (`open-sse/services/compression/engines/rtk/veri
 import { runRtkFilterTests } from "open-sse/services/compression/engines/rtk/verify";
 
 const result = runRtkFilterTests();
-console.log(`Passed: ${result.outcomes.filter(o => o.passed).length}`);
-console.log(`Failed: ${result.outcomes.filter(o => !o.passed).length}`);
+console.log(`Passed: ${result.outcomes.filter((o) => o.passed).length}`);
+console.log(`Failed: ${result.outcomes.filter((o) => !o.passed).length}`);
 if (!result.passed) {
   console.error("Filters failed verification");
-  result.outcomes.filter(o => !o.passed).forEach(o => {
-    console.error(`  - ${o.filterId} / ${o.testName}: expected "${o.expected}", got "${o.actual}"`);
-  });
+  result.outcomes
+    .filter((o) => !o.passed)
+    .forEach((o) => {
+      console.error(
+        `  - ${o.filterId} / ${o.testName}: expected "${o.expected}", got "${o.actual}"`
+      );
+    });
 }
 ```
 

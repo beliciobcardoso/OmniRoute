@@ -51,10 +51,7 @@ export const LEGACY_FREE_PROVIDERS: readonly string[] = [
   "pollinations",
   "longcat",
   "cloudflare-ai",
-  "qwen",
-  "gemini-cli",
   "nvidia-nim",
-  "cerebras",
   "groq",
 ];
 

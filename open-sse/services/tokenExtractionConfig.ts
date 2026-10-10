@@ -104,18 +104,6 @@ const RAW_CONFIGS: TokenExtractionConfig[] = [
     "Log in to your Claude account at claude.ai. After login, the session cookie will be extracted automatically."
   ),
 
-  // ── ChatGPT Web ───────────────────────────────────────────
-  config(
-    "chatgpt-web",
-    "ChatGPT Web",
-    "https://chatgpt.com/auth/login",
-    "https://chatgpt.com",
-    [
-      { type: "cookie", name: "__Secure-next-auth.session-token", domain: ".chatgpt.com" },
-    ],
-    "Log in to ChatGPT. The __Secure-next-auth.session-token cookie will be extracted after login."
-  ),
-
   // ── Gemini Web ────────────────────────────────────────────
   config(
     "gemini-web",
@@ -146,9 +134,7 @@ const RAW_CONFIGS: TokenExtractionConfig[] = [
     "Perplexity Web",
     "https://www.perplexity.ai/login",
     "https://www.perplexity.ai",
-    [
-      { type: "cookie", name: "__Secure-next-auth.session-token", domain: ".perplexity.ai" },
-    ],
+    [{ type: "cookie", name: "__Secure-next-auth.session-token", domain: ".perplexity.ai" }],
     "Log in to Perplexity. The __Secure-next-auth.session-token cookie will be extracted.",
     { cookieDomain: ".perplexity.ai" }
   ),
@@ -167,40 +153,38 @@ const RAW_CONFIGS: TokenExtractionConfig[] = [
     { cookieDomain: ".deepseek.com" }
   ),
 
-  // ── Qwen Web ──────────────────────────────────────────────
-  // The v2 API sits behind Alibaba's "baxia" WAF, which needs the full browser
-  // cookie jar (cna + ssxmod_itna/itna2 + token), not just the bearer token.
-  // Capture the WAF cookies alongside the localStorage token (#3288).
+  // ── Volcano Engine Ark Console ───────────────────────────
   config(
-    "qwen-web",
-    "Qwen Web (Tongyi)",
-    "https://chat.qwen.ai/",
-    "https://chat.qwen.ai",
+    "volcengine-console",
+    "Volcano Engine Ark Console",
+    "https://console.volcengine.com/ark/region:cn-beijing/subscription/coding-plan",
+    "https://console.volcengine.com",
     [
-      { type: "localStorage", key: "token" },
-      { type: "cookie", name: "token", domain: ".chat.qwen.ai" },
-      { type: "cookie", name: "cna", domain: ".chat.qwen.ai" },
-      { type: "cookie", name: "ssxmod_itna", domain: ".chat.qwen.ai" },
-      { type: "cookie", name: "ssxmod_itna2", domain: ".chat.qwen.ai" },
-      { type: "cookie", name: "XSRF_TOKEN", domain: ".chat.qwen.ai" },
+      { type: "cookie", name: "digest", domain: ".volcengine.com" },
+      { type: "cookie", name: "AccountID", domain: ".volcengine.com" },
+      { type: "cookie", name: "csrfToken", domain: ".volcengine.com" },
+      { type: "cookie", name: "userInfo", domain: ".volcengine.com" },
     ],
-    "Log in to Qwen at chat.qwen.ai using your Alibaba account. The session token and the " +
-      "Alibaba WAF cookies (cna, ssxmod_itna) will be extracted — all are required by the v2 API.",
-    { cookieDomain: ".chat.qwen.ai" }
+    "Log in to the Volcano Engine Ark console. The console session is used to discover Agent/Coding Plan API keys and live quota usage.",
+    {
+      cookieDomain: ".volcengine.com",
+      successUrlPattern: /console\.volcengine\.com\/ark/i,
+      pollingConfig: { timeout: 300_000, minLoginTime: 3000 },
+    }
   ),
 
   // ── Kimi Web ──────────────────────────────────────────────
   config(
     "kimi-web",
     "Kimi (Moonshot)",
-    "https://kimi.moonshot.cn/",
-    "https://kimi.moonshot.cn",
+    "https://www.kimi.com/",
+    "https://www.kimi.com",
     [
-      { type: "cookie", name: "kimi_token", domain: ".kimi.moonshot.cn" },
-      { type: "localStorage", key: "kimi_token" },
+      { type: "localStorage", key: "access_token" },
+      { type: "cookie", name: "kimi-auth", domain: ".kimi.com" },
     ],
-    "Log in to Kimi at kimi.moonshot.cn via phone/WeChat. The session token will be extracted.",
-    { cookieDomain: ".kimi.moonshot.cn" }
+    "Log in to Kimi at www.kimi.com. The current access_token will be extracted from localStorage; kimi-auth remains a legacy fallback.",
+    { cookieDomain: ".kimi.com" }
   ),
 
   // ── Blackbox Web ──────────────────────────────────────────
@@ -223,9 +207,7 @@ const RAW_CONFIGS: TokenExtractionConfig[] = [
     "Poe (Quora)",
     "https://poe.com/login",
     "https://poe.com",
-    [
-      { type: "cookie", name: "p-b", domain: ".poe.com" },
-    ],
+    [{ type: "cookie", name: "p-b", domain: ".poe.com" }],
     "Log in to Poe at poe.com. The session cookie will be extracted.",
     { cookieDomain: ".poe.com" }
   ),
@@ -236,11 +218,8 @@ const RAW_CONFIGS: TokenExtractionConfig[] = [
     "Microsoft Copilot",
     "https://copilot.microsoft.com/",
     "https://copilot.microsoft.com",
-    [
-      { type: "cookie", name: "RPSCAuth", domain: ".microsoft.com" },
-    ],
-    "Log in with your Microsoft account at copilot.microsoft.com. The session auth cookie will be extracted.",
-    { cookieDomain: ".microsoft.com" }
+    [{ type: "header", name: "Authorization" }],
+    "Log in with your Microsoft account at copilot.microsoft.com. The bearer access token will be extracted from an authenticated request."
   ),
 
   // ── DuckDuckGo Web ────────────────────────────────────────
@@ -249,9 +228,7 @@ const RAW_CONFIGS: TokenExtractionConfig[] = [
     "DuckDuckGo AI Chat",
     "https://duckduckgo.com/?q=DuckDuckGo+AI+Chat&ia=chat&duckai=1",
     "https://duckduckgo.com",
-    [
-      { type: "cookie", name: "duckai", domain: ".duckduckgo.com" },
-    ],
+    [{ type: "cookie", name: "duckai", domain: ".duckduckgo.com" }],
     "Open DuckDuckGo AI Chat. Some models may require a free account. The duckai cookie will be extracted.",
     {
       cookieDomain: ".duckduckgo.com",
@@ -259,17 +236,19 @@ const RAW_CONFIGS: TokenExtractionConfig[] = [
     }
   ),
 
-  // ── DouBao Web ────────────────────────────────────────────
+  // ── Dola Web ──────────────────────────────────────────────
   config(
     "doubao-web",
-    "DouBao (ByteDance)",
-    "https://www.doubao.com/",
-    "https://www.doubao.com",
+    "Dola (ByteDance)",
+    "https://www.dola.com/",
+    "https://www.dola.com",
     [
-      { type: "cookie", name: "sessionid", domain: ".doubao.com" },
+      { type: "cookie", name: "sessionid", domain: ".dola.com" },
+      { type: "cookie", name: "ttwid", domain: ".dola.com" },
+      { type: "cookie", name: "s_v_web_id", domain: ".dola.com" },
     ],
-    "Log in to DouBao at doubao.com with your ByteDance account. The sessionid will be extracted.",
-    { cookieDomain: ".doubao.com" }
+    "Log in to Dola at www.dola.com with your ByteDance account. sessionid, ttwid, and s_v_web_id will be extracted.",
+    { cookieDomain: ".dola.com" }
   ),
 
   // ── T3 Chat Web ───────────────────────────────────────────
@@ -278,9 +257,7 @@ const RAW_CONFIGS: TokenExtractionConfig[] = [
     "T3 Chat",
     "https://t3.chat/login",
     "https://t3.chat",
-    [
-      { type: "localStorage", key: "token" },
-    ],
+    [{ type: "localStorage", key: "token" }],
     "Log in to T3 Chat at t3.chat using Google/GitHub. The token from localStorage will be extracted.",
     { pollingConfig: QUICK_POLLING }
   ),
@@ -305,9 +282,7 @@ const RAW_CONFIGS: TokenExtractionConfig[] = [
     "v0 by Vercel",
     "https://v0.dev/login",
     "https://v0.dev",
-    [
-      { type: "cookie", name: "__Secure-next-auth.session-token", domain: ".v0.dev" },
-    ],
+    [{ type: "cookie", name: "__Secure-next-auth.session-token", domain: ".v0.dev" }],
     "Log in to v0.dev with your Vercel/Google/GitHub account. The session cookie will be extracted.",
     { cookieDomain: ".v0.dev" }
   ),
@@ -318,9 +293,7 @@ const RAW_CONFIGS: TokenExtractionConfig[] = [
     "Meta AI (Muse)",
     "https://www.meta.ai/",
     "https://www.meta.ai",
-    [
-      { type: "cookie", name: "session", domain: ".meta.ai" },
-    ],
+    [{ type: "cookie", name: "session", domain: ".meta.ai" }],
     "Log in to Meta AI at meta.ai with your Facebook/Instagram account. The session cookie will be extracted.",
     { cookieDomain: ".meta.ai" }
   ),
@@ -331,9 +304,7 @@ const RAW_CONFIGS: TokenExtractionConfig[] = [
     "Adapta AI",
     "https://agent.adapta.one/login",
     "https://agent.adapta.one",
-    [
-      { type: "cookie", name: "__session", domain: ".adapta.one" },
-    ],
+    [{ type: "cookie", name: "__session", domain: ".adapta.one" }],
     "Log in to Adapta at agent.adapta.one. The session token will be extracted.",
     { cookieDomain: ".adapta.one" }
   ),
@@ -344,9 +315,7 @@ const RAW_CONFIGS: TokenExtractionConfig[] = [
     "VeoAI Free",
     "https://veoaifree.com/",
     "https://veoaifree.com",
-    [
-      { type: "cookie", name: "wordpress_logged_in", domain: ".veoaifree.com" },
-    ],
+    [{ type: "cookie", name: "wordpress_logged_in", domain: ".veoaifree.com" }],
     "Log in to VeoAI Free at veoaifree.com. The WordPress session cookie will be extracted.",
     {
       cookieDomain: ".veoaifree.com",
@@ -395,6 +364,16 @@ const RAW_CONFIGS: TokenExtractionConfig[] = [
     "Log in to Manus at manus.im. The session cookie will be extracted.",
     { cookieDomain: ".manus.im" }
   ),
+
+  // ── Z.ai Web (#4056) ────────────────────────────────────────
+  config(
+    "zai-web",
+    "Z.ai Web",
+    "https://chat.z.ai/",
+    "https://chat.z.ai",
+    [{ type: "localStorage", key: "token" }],
+    'Log in to Z.ai at chat.z.ai. OmniRoute extracts the Local Storage value named "token"; chat CAPTCHA is handled by the browser transport.'
+  ),
 ];
 
 // ─── Registry ───────────────────────────────────────────────────────────────
@@ -415,5 +394,5 @@ export function listExtractionConfigs(): TokenExtractionConfig[] {
   return [...RAW_CONFIGS];
 }
 
-/** The shared config map — used by LoginManager and InAppLoginService */
+/** The shared config map — used by InAppLoginService */
 export const TOKEN_EXTRACTION_CONFIGS = CONFIG_MAP;

@@ -8,7 +8,7 @@ import {
 import { isOpenAICompatibleProvider } from "@/shared/constants/providers";
 
 export const OPENAI_LIKE_FORMATS = new Set(["openai", "openai-responses"]);
-export const GEMINI_LIKE_FORMATS = new Set(["gemini", "gemini-cli"]);
+export const GEMINI_LIKE_FORMATS = new Set(["gemini"]);
 
 export function normalizeBaseUrl(baseUrl: string) {
   // Guard against a non-string baseUrl reaching .trim() / .replace() — see #2463
@@ -37,17 +37,23 @@ export function addModelsSuffix(baseUrl: string) {
   const normalized = normalizeBaseUrl(baseUrl);
   if (!normalized) return "";
 
+  // Endpoint URLs can carry request-only query flags (for example Kimi Code's
+  // `/messages?beta=true`). A models probe targets a sibling path, so preserve
+  // only the URL before the query/hash before replacing the endpoint suffix.
+  const separatorIndex = normalized.search(/[?#]/);
+  const endpoint = separatorIndex === -1 ? normalized : normalized.slice(0, separatorIndex);
+
   const suffixes = ["/chat/completions", "/responses", "/chat", "/messages"];
-  if (normalized.endsWith("/models")) {
-    return normalized;
+  if (endpoint.endsWith("/models")) {
+    return endpoint;
   }
   for (const suffix of suffixes) {
-    if (normalized.endsWith(suffix)) {
-      return `${normalized.slice(0, -suffix.length)}/models`;
+    if (endpoint.endsWith(suffix)) {
+      return `${endpoint.slice(0, -suffix.length)}/models`;
     }
   }
 
-  return `${normalized}/models`;
+  return `${endpoint}/models`;
 }
 
 export function resolveBaseUrl(entry: any, providerSpecificData: any = {}) {

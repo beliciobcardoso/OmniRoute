@@ -1,3 +1,9 @@
+---
+title: "Zed IDE Integration in Docker Environments"
+version: 3.8.40
+lastUpdated: 2026-06-28
+---
+
 # Zed IDE Integration in Docker Environments
 
 When OmniRoute runs inside Docker, the standard "Import from Zed Keychain" flow fails
@@ -97,7 +103,7 @@ The manual import endpoint can also be called directly:
 ```
 POST /api/providers/zed/manual-import
 Content-Type: application/json
-Authorization: Bearer <management-token>
+Authorization: Bearer <oma_live_or_manage_scoped_api_key>
 
 {
   "provider": "openai",

@@ -6,6 +6,7 @@ import {
   isAlwaysProtectedPath,
   isLoopbackHost,
 } from "../../../src/server/authz/routeGuard.ts";
+import { SPAWN_CAPABLE_PATTERNS } from "../../../src/shared/constants/spawnCapablePrefixes.ts";
 import { managementPolicy } from "../../../src/server/authz/policies/management.ts";
 import { getMachineTokenSync } from "../../../src/lib/machineToken.ts";
 import { CLI_TOKEN_HEADER } from "../../../src/server/authz/headers.ts";
@@ -19,6 +20,22 @@ test("isLocalOnlyPath: /api/mcp/ prefix is local-only", () => {
 
 test("isLocalOnlyPath: /api/cli-tools/runtime/ is local-only", () => {
   assert.equal(isLocalOnlyPath("/api/cli-tools/runtime/claude"), true);
+});
+
+test("isLocalOnlyPath: MITM management routes are local-only (GHSA-x7vm-hp44-9p79)", () => {
+  // The "Enable MITM" flow installs a system-wide trusted root CA and writes
+  // /etc/hosts DNS overrides (src/mitm/*) — host-level TLS interception. Both
+  // routes were MANAGEMENT-classified only, so requireLogin=false left them
+  // remotely reachable. They belong to the same loopback tier as
+  // /api/tools/agent-bridge/ (also MITM + DNS).
+  assert.equal(isLocalOnlyPath("/api/settings/mitm"), true);
+  assert.equal(isLocalOnlyPath("/api/cli-tools/antigravity-mitm"), true);
+  assert.equal(isLocalOnlyPath("/api/cli-tools/antigravity-mitm/alias"), true);
+});
+
+test("isLocalOnlyBypassableByManageScope: MITM routes are NOT bypassable (GHSA-x7vm-hp44-9p79)", () => {
+  assert.equal(isLocalOnlyBypassableByManageScope("/api/settings/mitm"), false);
+  assert.equal(isLocalOnlyBypassableByManageScope("/api/cli-tools/antigravity-mitm"), false);
 });
 
 test("isLocalOnlyPath: regular management routes are not local-only", () => {
@@ -37,6 +54,10 @@ test("isLocalOnlyPath: spawn-capable system/db-backups routes are local-only (6A
   assert.equal(isLocalOnlyPath("/api/db-backups/import"), false);
 });
 
+test("isLocalOnlyPath: /api/db/health is local-only (forks native diagnostics, #13717)", () => {
+  assert.equal(isLocalOnlyPath("/api/db/health"), true);
+});
+
 test("isLocalOnlyBypassableByManageScope: /api/mcp/ prefix is bypassable", () => {
   assert.equal(isLocalOnlyBypassableByManageScope("/api/mcp/"), true);
   assert.equal(isLocalOnlyBypassableByManageScope("/api/mcp/stream"), true);
@@ -50,12 +71,55 @@ test("isLocalOnlyBypassableByManageScope: non-local-only routes are not bypassab
   assert.equal(isLocalOnlyBypassableByManageScope("/api/settings"), false);
 });
 
+test("SPAWN_CAPABLE_PATTERNS covers every regex-tier LOCAL_ONLY spawn route (GHSA-9q3h-mjm5-f4gj)", () => {
+  // The manage-scope bypass veto's precise early-deny keys on
+  // SPAWN_CAPABLE_PATTERNS, so every LOCAL_ONLY_API_PATTERNS entry (a
+  // spawn-capable regex route) must have a matching pattern here — otherwise the
+  // two layers drift and a spawn route loses its exact early-deny. This guards
+  // against the chatgpt-web-codex-doctor drift and any future one.
+  const spawnRoutes = [
+    "/api/providers/acct-1/login",
+    "/api/providers/acct-1/refresh-cursor",
+    "/api/providers/acct-1/chatgpt-web-codex-doctor",
+  ];
+  for (const p of spawnRoutes) {
+    assert.equal(isLocalOnlyPath(p), true, `${p} must be LOCAL_ONLY`);
+    assert.equal(
+      SPAWN_CAPABLE_PATTERNS.some((re) => re.test(p)),
+      true,
+      `${p} is a LOCAL_ONLY spawn route but SPAWN_CAPABLE_PATTERNS does not cover it`
+    );
+  }
+});
+
 test("isAlwaysProtectedPath: /api/shutdown is always protected", () => {
   assert.equal(isAlwaysProtectedPath("/api/shutdown"), true);
 });
 
 test("isAlwaysProtectedPath: /api/settings/database is always protected", () => {
   assert.equal(isAlwaysProtectedPath("/api/settings/database"), true);
+});
+
+test("isAlwaysProtectedPath: /api/db-backups is always protected (GHSA-mghq-58h3-qcqj)", () => {
+  // Full-database read/replace must require auth even when requireLogin=false —
+  // the same Tier-2 trade-off /api/settings/database already makes. The single
+  // prefix entry covers export, exportAll, import and future siblings.
+  assert.equal(isAlwaysProtectedPath("/api/db-backups/export"), true);
+  assert.equal(isAlwaysProtectedPath("/api/db-backups/exportAll"), true);
+  assert.equal(isAlwaysProtectedPath("/api/db-backups/import"), true);
+});
+
+test("isAlwaysProtectedPath: legacy settings export/import-json are always protected (GHSA-v7g9-7f55-5g46)", () => {
+  // The mghq fix covered /api/db-backups but left the legacy sibling routes out:
+  // export-json dumps every credential and import-json irreversibly replaces
+  // settings/connections. Both handlers only check isAuthRequired(), which
+  // returns false under requireLogin=false — so they must sit in Tier 2 like
+  // /api/settings/database and /api/db-backups.
+  assert.equal(isAlwaysProtectedPath("/api/settings/export-json"), true);
+  assert.equal(isAlwaysProtectedPath("/api/settings/import-json"), true);
+  // The matcher is a plain startsWith (fail-closed: covers more, never less),
+  // so a hypothetical export-json2 sibling would also be protected — fine.
+  assert.equal(isAlwaysProtectedPath("/api/settings/proxy"), false);
 });
 
 test("isAlwaysProtectedPath: ordinary settings routes are not always protected", () => {
@@ -187,6 +251,25 @@ test("isLocalOnlyPath: /api/services/ prefix is local-only", () => {
 test("isLocalOnlyBypassableByManageScope: /api/services/* is NOT bypassable (spawn-capable)", () => {
   assert.equal(isLocalOnlyBypassableByManageScope("/api/services/9router/start"), false);
   assert.equal(isLocalOnlyBypassableByManageScope("/api/services/"), false);
+});
+
+// Hard Rule #17 — Mux (coder/mux) embedded service (spawns child processes via
+// runNpm install + node server spawn): every /api/services/mux/* route MUST be
+// classified local-only, same as every other embedded service under this prefix.
+test("isLocalOnlyPath: /api/services/mux/* is local-only (Hard Rule #17)", () => {
+  assert.equal(isLocalOnlyPath("/api/services/mux/install"), true);
+  assert.equal(isLocalOnlyPath("/api/services/mux/start"), true);
+  assert.equal(isLocalOnlyPath("/api/services/mux/stop"), true);
+  assert.equal(isLocalOnlyPath("/api/services/mux/restart"), true);
+  assert.equal(isLocalOnlyPath("/api/services/mux/update"), true);
+  assert.equal(isLocalOnlyPath("/api/services/mux/status"), true);
+  assert.equal(isLocalOnlyPath("/api/services/mux/auto-start"), true);
+  assert.equal(isLocalOnlyPath("/api/services/mux/logs"), true);
+});
+
+test("isLocalOnlyBypassableByManageScope: /api/services/mux/* is NOT bypassable (spawn-capable)", () => {
+  assert.equal(isLocalOnlyBypassableByManageScope("/api/services/mux/start"), false);
+  assert.equal(isLocalOnlyBypassableByManageScope("/api/services/mux/install"), false);
 });
 
 test("management policy rejects /api/services/ from non-localhost (status 403)", async () => {

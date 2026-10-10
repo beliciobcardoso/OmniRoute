@@ -59,8 +59,8 @@ export interface LoginShellPathOptions {
  */
 export function getLoginShellPath(opts: LoginShellPathOptions = {}): string | null {
   const platform = opts.platform ?? process.platform;
-  if (platform !== "darwin") return null;
-  const shell = opts.shell || process.env.SHELL || "/bin/zsh";
+  if (platform !== "darwin" && platform !== "linux") return null;
+  const shell = opts.shell || process.env.SHELL || (platform === "darwin" ? "/bin/zsh" : "/bin/bash");
   if (!/^[\w./-]+$/.test(shell)) return null;
   const run =
     opts.runShell ||
@@ -84,9 +84,4 @@ let cached: string | null | undefined;
 export function getCachedLoginShellPath(): string | null {
   if (cached === undefined) cached = getLoginShellPath();
   return cached;
-}
-
-/** Test-only: clear the module-level cache so a test can re-stub the runner. */
-export function __resetLoginShellPathCacheForTesting(value?: string | null): void {
-  cached = value;
 }

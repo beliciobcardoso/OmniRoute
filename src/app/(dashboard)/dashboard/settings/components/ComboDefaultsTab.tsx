@@ -1,8 +1,10 @@
 "use client";
 
 import { useState, useEffect, useRef } from "react";
-import { Card, Button, Input, Toggle } from "@/shared/components";
+import { Card, Button, Input, ModelSelectField, Toggle } from "@/shared/components";
 import { cn } from "@/shared/utils/cn";
+import { matchesSearch } from "@/shared/utils/turkishText";
+import FusionDefaultsFields from "./FusionDefaultsFields";
 import {
   ROUTING_STRATEGIES,
   SETTINGS_FALLBACK_STRATEGY_VALUES,
@@ -96,11 +98,13 @@ export default function ComboDefaultsTab() {
     handoffModel: "",
     maxMessagesForSummary: 30,
     stickyRoundRobinLimit: 3,
+    disableSessionStickiness: false,
     resetAwareQuotaCacheTtlMs: 0,
     resetAwareQuotaCacheMaxStaleMs: 0,
     zeroLatencyOptimizationsEnabled: false,
   });
-  const [codexSessionAffinityTtlMs, setCodexSessionAffinityTtlMs] = useState(0);
+  const [sessionAffinityTtlMs, setSessionAffinityTtlMs] = useState(0);
+  const [promptCacheAffinityEnabled, setPromptCacheAffinityEnabled] = useState(true);
   const [providerOverrides, setProviderOverrides] = useState<any>({});
   const [availableProviders, setAvailableProviders] = useState<{ id: string; provider: string }[]>(
     []
@@ -167,15 +171,20 @@ export default function ComboDefaultsTab() {
             settingsData.stickyRoundRobinLimit ??
             comboData.comboDefaults?.stickyRoundRobinLimit ??
             prev.stickyRoundRobinLimit,
+          disableSessionStickiness:
+            settingsData.disableSessionStickiness ??
+            comboData.comboDefaults?.disableSessionStickiness ??
+            prev.disableSessionStickiness,
         }));
         if (comboData.providerOverrides) {
           setProviderOverrides(sanitizeProviderOverrides(comboData.providerOverrides));
         }
-        setCodexSessionAffinityTtlMs(
-          Number.isFinite(Number(settingsData.codexSessionAffinityTtlMs))
-            ? Number(settingsData.codexSessionAffinityTtlMs)
+        setSessionAffinityTtlMs(
+          Number.isFinite(Number(settingsData.sessionAffinityTtlMs))
+            ? Number(settingsData.sessionAffinityTtlMs)
             : 0
         );
+        setPromptCacheAffinityEnabled(settingsData.promptCacheAffinityEnabled !== false);
       })
       .catch((err) => console.error("Failed to fetch combo defaults:", err));
   }, []);
@@ -213,10 +222,15 @@ export default function ComboDefaultsTab() {
   const saveComboDefaults = async () => {
     setSaving(true);
     try {
-      const { stickyRoundRobinLimit, ...comboDefaultsPayload } = comboDefaults;
+      const { stickyRoundRobinLimit, disableSessionStickiness, ...comboDefaultsPayload } =
+        comboDefaults;
       const settingsPatch = {
         ...toGlobalRoutingPatch(comboDefaults.strategy, stickyRoundRobinLimit),
-        codexSessionAffinityTtlMs,
+        sessionAffinityTtlMs,
+        // #6168: global session-stickiness opt-out — persisted top-level on settings
+        // (mirrors stickyRoundRobinLimit) so combo.ts resolution reads settings.disableSessionStickiness.
+        disableSessionStickiness: disableSessionStickiness === true,
+        promptCacheAffinityEnabled,
       };
 
       const comboDefaultsRes = await fetch("/api/settings/combo-defaults", {
@@ -281,8 +295,7 @@ export default function ComboDefaultsTab() {
 
   // Filtered provider list — excludes already-added ones, filtered by search query
   const filteredProviders = availableProviders.filter(
-    (p) =>
-      !providerOverrides[p.provider] && p.provider.toLowerCase().includes(searchQuery.toLowerCase())
+    (p) => !providerOverrides[p.provider] && matchesSearch(p.provider, searchQuery)
   );
 
   const handleDropdownKeyDown = (e: React.KeyboardEvent) => {
@@ -405,7 +418,7 @@ export default function ComboDefaultsTab() {
             <Input
               type="number"
               min="1"
-              max="10"
+              max="1000"
               value={comboDefaults.stickyRoundRobinLimit || 3}
               onChange={async (e) => {
                 const nextLimit = parseInt(e.target.value) || 3;
@@ -458,6 +471,26 @@ export default function ComboDefaultsTab() {
             }
             className="text-sm"
           />
+          <Input
+            label={translateOrFallback(t, "comboTimeout", "Combo timeout (seconds)")}
+            type="number"
+            min={1}
+            max={86400}
+            step={1}
+            value={msToOptionalSecondsInput(comboDefaults.comboTimeoutMs)}
+            placeholder={translateOrFallback(
+              t,
+              "inheritComboSafetyTimeout",
+              "Inherit 10-minute hang-stop"
+            )}
+            onChange={(e) =>
+              setComboDefaults((prev) => ({
+                ...prev,
+                comboTimeoutMs: secondsInputToOptionalMs(e.target.value),
+              }))
+            }
+            className="text-sm"
+          />
         </div>
         <p className="text-xs text-text-muted">
           {translateOrFallback(
@@ -466,28 +499,35 @@ export default function ComboDefaultsTab() {
             "Combo targets inherit the current request timeout by default. Set a lower value here only when you want faster fallback."
           )}
         </p>
+        <p className="text-xs text-text-muted">
+          {translateOrFallback(
+            t,
+            "comboTimeoutHint",
+            "Whole-combo wall-clock budget across failover targets. Empty keeps the 10-minute hang-stop. Keep this longer than Target timeout so failover still has time."
+          )}
+        </p>
 
         <div className="grid grid-cols-1 gap-3 pt-3 border-t border-border/50">
           <div>
             <p className="font-medium text-sm">
-              {translateOrFallback(t, "codexSessionAffinityTitle", "Codex session affinity")}
+              {translateOrFallback(t, "sessionAffinityTitle", "Session affinity")}
             </p>
             <p className="text-xs text-text-muted">
               {translateOrFallback(
                 t,
-                "codexSessionAffinityDesc",
-                "Keeps one Codex conversation on the same account for this many seconds. 0 disables it."
+                "sessionAffinityDesc",
+                "Keeps one conversation on the same account for this many seconds, for any provider. 0 disables it."
               )}
             </p>
           </div>
           <Input
-            label={translateOrFallback(t, "codexSessionAffinityTtl", "Affinity TTL (seconds)")}
+            label={translateOrFallback(t, "sessionAffinityTtl", "Affinity TTL (seconds)")}
             type="number"
             min={0}
             max={86400}
             step={60}
-            value={msToSeconds(codexSessionAffinityTtlMs)}
-            onChange={(e) => setCodexSessionAffinityTtlMs(secondsInputToMs(e.target.value, 86400))}
+            value={msToSeconds(sessionAffinityTtlMs)}
+            onChange={(e) => setSessionAffinityTtlMs(secondsInputToMs(e.target.value, 86400))}
             className="text-sm"
           />
         </div>
@@ -622,15 +662,14 @@ export default function ComboDefaultsTab() {
               }
               className="text-sm"
             />
-            <Input
+            <ModelSelectField
               label={translateOrFallback(t, "contextRelaySummaryModel", "Summary Model")}
-              type="text"
               value={comboDefaults.handoffModel ?? ""}
-              placeholder="codex/gpt-5.4"
-              onChange={(e) =>
+              placeholder="codex/gpt-5.6-sol"
+              onChange={(v) =>
                 setComboDefaults((prev) => ({
                   ...prev,
-                  handoffModel: e.target.value,
+                  handoffModel: v,
                 }))
               }
               className="text-sm"
@@ -647,6 +686,10 @@ export default function ComboDefaultsTab() {
           </div>
         )}
 
+        {comboDefaults.strategy === "fusion" && (
+          <FusionDefaultsFields comboDefaults={comboDefaults} setComboDefaults={setComboDefaults} />
+        )}
+
         {/* Toggles */}
         <div className="flex flex-col gap-3 pt-3 border-t border-border/50">
           <div className="flex items-center justify-between">
@@ -659,6 +702,24 @@ export default function ComboDefaultsTab() {
               onChange={() =>
                 setComboDefaults((prev) => ({ ...prev, trackMetrics: !prev.trackMetrics }))
               }
+            />
+          </div>
+          <div className="flex items-center justify-between">
+            <div>
+              <p className="font-medium text-sm">
+                {translateOrFallback(t, "promptCacheAffinity", "Prompt-cache locality routing")}
+              </p>
+              <p className="text-xs text-text-muted">
+                {translateOrFallback(
+                  t,
+                  "promptCacheAffinityDesc",
+                  "Prefer the same provider account for matching prompt-cache keys while preserving health and quota failover."
+                )}
+              </p>
+            </div>
+            <Toggle
+              checked={promptCacheAffinityEnabled}
+              onChange={() => setPromptCacheAffinityEnabled((enabled) => !enabled)}
             />
           </div>
           <div className="flex items-center justify-between gap-4">
@@ -707,6 +768,29 @@ export default function ComboDefaultsTab() {
               }
             />
           </div>
+          <div className="flex items-center justify-between">
+            <div>
+              <p className="font-medium text-sm">
+                {translateOrFallback(t, "disableSessionStickiness", "Disable session stickiness")}
+              </p>
+              <p className="text-xs text-text-muted">
+                {translateOrFallback(
+                  t,
+                  "disableSessionStickinessDesc",
+                  "Round-robin and random combos rotate to a different connection on every request instead of pinning a whole conversation to one connection by the first-message hash. Leave off to preserve prompt-cache hits for multi-turn chats. Per-combo overrides take precedence."
+                )}
+              </p>
+            </div>
+            <Toggle
+              checked={comboDefaults.disableSessionStickiness === true}
+              onChange={() =>
+                setComboDefaults((prev) => ({
+                  ...prev,
+                  disableSessionStickiness: prev.disableSessionStickiness !== true,
+                }))
+              }
+            />
+          </div>
         </div>
 
         {/* Provider Overrides */}
@@ -726,7 +810,7 @@ export default function ComboDefaultsTab() {
                     onClick={() => moveProviderOverride(provider, -1)}
                     disabled={index === 0}
                     className={`p-0.5 rounded ${index === 0 ? "text-text-muted/20 cursor-not-allowed" : "text-text-muted hover:text-primary hover:bg-black/5 dark:hover:bg-white/5"}`}
-                    title="Move up"
+                    title={t("moveUp")}
                   >
                     <span className="material-symbols-outlined text-[12px]">arrow_upward</span>
                   </button>
@@ -734,7 +818,7 @@ export default function ComboDefaultsTab() {
                     onClick={() => moveProviderOverride(provider, 1)}
                     disabled={index === Object.keys(providerOverrides).length - 1}
                     className={`p-0.5 rounded ${index === Object.keys(providerOverrides).length - 1 ? "text-text-muted/20 cursor-not-allowed" : "text-text-muted hover:text-primary hover:bg-black/5 dark:hover:bg-white/5"}`}
-                    title="Move down"
+                    title={t("moveDown")}
                   >
                     <span className="material-symbols-outlined text-[12px]">arrow_downward</span>
                   </button>
@@ -806,8 +890,8 @@ export default function ComboDefaultsTab() {
                   {filteredProviders.length === 0 ? (
                     <li className="px-3 py-2 text-xs text-text-muted text-center">
                       {availableProviders.filter((p) => !providerOverrides[p.provider]).length === 0
-                        ? "All providers added"
-                        : "No providers found"}
+                        ? t("allProvidersAdded")
+                        : t("noProvidersFound")}
                     </li>
                   ) : (
                     filteredProviders.map((p, idx) => (

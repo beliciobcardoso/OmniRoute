@@ -23,6 +23,18 @@ test("isPrivateLanHost: accepts RFC1918 IPv4 (incl. :port and ::ffff: mapped)", 
   }
 });
 
+test("isPrivateLanHost: accepts Tailscale CGNAT IPv4 range", () => {
+  for (const h of [
+    "100.64.0.1",
+    "100.96.135.160",
+    "100.127.255.254",
+    "100.96.135.160:20128",
+    "::ffff:100.96.135.160",
+  ]) {
+    assert.equal(isPrivateLanHost(h), true, `expected Tailscale LAN: ${h}`);
+  }
+});
+
 test("isPrivateLanHost: accepts IPv6 ULA / link-local", () => {
   assert.equal(isPrivateLanHost("fd12:3456::1"), true);
   assert.equal(isPrivateLanHost("fe80::1"), true);
@@ -32,6 +44,8 @@ test("isPrivateLanHost: rejects public IPs, loopback and junk", () => {
   for (const h of [
     "8.8.8.8",
     "69.164.221.35", // public VPS
+    "100.63.255.255", // just outside Tailscale 100.64/10
+    "100.128.0.1", // just outside Tailscale 100.64/10
     "172.32.0.1", // just outside 172.16/12
     "127.0.0.1",
     "::1",
@@ -71,21 +85,47 @@ test("services + traffic-inspector remain LOCAL_ONLY paths", () => {
   assert.equal(isLocalOnlyPath("/api/tools/traffic-inspector/sessions"), true);
 });
 
+test("issue-agent routes are LOCAL_ONLY by default", () => {
+  assert.equal(isLocalOnlyPath("/api/issue-agent/runs"), true);
+  assert.equal(isLocalOnlyPath("/api/issue-agent/runs/recorded-triage"), true);
+});
+
 test("management policy must NOT derive locality from the spoofable Host header", () => {
   const src = readFileSync(
     join(import.meta.dirname, "../../src/server/authz/policies/management.ts"),
     "utf8"
   );
+  // `requestPeerAddress` and friends moved to authz/peerContext.ts when the PUBLIC
+  // policy had to share the very same verdict (check:pack-boot / #11040 follow-up).
+  // The guard follows the implementation instead of the filename: neither module may
+  // read the Host header, and the module that OWNS peer resolution must resolve the
+  // token-stamped peer IP.
+  const peerSrc = readFileSync(
+    join(import.meta.dirname, "../../src/server/authz/peerContext.ts"),
+    "utf8"
+  );
   // Regression guard: a prior fix read the client-controlled Host header for the
   // LOCAL_ONLY decision, letting `Host: 127.0.0.1` bypass the gate. Locality must
   // come from the token-stamped peer IP instead.
+  for (const [name, text] of [
+    ["management.ts", src],
+    ["peerContext.ts", peerSrc],
+  ] as const) {
+    assert.ok(
+      !text.includes('get?.("host")') && !text.includes('get("host")'),
+      `${name} must NOT read the Host header for locality`
+    );
+  }
   assert.ok(
-    !src.includes('get?.("host")') && !src.includes('get("host")'),
-    "requestPeerAddress must NOT read the Host header"
-  );
-  assert.ok(
-    src.includes("resolveStampedPeer") && src.includes("PEER_IP_HEADER"),
+    peerSrc.includes("resolveStampedPeer") && peerSrc.includes("PEER_IP_HEADER"),
     "requestPeerAddress must resolve the trusted token-stamped peer IP"
+  );
+  // Positive anchor: management.ts must still route its locality decision through
+  // the shared helpers, so this guard cannot pass by the policy quietly growing its
+  // own Host-based path again.
+  assert.ok(
+    src.includes("peerContext") && src.includes("isLoopbackRequest"),
+    "management policy must delegate locality to authz/peerContext"
   );
 });
 

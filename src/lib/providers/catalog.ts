@@ -9,7 +9,9 @@ import {
   UPSTREAM_PROXY_PROVIDERS,
   WEB_COOKIE_PROVIDERS,
   isClaudeCodeCompatibleProvider,
+  resolveProviderId,
   supportsApiKeyOnFreeProvider,
+  supportsDualAuthProvider,
   type RiskNoticeVariant,
 } from "@/shared/constants/providers";
 
@@ -26,6 +28,15 @@ export type StaticProviderCatalogCategory =
   | "apikey"
   | "cloud-agent";
 
+export interface ProviderNotice {
+  /** Direct link to the API key management page for this provider. */
+  apiKeyUrl?: string;
+  /** Link to the signup/registration page for this provider. */
+  signupUrl?: string;
+  /** Optional short label (e.g. "Get API key", "Sign up"). */
+  text?: string;
+}
+
 export interface ProviderCatalogMetadata {
   id: string;
   name: string;
@@ -41,6 +52,13 @@ export interface ProviderCatalogMetadata {
   riskNoticeVariant?: RiskNoticeVariant;
   apiType?: string;
   baseUrl?: string;
+  /** Backend OAuth provider ID when one dashboard card fronts both auth modes. */
+  oauthProviderId?: string;
+  hiddenFromDashboard?: boolean;
+  /** Optional operator-supplied remote icon URL (#2166) for compatible provider nodes. */
+  iconUrl?: string;
+  /** Optional registration/API-key URL hints rendered as links on the provider detail page (#9270). */
+  notice?: ProviderNotice;
   [key: string]: unknown;
 }
 
@@ -59,6 +77,8 @@ export interface CompatibleProviderNodeLike {
   type?: string | null;
   apiType?: string | null;
   baseUrl?: string | null;
+  /** Optional operator-supplied remote icon URL (#2166). */
+  iconUrl?: string | null;
 }
 
 export interface CompatibleProviderLabels {
@@ -83,8 +103,7 @@ export interface ResolvedCompatibleProviderCatalogEntry extends ProviderCatalogM
 }
 
 export type ResolvedProviderCatalogEntry =
-  | ResolvedStaticProviderCatalogEntry
-  | ResolvedCompatibleProviderCatalogEntry;
+  ResolvedStaticProviderCatalogEntry | ResolvedCompatibleProviderCatalogEntry;
 
 export const STATIC_PROVIDER_CATALOG_GROUPS: Record<
   StaticProviderCatalogCategory,
@@ -173,22 +192,13 @@ export function getStaticProviderCatalogGroup(
   return STATIC_PROVIDER_CATALOG_GROUPS[category];
 }
 
-export function getStaticProviderCategories(providerId: string): StaticProviderCatalogCategory[] {
-  const categories: StaticProviderCatalogCategory[] = [];
-  for (const category of STATIC_PROVIDER_CATALOG_RESOLUTION_ORDER) {
-    if (STATIC_PROVIDER_CATALOG_GROUPS[category].providers[providerId]) {
-      categories.push(category);
-    }
-  }
-  return categories;
-}
-
 export function resolveStaticProviderCatalogEntry(
   providerId: string
 ): ResolvedStaticProviderCatalogEntry | null {
+  const canonicalId = resolveProviderId(providerId);
   for (const category of STATIC_PROVIDER_CATALOG_RESOLUTION_ORDER) {
     const group = STATIC_PROVIDER_CATALOG_GROUPS[category];
-    const provider = group.providers[providerId];
+    const provider = group.providers[canonicalId] ?? group.providers[providerId];
     if (!provider) continue;
     return {
       ...provider,
@@ -203,6 +213,7 @@ export function resolveStaticProviderCatalogEntry(
 
 export function isManagedProviderConnectionId(providerId: string): boolean {
   if (supportsApiKeyOnFreeProvider(providerId)) return true;
+  if (supportsDualAuthProvider(providerId)) return true;
 
   const entry = resolveStaticProviderCatalogEntry(providerId);
   return !!(entry && MANAGED_PROVIDER_CONNECTION_CATEGORIES.has(entry.category));
@@ -228,6 +239,7 @@ export function resolveCompatibleProviderCatalogEntry(
     textIcon: isCcCompatible ? "CC" : isAnthropicCompatible ? "AC" : "OC",
     apiType: providerNode.apiType || undefined,
     baseUrl: providerNode.baseUrl || undefined,
+    iconUrl: providerNode.iconUrl || undefined,
     type: providerNode.type,
     category: "compatible",
     displayAuthType: "compatible",

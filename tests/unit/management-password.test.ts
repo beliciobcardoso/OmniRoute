@@ -1,3 +1,13 @@
+// ENVIRONMENT NOTE (sandbox better-sqlite3 / glibc limitation, not a code defect):
+// This test constructs or exercises a real better-sqlite3-backed SQLite database.
+// better-sqlite3 is a native addon; production and CI load it normally, but some
+// sandboxes/dev boxes ship a system glibc older than the prebuilt binary requires
+// ("GLIBC_2.29 not found"), so the native module fails to dlopen and any test that
+// reaches better-sqlite3 directly (or asserts stdout that the load-failure warning
+// would pollute) fails HERE while passing in CI. This is a known environment
+// limitation, not a defect in the code under test: the OmniRoute runtime itself
+// cascades to node:sqlite/sql.js when better-sqlite3 is unavailable. See
+// tests/unit/_helpers/betterSqlite3Availability.ts for a guard helper.
 import test from "node:test";
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
@@ -16,7 +26,7 @@ const managementPassword = await import("../../src/lib/auth/managementPassword.t
 
 async function resetStorage() {
   core.resetDbInstance();
-  fs.rmSync(TEST_DATA_DIR, { recursive: true, force: true });
+  fs.rmSync(TEST_DATA_DIR, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
   fs.mkdirSync(TEST_DATA_DIR, { recursive: true });
   delete process.env.INITIAL_PASSWORD;
 }
@@ -29,30 +39,22 @@ async function runResetPasswordCli(password: string) {
 
   let stdout = "";
   let stderr = "";
-  let answeredPassword = false;
-  let answeredConfirmation = false;
-
-  const answerPrompts = () => {
-    if (!answeredPassword && stdout.includes("Enter new password")) {
-      child.stdin.write(`${password}\n`);
-      answeredPassword = true;
-    }
-    if (answeredPassword && !answeredConfirmation && stdout.includes("Confirm new password")) {
-      child.stdin.write(`${password}\n`);
-      child.stdin.end();
-      answeredConfirmation = true;
-    }
-  };
 
   child.stdout.setEncoding("utf8");
   child.stderr.setEncoding("utf8");
   child.stdout.on("data", (chunk) => {
     stdout += chunk;
-    answerPrompts();
   });
   child.stderr.on("data", (chunk) => {
     stderr += chunk;
   });
+
+  // #6387: the CLI now reads a piped (non-TTY) stdin all at once — the first line is the
+  // password — instead of the old two interactive `Enter new password` / `Confirm new
+  // password` prompts. Feed the password and close stdin immediately; waiting for prompts
+  // the non-TTY path never prints deadlocks the child (was the v3.8.46 CI shard-4 wedge).
+  child.stdin.write(`${password}\n`);
+  child.stdin.end();
 
   const code = await new Promise<number | null>((resolve, reject) => {
     child.on("error", reject);
@@ -68,7 +70,7 @@ test.beforeEach(async () => {
 
 test.after(() => {
   core.resetDbInstance();
-  fs.rmSync(TEST_DATA_DIR, { recursive: true, force: true });
+  fs.rmSync(TEST_DATA_DIR, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
   if (ORIGINAL_INITIAL_PASSWORD === undefined) {
     delete process.env.INITIAL_PASSWORD;
   } else {

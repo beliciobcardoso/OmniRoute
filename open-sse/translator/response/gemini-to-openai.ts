@@ -4,10 +4,17 @@ import {
   buildGeminiThoughtSignatureKey,
   storeGeminiThoughtSignature,
 } from "../../services/geminiThoughtSignatureStore.ts";
+import { caseInsensitiveToolNameLookup } from "../helpers/toolCallHelper.ts";
 import {
   parseTextualToolCallCandidate,
   containsTextualToolCallMarker,
 } from "../../utils/textualToolCall.ts";
+import {
+  normalizeOpenAICompatibleFinishReasonString,
+  isMalformedToolCallFinishReason,
+} from "../../utils/finishReason.ts";
+import { stripAnsiCodes } from "../../utils/streamHelpers.ts";
+import { stripObfuscationZeroWidth } from "../../utils/zeroWidth.ts";
 
 type GeminiToOpenAIState = {
   functionIndex: number;
@@ -251,7 +258,7 @@ function emitFunctionCallPart(
   results: Array<Record<string, unknown>>
 ) {
   const rawToolName = part.functionCall.name;
-  const fcName = state.toolNameMap?.get(rawToolName) || rawToolName;
+  const fcName = caseInsensitiveToolNameLookup(rawToolName, state.toolNameMap) ?? rawToolName;
   const fcArgs = normalizeToolCallArgs(part.functionCall.args || {});
   const toolCallIndex = state.functionIndex++;
   const toolCall = {
@@ -296,6 +303,9 @@ export function geminiToOpenAIResponse(chunk, state) {
   const response = chunk.response || chunk;
   if (!response) return null;
 
+  const modelVersion =
+    typeof response.modelVersion === "string" ? response.modelVersion.toLowerCase() : "";
+  const parseTextualReasoningTags = !chunk.response && !modelVersion.startsWith("antigravity/");
   const results = [];
   const candidate = response.candidates?.[0];
 
@@ -397,6 +407,10 @@ export function geminiToOpenAIResponse(chunk, state) {
   // Process parts
   if (content?.parts) {
     for (const part of content.parts) {
+      // Normalize the part text once: strip ANSI/VT100 escape codes that some
+      // upstreams (gemini-cli terminal redraws) inject, so the `<thinking>` /
+      // `[Tool call:]` textual parsers below never see stray control bytes (#2273).
+      const partText = stripAnsiCodes(part.text);
       const hasThoughtSig = part.thoughtSignature || part.thought_signature;
       const isThought = part.thought === true;
       if (hasThoughtSig && typeof hasThoughtSig === "string") {
@@ -405,7 +419,7 @@ export function geminiToOpenAIResponse(chunk, state) {
 
       // Handle thought signature (thinking mode) or native gemini thought flag
       if (hasThoughtSig || isThought) {
-        const hasTextContent = part.text !== undefined && part.text !== "";
+        const hasTextContent = partText !== undefined && partText !== "";
         const hasFunctionCall = !!part.functionCall;
 
         // Gemini/Antigravity can emit thoughtSignature as a standalone part
@@ -429,7 +443,7 @@ export function geminiToOpenAIResponse(chunk, state) {
             choices: [
               {
                 index: 0,
-                delta: isThought ? { reasoning_content: part.text } : { content: part.text },
+                delta: isThought ? { reasoning_content: partText } : { content: partText },
                 finish_reason: null,
               },
             ],
@@ -437,16 +451,18 @@ export function geminiToOpenAIResponse(chunk, state) {
         }
 
         if (hasFunctionCall) {
-          // Flush any still-open textual reasoning wrapper as reasoning_content BEFORE
-          // the tool call. A signed native functionCall arriving while a `<thinking>`
-          // (etc.) tag opened in an earlier chunk is still buffered must not silently
-          // drop that buffered reasoning — flushOpenTextualReasoning emits it and clears
-          // the active-tag/content buffers. (LEDGER-4 / #3821-review)
-          flushOpenTextualReasoning(state, results);
-          // Also drop any partial open-tag fragment buffered at a chunk boundary
-          // (flushOpenTextualReasoning early-returns when only this is set), matching the
-          // pre-fix branch which cleared all three buffers. (#3821-review convergence)
-          state.textualReasoningTagBuffer = undefined;
+          if (parseTextualReasoningTags) {
+            // Flush any still-open textual reasoning wrapper as reasoning_content BEFORE
+            // the tool call. A signed native functionCall arriving while a `<thinking>`
+            // (etc.) tag opened in an earlier chunk is still buffered must not silently
+            // drop that buffered reasoning — flushOpenTextualReasoning emits it and clears
+            // the active-tag/content buffers. (LEDGER-4 / #3821-review)
+            flushOpenTextualReasoning(state, results);
+            // Also drop any partial open-tag fragment buffered at a chunk boundary
+            // (flushOpenTextualReasoning early-returns when only this is set), matching the
+            // pre-fix branch which cleared all three buffers. (#3821-review convergence)
+            state.textualReasoningTagBuffer = undefined;
+          }
           emitFunctionCallPart(part, state, results);
         }
         continue;
@@ -457,8 +473,10 @@ export function geminiToOpenAIResponse(chunk, state) {
       // "[Tool call: ...]" block instead of native functionCall. Convert that
       // back to a structured OpenAI tool call so clients/tools do not see it as
       // assistant prose.
-      if (part.text !== undefined && part.text !== "") {
-        const afterReasoning = consumeTextualReasoningTags(part.text, state, results);
+      if (partText !== undefined && partText !== "") {
+        const afterReasoning = parseTextualReasoningTags
+          ? consumeTextualReasoningTags(partText, state, results)
+          : partText;
         if (!afterReasoning) continue;
 
         let accumulated = (state.textualToolCallBuffer || "") + afterReasoning;
@@ -466,7 +484,7 @@ export function geminiToOpenAIResponse(chunk, state) {
         let candidate = parseTextualToolCallCandidate(accumulated);
 
         if (candidate) {
-          accumulated = accumulated.replace(/[\u200B-\u200D\uFEFF]/g, "");
+          accumulated = stripObfuscationZeroWidth(accumulated);
           let toolCallIndex = accumulated.lastIndexOf("(empty)[Tool call:");
           if (toolCallIndex < 0) {
             toolCallIndex = accumulated.lastIndexOf("[Tool call:");
@@ -676,7 +694,9 @@ export function geminiToOpenAIResponse(chunk, state) {
 
   // Finish reason - include usage in final chunk
   if (candidate.finishReason) {
-    flushOpenTextualReasoning(state, results);
+    if (parseTextualReasoningTags) {
+      flushOpenTextualReasoning(state, results);
+    }
 
     if (state.textualToolCallBuffer) {
       const remainingText = state.textualToolCallBuffer;
@@ -711,20 +731,64 @@ export function geminiToOpenAIResponse(chunk, state) {
       }
     }
 
-    let finishReason = candidate.finishReason.toLowerCase();
-    if (finishReason === "stop" && state.toolCalls.size > 0) {
-      finishReason = "tool_calls";
-    } else if (finishReason === "max_tokens") {
-      finishReason = "length";
+    // Live incident (dashboard log id 1784489701456-d8c0e9): MALFORMED_FUNCTION_CALL /
+    // UNEXPECTED_TOOL_CALL mean Gemini's OWN parser rejected an attempted tool call —
+    // there is no real functionCall part to translate, only a human-readable
+    // finishMessage. Passing "malformed_function_call" through raw as finish_reason
+    // (the 9router#2462 fix below) is honest but useless to a real OpenAI-format
+    // client: it isn't one of the 5 values the spec defines, so a client like OpenClaw
+    // has no handling for it at all and just silently never notices the turn failed.
+    // Synthesize a tool_calls entry instead so finish_reason becomes the standard
+    // "tool_calls" — that routes the failure into the ordinary "tool call arguments
+    // didn't parse" path every OpenAI-compatible agent loop already handles, instead
+    // of an unrecognized enum value nothing is watching for.
+    //
+    // Follow-up live incident (log id 1784589106014-2a42f8): Gemini can emit a REAL,
+    // valid functionCall (e.g. "openclaw") AND still finish the SAME candidate with
+    // MALFORMED_FUNCTION_CALL — the model attempted multiple tool calls in one turn,
+    // one parsed cleanly and another (e.g. "exec"+"cron") did not. The first version of
+    // this fix skipped synthesis whenever state.toolCalls.size > 0, on the assumption
+    // that a real call already existing meant the model was retrying a LATER, separate
+    // attempt after an earlier one already succeeded — but that's indistinguishable,
+    // from here, from a real call and a malformed one arriving in the very same turn.
+    // Skipping silently discarded the malformed attempt's failure entirely: the client
+    // saw "openclaw" succeed and never learned "exec"/"cron" were attempted and
+    // rejected. Always synthesize instead — multiple tool_calls in one response is
+    // normal, well-supported OpenAI behavior (parallel tool calls), so this adds the
+    // failure as an additional entry rather than replacing or hiding the real one.
+    const isMalformedToolCall = isMalformedToolCallFinishReason(candidate.finishReason);
+    if (isMalformedToolCall) {
+      emitFunctionCallPart(
+        {
+          functionCall: {
+            name: "malformed_tool_call",
+            args: {
+              error: candidate.finishReason,
+              message: typeof candidate.finishMessage === "string" ? candidate.finishMessage : null,
+            },
+          },
+        },
+        state,
+        results
+      );
     }
-    // Content blocked by Gemini safety filters — pass through as "content_filter"
-    // so downstream clients can distinguish from normal completion.
-    if (
-      finishReason === "safety" ||
-      finishReason === "recitation" ||
-      finishReason === "blocklist"
-    ) {
-      finishReason = "content_filter";
+
+    // normalizeOpenAICompatibleFinishReasonString lowercases, maps max_tokens→length,
+    // and folds Gemini safety reasons (safety/recitation/blocklist/...) → content_filter
+    // so downstream clients can distinguish a blocked completion from a normal stop.
+    // Abort reasons (MALFORMED_FUNCTION_CALL, UNEXPECTED_TOOL_CALL, ...) are NOT in
+    // either mapped set, so they surface here unchanged (e.g. raw
+    // "malformed_function_call") rather than being folded into a misleading "stop" —
+    // isAbortFinishReason() (finishReason.ts) is what the openai→claude hub step
+    // uses downstream to recognize this raw value and keep it off a clean end_turn
+    // (9router#2462 sub-bug #2).
+    let finishReason = normalizeOpenAICompatibleFinishReasonString(candidate.finishReason);
+    if ((finishReason === "stop" || isMalformedToolCall) && state.toolCalls.size > 0) {
+      // Covers (1) a clean stop with tool calls already accumulated (pre-existing
+      // behavior, unchanged) and (2) any malformed-tool-call abort — always true here
+      // since the synthesis above guarantees state.toolCalls.size > 0 whenever
+      // isMalformedToolCall is true.
+      finishReason = "tool_calls";
     }
 
     const finalChunk: Record<string, unknown> = {
@@ -755,5 +819,4 @@ export function geminiToOpenAIResponse(chunk, state) {
 
 // Register
 register(FORMATS.GEMINI, FORMATS.OPENAI, null, geminiToOpenAIResponse);
-register(FORMATS.GEMINI_CLI, FORMATS.OPENAI, null, geminiToOpenAIResponse);
 register(FORMATS.ANTIGRAVITY, FORMATS.OPENAI, null, geminiToOpenAIResponse);

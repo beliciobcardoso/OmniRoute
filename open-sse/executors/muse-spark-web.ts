@@ -1,23 +1,38 @@
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
+import { Buffer } from "node:buffer";
+import WebSocket from "ws";
 
-import {
-  BaseExecutor,
-  mergeAbortSignals,
-  mergeUpstreamExtraHeaders,
-  type ExecuteInput,
-} from "./base.ts";
-import { FETCH_TIMEOUT_MS } from "../config/constants.ts";
+import { BaseExecutor, mergeUpstreamExtraHeaders, type ExecuteInput } from "./base.ts";
 import { getRotatingApiKey } from "../services/apiKeyRotator.ts";
 import { prepareToolMessages, buildToolAwareResult } from "../translator/webTools.ts";
+import { sanitizeErrorMessage } from "../utils/error.ts";
 import {
   normalizeSessionCookieHeader,
   normalizeSessionCookieHeaders,
 } from "@/lib/providers/webCookieAuth";
+import { type ParsedMetaAiResponse, isRecord } from "./muse-spark-web/response-parser.ts";
+import {
+  _fetchFreshAccessTokenDispatch,
+  type AccessTokenResult,
+} from "./muse-spark-web/fresh-access-token.ts";
+import {
+  META_WS_CHAT_TEMPLATE_B64,
+  META_WS_HOME_TEMPLATE_B64,
+} from "./muse-spark-web/ws-templates.ts";
+import { buildWsPromptFrame, writeU24Le } from "./muse-spark-web/ws-frame.ts";
+
+export {
+  __fetchFreshAccessTokenForTesting,
+  __resetMuseSparkTokenCacheForTesting,
+  __setMuseSparkBrowserPoolForTesting,
+  __setMuseSparkFreshTokenFetcherForTesting,
+} from "./muse-spark-web/fresh-access-token.ts";
+export { META_WS_CHAT_TEMPLATE_B64, META_WS_HOME_TEMPLATE_B64 };
+export { buildWsPromptFrame, parseProtoFields } from "./muse-spark-web/ws-frame.ts";
 
 const META_AI_GRAPHQL_API = "https://www.meta.ai/api/graphql";
-// Meta rebranded the chat product from "Abra" to "Ecto"; the session cookie
-// `abra_sess` was replaced by `ecto_1_sess`. `normalizeSessionCookieHeader`
-// only uses this constant when the user pastes a bare cookie value with no
+// Meta rebranded "Abra" to "Ecto"; `abra_sess` became `ecto_1_sess`.
+// `normalizeSessionCookieHeader` only uses this constant for bare values with no
 // `name=` prefix; full cookie lines (with any cookie names) pass through
 // untouched, so users who paste their entire DevTools cookie line still work.
 const META_AI_DEFAULT_COOKIE = "ecto_1_sess";
@@ -27,14 +42,18 @@ const META_AI_DEFAULT_COOKIE = "ecto_1_sess";
 // fails server-side validation with `Unknown type "RewriteOptionsInput"`.
 // The new operation is a Subscription rather than a Mutation, but Meta's
 // GraphQL endpoint still accepts it over POST and streams the response.
-const META_AI_SEND_MESSAGE_DOC_ID = "29ae946c82d1f301196c6ca2226400b5";
+const META_AI_WARMUP_DOC_ID = "e7f802582dbfed8e181b012e010993eb";
+const META_AI_MODE_SWITCH_DOC_ID = "c32bbe999c48e64e855dc63177d5153f";
+const META_WS_APP_ID = "1522763855472543";
+const META_WS_APP_VERSION = "1.0.0";
+const META_WS_AUTHTYPE = "15:0";
+const META_WS_DGW_VERSION = "5";
+const META_WS_DGW_UUID = "0";
+const META_WS_TIER = "prod";
+const META_WS_INTRO_FRAME_TYPE = 0x0f;
 const META_AI_ROOT_BRANCH_PATH = "0";
-const META_AI_ENTRY_POINT = "KADABRA__CHAT__UNIFIED_INPUT_BAR";
-const META_AI_FRIENDLY_NAME = "useEctoSendMessageSubscription";
-const META_AI_REQUEST_ANALYTICS_TAGS = "graphservice";
-const META_AI_ASBD_ID = "129477";
 const META_AI_USER_AGENT =
-  "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/147.0.0.0 Safari/537.36";
+  "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36";
 const BASE62_ALPHABET = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
 
 type MuseSparkModelInfo = {
@@ -43,29 +62,10 @@ type MuseSparkModelInfo = {
 };
 
 const MODEL_MAP: Record<string, MuseSparkModelInfo> = {
-  "muse-spark": { mode: "mode_fast", isThinking: false },
-  "muse-spark-thinking": { mode: "mode_thinking", isThinking: true },
+  "muse-spark": { mode: "think_fast", isThinking: false },
+  "muse-spark-thinking": { mode: "think_hard", isThinking: true },
   "muse-spark-contemplating": { mode: "think_hard", isThinking: true },
 };
-
-type MetaSseFrame = {
-  event: string;
-  data: string;
-};
-
-type ParsedMetaAiResponse = {
-  content: string;
-  deltas: string[];
-  reasoningContent: string;
-  reasoningDeltas: string[];
-  errorCode: string | null;
-  errorMessage: string | null;
-  status: number;
-};
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return !!value && typeof value === "object" && !Array.isArray(value);
-}
 
 function extractMessageText(content: unknown): string {
   if (typeof content === "string") {
@@ -347,10 +347,14 @@ function buildMetaAiRequestBody(prompt: string, model: string, conversation: Con
   const userUniqueMessageId = generateNumericMessageId();
 
   return {
-    doc_id: META_AI_SEND_MESSAGE_DOC_ID,
+    doc_id: META_AI_WARMUP_DOC_ID,
     variables: {
       assistantMessageId: crypto.randomUUID(),
-      attachments: null,
+      // `attachments` was removed from Meta's GraphQL schema (the
+      // AttachmentInput type is gone), so sending it — even as null —
+      // makes the server reject the persisted query with
+      // `Unknown type "AttachmentInput"`. Omit it entirely; GraphQL
+      // input fields are nullable-by-omission by default.
       clientLatitude: null,
       clientLongitude: null,
       clientTimezone:
@@ -362,7 +366,7 @@ function buildMetaAiRequestBody(prompt: string, model: string, conversation: Con
       currentBranchPath: conversation.branchPath,
       developerOverridesForMessage: null,
       devicePixelRatio: 1,
-      entryPoint: META_AI_ENTRY_POINT,
+      entryPoint: "KADABRA__CHAT__UNIFIED_INPUT_BAR",
       imagineOperationRequest: null,
       isNewConversation: conversation.isNewConversation,
       mentions: null,
@@ -384,365 +388,6 @@ function buildMetaAiRequestBody(prompt: string, model: string, conversation: Con
       userMessageId: crypto.randomUUID(),
       userUniqueMessageId,
     },
-  };
-}
-
-function parseMetaSseFrames(text: string): MetaSseFrame[] {
-  const frames: MetaSseFrame[] = [];
-  const lines = text.split(/\r?\n/);
-  let currentEvent = "message";
-  let dataLines: string[] = [];
-
-  const flush = () => {
-    if (dataLines.length === 0 && currentEvent === "message") {
-      return;
-    }
-
-    frames.push({
-      event: currentEvent,
-      data: dataLines.join("\n").trim(),
-    });
-
-    currentEvent = "message";
-    dataLines = [];
-  };
-
-  for (const line of lines) {
-    if (!line) {
-      flush();
-      continue;
-    }
-
-    if (line.startsWith(":")) {
-      continue;
-    }
-
-    if (line.startsWith("event:")) {
-      currentEvent = line.slice("event:".length).trim() || "message";
-      continue;
-    }
-
-    if (line.startsWith("data:")) {
-      dataLines.push(line.slice("data:".length).trimStart());
-    }
-  }
-
-  flush();
-  return frames;
-}
-
-function readMetaJsonPayloads(text: string): Array<Record<string, unknown>> {
-  const trimmed = text.trim();
-  if (trimmed.startsWith("{")) {
-    try {
-      const parsed = JSON.parse(trimmed);
-      return isRecord(parsed) ? [parsed] : [];
-    } catch {
-      return [];
-    }
-  }
-
-  return parseMetaSseFrames(text)
-    .filter((frame) => frame.data)
-    .map((frame) => {
-      try {
-        const parsed = JSON.parse(frame.data);
-        return isRecord(parsed) ? parsed : null;
-      } catch {
-        return null;
-      }
-    })
-    .filter((frame): frame is Record<string, unknown> => !!frame);
-}
-
-const META_AI_REASONING_KEYS = [
-  "reasoning",
-  "reasoningContent",
-  "reasoning_content",
-  "reasoningText",
-  "thinking",
-  "thinkingContent",
-  "thinkingText",
-  "thought",
-  "thoughtText",
-  "thoughts",
-  "internalThoughts",
-  "chainOfThought",
-  "thinkingTrace",
-  "thinking_trace",
-] as const;
-
-const META_AI_NESTED_RENDERER_KEYS = [
-  "contentRenderer",
-  "textContent",
-  "message",
-  "mediaContent",
-  "unified_response",
-  "unifiedResponseContent",
-  "sections",
-  "view_model",
-  "primitive",
-  "primitives",
-  "nested_responses",
-] as const;
-
-function collectRendererTexts(value: unknown, seen: Set<string>, depth = 0): string[] {
-  if (depth > 8) {
-    return [];
-  }
-
-  if (typeof value === "string") {
-    const normalized = value.trim();
-    if (!normalized || seen.has(normalized)) {
-      return [];
-    }
-    seen.add(normalized);
-    return [normalized];
-  }
-
-  if (Array.isArray(value)) {
-    return value.flatMap((item) => collectRendererTexts(item, seen, depth + 1));
-  }
-
-  if (!isRecord(value)) {
-    return [];
-  }
-
-  const parts: string[] = [];
-  if (typeof value.text === "string") {
-    parts.push(...collectRendererTexts(value.text, seen, depth + 1));
-  }
-
-  for (const key of [
-    "contentRenderer",
-    "textContent",
-    "message",
-    "mediaContent",
-    "unified_response",
-    "unifiedResponseContent",
-    "sections",
-    "view_model",
-    "primitive",
-    "primitives",
-    "nested_responses",
-  ]) {
-    if (key in value) {
-      parts.push(...collectRendererTexts(value[key], seen, depth + 1));
-    }
-  }
-
-  return parts;
-}
-
-function collectReasoningTexts(
-  value: unknown,
-  seen: Set<string>,
-  depth = 0,
-  force = false
-): string[] {
-  if (depth > 8) {
-    return [];
-  }
-
-  if (typeof value === "string") {
-    const normalized = value.trim();
-    if (!force || !normalized || seen.has(normalized)) {
-      return [];
-    }
-    seen.add(normalized);
-    return [normalized];
-  }
-
-  if (Array.isArray(value)) {
-    return value.flatMap((item) => collectReasoningTexts(item, seen, depth + 1, force));
-  }
-
-  if (!isRecord(value)) {
-    return [];
-  }
-
-  const typename = typeof value.__typename === "string" ? value.__typename : "";
-  const localForce = force || /reasoning|thinking|thought/i.test(typename);
-  const parts: string[] = [];
-
-  if (typeof value.text === "string" && localForce) {
-    parts.push(...collectReasoningTexts(value.text, seen, depth + 1, true));
-  }
-
-  for (const key of META_AI_REASONING_KEYS) {
-    if (key in value) {
-      parts.push(...collectReasoningTexts(value[key], seen, depth + 1, true));
-    }
-  }
-
-  for (const key of META_AI_NESTED_RENDERER_KEYS) {
-    if (key in value) {
-      parts.push(...collectReasoningTexts(value[key], seen, depth + 1, localForce));
-    }
-  }
-
-  return parts;
-}
-
-function extractAssistantContent(message: Record<string, unknown>): string {
-  if (typeof message.content === "string" && message.content.length > 0) {
-    return message.content;
-  }
-
-  const contentRenderer = isRecord(message.contentRenderer) ? message.contentRenderer : null;
-  if (!contentRenderer) {
-    return "";
-  }
-
-  const parts = collectRendererTexts(contentRenderer, new Set());
-  return parts.join("\n\n").trim();
-}
-
-function extractAssistantReasoning(message: Record<string, unknown>): string {
-  const parts = collectReasoningTexts(message, new Set());
-  return parts.join("\n\n").trim();
-}
-
-function extractAssistantError(message: Record<string, unknown>) {
-  const error = isRecord(message.error) ? message.error : null;
-  const streamingState =
-    typeof message.streamingState === "string" ? message.streamingState.toUpperCase() : null;
-  return {
-    code: typeof error?.code === "string" ? error.code : null,
-    message:
-      typeof error?.message === "string"
-        ? error.message.trim()
-        : streamingState === "ERROR" &&
-            typeof message.content === "string" &&
-            message.content.trim()
-          ? message.content.trim()
-          : null,
-  };
-}
-
-function classifyMetaAiError(errorMessage: string | null, content: string) {
-  const combined = `${errorMessage || ""}\n${content}`.trim();
-  if (!combined) {
-    return null;
-  }
-
-  if (/authentication required to send messages|login is required|sign in/i.test(combined)) {
-    return {
-      status: 401,
-      message: "Meta AI auth failed — your meta.ai abra_sess cookie may be missing or expired.",
-    };
-  }
-
-  if (/limit exceeded|rate limit|too many requests/i.test(combined)) {
-    return {
-      status: 429,
-      message: "Meta AI rate limited the session. Wait a moment and retry.",
-    };
-  }
-
-  if (/blocked by our security system|security system/i.test(combined)) {
-    return {
-      status: 403,
-      message:
-        "Meta AI blocked the request through its web security checks. Refresh the session cookie and retry.",
-    };
-  }
-
-  return null;
-}
-
-function parseMetaAiResponseText(text: string, isThinkingModel: boolean): ParsedMetaAiResponse {
-  let lastContent = "";
-  const deltas: string[] = [];
-  let lastReasoning = "";
-  const reasoningDeltas: string[] = [];
-  let errorCode: string | null = null;
-  let errorMessage: string | null = null;
-
-  for (const payload of readMetaJsonPayloads(text)) {
-    if (Array.isArray(payload.errors) && payload.errors.length > 0) {
-      const firstError = payload.errors.find(
-        (item) => isRecord(item) && typeof item.message === "string"
-      );
-      if (isRecord(firstError) && typeof firstError.message === "string") {
-        errorMessage = firstError.message.trim();
-      }
-    }
-
-    const data = isRecord(payload.data) ? payload.data : null;
-    const sendMessageStream = isRecord(data?.sendMessageStream) ? data?.sendMessageStream : null;
-    if (!sendMessageStream || sendMessageStream.__typename !== "AssistantMessage") {
-      continue;
-    }
-
-    const content = extractAssistantContent(sendMessageStream);
-    if (content && content !== lastContent) {
-      deltas.push(content.startsWith(lastContent) ? content.slice(lastContent.length) : content);
-      lastContent = content;
-    }
-
-    if (isThinkingModel) {
-      const reasoning = extractAssistantReasoning(sendMessageStream);
-      if (reasoning && reasoning !== content && reasoning !== lastReasoning) {
-        reasoningDeltas.push(
-          reasoning.startsWith(lastReasoning) ? reasoning.slice(lastReasoning.length) : reasoning
-        );
-        lastReasoning = reasoning;
-      }
-    }
-
-    const upstreamError = extractAssistantError(sendMessageStream);
-    if (upstreamError.message) {
-      errorMessage = upstreamError.message;
-      errorCode = upstreamError.code;
-    }
-  }
-
-  const classifiedError = classifyMetaAiError(errorMessage, lastContent);
-  if (classifiedError) {
-    return {
-      content: lastContent,
-      deltas,
-      reasoningContent: lastReasoning,
-      reasoningDeltas,
-      errorCode,
-      errorMessage: classifiedError.message,
-      status: classifiedError.status,
-    };
-  }
-
-  if (errorMessage) {
-    return {
-      content: lastContent,
-      deltas,
-      reasoningContent: lastReasoning,
-      reasoningDeltas,
-      errorCode,
-      errorMessage: `Meta AI returned an error: ${errorMessage}`,
-      status: 502,
-    };
-  }
-
-  if (!lastContent) {
-    return {
-      content: "",
-      deltas: [],
-      reasoningContent: lastReasoning,
-      reasoningDeltas,
-      errorCode: null,
-      errorMessage: "Meta AI returned no assistant content",
-      status: 502,
-    };
-  }
-
-  return {
-    content: lastContent,
-    deltas: deltas.filter((delta) => delta.length > 0),
-    reasoningContent: lastReasoning,
-    reasoningDeltas: reasoningDeltas.filter((delta) => delta.length > 0),
-    errorCode: null,
-    errorMessage: null,
-    status: 200,
   };
 }
 
@@ -893,39 +538,13 @@ function buildErrorResponse(status: number, message: string, code?: string | nul
   return new Response(
     JSON.stringify({
       error: {
-        message,
+        message: sanitizeErrorMessage(message),
         type: "upstream_error",
         ...(code ? { code } : {}),
       },
     }),
     { status, headers: { "Content-Type": "application/json" } }
   );
-}
-
-async function readTextResponse(
-  body: ReadableStream<Uint8Array>,
-  signal?: AbortSignal | null
-): Promise<string> {
-  const reader = body.getReader();
-  const decoder = new TextDecoder();
-  let text = "";
-
-  try {
-    while (true) {
-      if (signal?.aborted) {
-        throw signal.reason ?? new DOMException("Aborted", "AbortError");
-      }
-
-      const { value, done } = await reader.read();
-      if (done) break;
-      text += decoder.decode(value, { stream: true });
-    }
-
-    text += decoder.decode();
-    return text;
-  } finally {
-    reader.releaseLock();
-  }
 }
 
 export function normalizeMetaAiCookieHeader(apiKey: string): string {
@@ -967,9 +586,9 @@ function buildMetaAiHeaders(cookieHeader: string): Record<string, string> {
     "Sec-Fetch-Mode": "cors",
     "Sec-Fetch-Site": "same-origin",
     "User-Agent": META_AI_USER_AGENT,
-    "X-ASBD-ID": META_AI_ASBD_ID,
-    "X-FB-Friendly-Name": META_AI_FRIENDLY_NAME,
-    "X-FB-Request-Analytics-Tags": META_AI_REQUEST_ANALYTICS_TAGS,
+    "X-ASBD-ID": "129477",
+    "X-FB-Friendly-Name": "useEctoSendMessageSubscription",
+    "X-FB-Request-Analytics-Tags": "graphservice",
   };
 }
 
@@ -1007,6 +626,263 @@ function getOpenAiMessages(body: unknown): Array<Record<string, unknown>> | null
   const messages = (body as Record<string, unknown>).messages;
   if (!messages || !Array.isArray(messages) || messages.length === 0) return null;
   return messages as Array<Record<string, unknown>>;
+}
+
+function buildWsIntroFrame(conversationId: string): Uint8Array {
+  const payload = new TextEncoder().encode(
+    JSON.stringify({
+      "x-dgw-app-x-ecto-conversation-id": conversationId,
+      "x-dgw-app-client-payload-type": "PROTO_INSIDE_JSON",
+    })
+  );
+  const header = new Uint8Array(6);
+  header[0] = META_WS_INTRO_FRAME_TYPE;
+  header[1] = 0;
+  header[2] = 0;
+  writeU24Le(payload.length, header, 3);
+  const result = new Uint8Array(header.length + payload.length);
+  result.set(header);
+  result.set(payload, header.length);
+  return result;
+}
+
+// ─── WS URL builder + GraphQL helper + b64 helpers ─────────────────────────────
+
+function buildWsUrl(authorization: string, requestId: string): string {
+  const params = new URLSearchParams({
+    "x-dgw-appid": META_WS_APP_ID,
+    "x-dgw-appversion": META_WS_APP_VERSION,
+    "x-dgw-authtype": META_WS_AUTHTYPE,
+    "x-dgw-version": META_WS_DGW_VERSION,
+    "x-dgw-uuid": META_WS_DGW_UUID,
+    "x-dgw-tier": META_WS_TIER,
+    Authorization: authorization,
+    "x-dgw-app-origin": "meta.ai",
+    "x-dgw-app-clippy-request-id": requestId,
+    "x-dgw-app-clippy-async": "true",
+  });
+  return `wss://gateway.meta.ai/ws/clippy?${params.toString()}`;
+}
+
+type GraphqlResult = { ok: true } | { ok: false; error: string };
+
+/**
+ * Narrows the failure arm. Under this workspace's `strictNullChecks: false`, a
+ * boolean-literal discriminant narrows the positive branch but not the negative one, so
+ * `!result.ok` leaves the full union and `.error` is unreachable to the checker.
+ */
+function isGraphqlFailure(result: GraphqlResult): result is Extract<GraphqlResult, { ok: false }> {
+  return !result.ok;
+}
+
+async function graphqlPost(
+  docId: string,
+  variables: Record<string, unknown>,
+  cookieHeader: string,
+  label: string,
+  signal?: AbortSignal | null
+): Promise<GraphqlResult> {
+  try {
+    const response = await fetch(META_AI_GRAPHQL_API, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Accept: "multipart/mixed, application/json",
+        Cookie: cookieHeader,
+        "User-Agent": META_AI_USER_AGENT,
+        Origin: "https://meta.ai",
+      },
+      body: JSON.stringify({ doc_id: docId, variables }),
+      signal: signal ?? undefined,
+    });
+    if (!response.ok) return { ok: false, error: `${label} failed: HTTP ${response.status}` };
+    // GraphQL often returns errors in the body with HTTP 200 — parse them.
+    const text = await response.text();
+    try {
+      const json = JSON.parse(text);
+      if (json && Array.isArray(json.errors) && json.errors.length > 0) {
+        const msg = json.errors[0]?.message || "Unknown GraphQL error";
+        return { ok: false, error: `${label} failed: ${msg}` };
+      }
+    } catch {
+      // Response wasn't JSON or had no errors — treat as success.
+    }
+    return { ok: true };
+  } catch (err) {
+    return {
+      ok: false,
+      error: `${label} fetch failed: ${sanitizeErrorMessage(
+        err instanceof Error ? err.message : String(err)
+      )}`,
+    };
+  }
+}
+
+// ─── WS response parser ────────────────────────────────────────────────────────
+
+type WsResponseEvent = {
+  type: "full" | "patch";
+  response?: { sections?: Array<{ view_model?: { primitive?: { text?: string } } }> };
+  operations?: Array<{ op?: string; path?: string; value?: string }>;
+};
+
+function parseWsResponseEvents(payload: string): WsResponseEvent[] {
+  const events: WsResponseEvent[] = [];
+  let start: number | null = null;
+  let depth = 0;
+  let inString = false;
+  let escape = false;
+  for (let i = 0; i < payload.length; i++) {
+    const ch = payload[i];
+    if (start === null) {
+      if (ch === "{") {
+        start = i;
+        depth = 1;
+        inString = false;
+        escape = false;
+      }
+      continue;
+    }
+    if (inString) {
+      if (escape) {
+        escape = false;
+      } else if (ch === "\\") {
+        escape = true;
+      } else if (ch === '"') {
+        inString = false;
+      }
+      continue;
+    }
+    if (ch === '"') {
+      inString = true;
+    } else if (ch === "{") {
+      depth++;
+    } else if (ch === "}") {
+      depth--;
+      if (depth === 0 && start !== null) {
+        try {
+          events.push(JSON.parse(payload.slice(start, i + 1)));
+        } catch {
+          /* skip */
+        }
+        start = null;
+      }
+    }
+  }
+  return events;
+}
+
+type WsChatResult = {
+  content: string;
+  deltas: string[];
+  error?: string;
+};
+
+// ─── WebSocket chat function + test hook ────────────────────────────────────────
+
+let WebSocketCtor: typeof WebSocket = WebSocket;
+
+export function __setMuseSparkWebSocketForTesting(ctor: typeof WebSocket): () => void {
+  const previous = WebSocketCtor;
+  WebSocketCtor = ctor;
+  return () => {
+    WebSocketCtor = previous;
+  };
+}
+
+async function wsChat(
+  prompt: string,
+  conversationId: string,
+  authorization: string,
+  cookieHeader: string,
+  templateB64: string,
+  signal?: AbortSignal | null
+): Promise<WsChatResult> {
+  const requestId = crypto.randomUUID();
+  const wsUrl = buildWsUrl(authorization, requestId);
+
+  return new Promise((resolve) => {
+    const ws = new WebSocketCtor(wsUrl, {
+      headers: {
+        Cookie: cookieHeader,
+        "User-Agent": META_AI_USER_AGENT,
+        Origin: "https://meta.ai",
+      },
+    });
+    let settled = false;
+    let accumulatedText = "";
+    const contentDeltas: string[] = [];
+    let timeout: ReturnType<typeof setTimeout> | null = null;
+    let abortHandler: (() => void) | null = null;
+
+    const finish = (result: WsChatResult) => {
+      if (settled) return;
+      settled = true;
+      if (timeout) clearTimeout(timeout);
+      if (signal && abortHandler) signal.removeEventListener("abort", abortHandler);
+      try {
+        ws.close();
+      } catch {
+        /* ignore */
+      }
+      resolve(result);
+    };
+
+    const fail = (error: string) => finish({ content: "", deltas: [], error });
+
+    timeout = setTimeout(() => fail(`Meta AI WS timed out (readyState=${ws.readyState})`), 30000);
+    abortHandler = () => fail("Request aborted");
+    signal?.addEventListener("abort", abortHandler, { once: true });
+
+    ws.onopen = () => {
+      ws.send(buildWsIntroFrame(conversationId));
+      ws.send(buildWsPromptFrame(prompt, conversationId, { templateB64, requestId }));
+    };
+
+    ws.onmessage = (event) => {
+      let raw = "";
+      if (typeof event.data === "string") {
+        raw = event.data;
+      } else if (Buffer.isBuffer(event.data)) {
+        raw = event.data.toString("utf-8");
+      } else if (event.data instanceof ArrayBuffer || event.data instanceof Uint8Array) {
+        raw = new TextDecoder().decode(event.data);
+      }
+      if (!raw) return;
+      const events = parseWsResponseEvents(raw);
+      for (const evt of events) {
+        if (evt.type === "full") {
+          const sections = evt.response?.sections || [];
+          for (const section of sections) {
+            const text = section?.view_model?.primitive?.text || "";
+            if (text && text !== accumulatedText) {
+              const delta = accumulatedText ? text.slice(accumulatedText.length) || text : text;
+              if (delta) contentDeltas.push(delta);
+              accumulatedText = text;
+            }
+          }
+        } else if (evt.type === "patch") {
+          const operations = evt.operations || [];
+          for (const op of operations) {
+            if (
+              op.op === "delta" &&
+              op.path === "/sections/0/view_model/primitive/text" &&
+              typeof op.value === "string"
+            ) {
+              contentDeltas.push(op.value);
+              accumulatedText += op.value;
+            }
+          }
+        }
+      }
+    };
+
+    ws.onerror = () => fail("Meta AI WebSocket connection error");
+    ws.onclose = () => {
+      if (settled) return;
+      finish({ content: accumulatedText, deltas: contentDeltas });
+    };
+  });
 }
 
 function getContinuationCacheKey(
@@ -1052,78 +928,6 @@ function evictContinuationIfNeeded(
   if (cached && cacheKey) {
     conversationCache.delete(cacheKey);
   }
-}
-
-async function postMetaAiRequest(
-  headers: Record<string, string>,
-  transformedBody: unknown,
-  signal: AbortSignal,
-  log: ExecuteInput["log"]
-): Promise<{ ok: true; response: Response } | { ok: false; result: MuseSparkExecuteResult }> {
-  try {
-    const response = await fetch(META_AI_GRAPHQL_API, {
-      method: "POST",
-      headers,
-      body: JSON.stringify(transformedBody),
-      signal,
-    });
-    return { ok: true, response };
-  } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
-    log?.error?.("MUSE-SPARK-WEB", `Fetch failed: ${message}`);
-    return {
-      ok: false,
-      result: errorResult(
-        502,
-        `Meta AI connection failed: ${message}`,
-        "meta_ai_fetch_failed",
-        headers,
-        transformedBody
-      ),
-    };
-  }
-}
-
-function buildHttpErrorResult(
-  upstreamResponse: Response,
-  headers: Record<string, string>,
-  transformedBody: unknown,
-  cached: CachedConversation | null,
-  cacheKey: string | null
-): MuseSparkExecuteResult {
-  evictContinuationIfNeeded(cached, cacheKey);
-
-  let message = `Meta AI returned HTTP ${upstreamResponse.status}`;
-  if (upstreamResponse.status === 401 || upstreamResponse.status === 403) {
-    message = "Meta AI auth failed — your meta.ai ecto_1_sess cookie may be missing or expired.";
-  } else if (upstreamResponse.status === 429) {
-    message = "Meta AI rate limited the session. Wait a moment and retry.";
-  }
-
-  return errorResult(
-    upstreamResponse.status,
-    message,
-    `HTTP_${upstreamResponse.status}`,
-    headers,
-    transformedBody
-  );
-}
-
-function buildParsedErrorResult(
-  parsed: ParsedMetaAiResponse,
-  headers: Record<string, string>,
-  transformedBody: unknown,
-  cached: CachedConversation | null,
-  cacheKey: string | null
-): MuseSparkExecuteResult {
-  evictContinuationIfNeeded(cached, cacheKey);
-  return errorResult(
-    parsed.status,
-    parsed.errorMessage || "Meta AI returned an unknown error",
-    parsed.errorCode || "meta_ai_unknown_error",
-    headers,
-    transformedBody
-  );
 }
 
 function rememberAssistantTurn(
@@ -1174,7 +978,11 @@ async function buildSuccessResult(
     try {
       const json = JSON.parse(bodyText);
       const rawContent = json?.choices?.[0]?.message?.content || "";
-      const { content, toolCalls, finishReason } = buildToolAwareResult(rawContent, requestedTools, "muse");
+      const { content, toolCalls, finishReason } = buildToolAwareResult(
+        rawContent,
+        requestedTools,
+        "muse"
+      );
       if (toolCalls) {
         json.choices[0].message = { role: "assistant", content: null, tool_calls: toolCalls };
         json.choices[0].finish_reason = finishReason;
@@ -1182,9 +990,12 @@ async function buildSuccessResult(
         json.choices[0].message.content = content;
       }
       response = new Response(JSON.stringify(json), {
-        status: 200, headers: { "Content-Type": "application/json" },
+        status: 200,
+        headers: { "Content-Type": "application/json" },
       });
-    } catch { /* keep original response */ }
+    } catch {
+      /* keep original response */
+    }
   }
 
   return resultWithResponse(response, headers, transformedBody);
@@ -1210,10 +1021,58 @@ export class MuseSparkWebExecutor extends BaseExecutor {
       return errorResult(400, "Missing or empty messages array", "invalid_request", {}, body);
     }
 
-    const { hasTools, requestedTools, effectiveMessages } = prepareToolMessages(bodyObj, rawMessages as Array<{ role: string; content: unknown }>);
+    const { hasTools, requestedTools, effectiveMessages } = prepareToolMessages(
+      bodyObj,
+      rawMessages as Array<{ role: string; content: unknown }>
+    );
     const parsedHistory = parseOpenAIMessages(effectiveMessages);
     if (!parsedHistory.foldedPrompt) {
       return errorResult(400, "Empty query after processing messages", "invalid_request", {}, body);
+    }
+
+    // Extract the WebSocket auth token (ecto1:...) from provider-specific data
+    // or from the apiKey field itself (user can paste both in the cookie field).
+    // Then try to fetch a fresh token from meta.ai — stale tokens cause the
+    // gateway to return 0x0e after 4 messages (#10727).
+    let cookieHeader = selectMetaAiCookieHeader(credentials);
+    let authorization: string;
+    if (
+      typeof credentials.providerSpecificData?.authorization === "string" &&
+      credentials.providerSpecificData.authorization
+    ) {
+      authorization = credentials.providerSpecificData.authorization.trim();
+    } else if (typeof credentials.apiKey === "string") {
+      const match = credentials.apiKey.match(/ecto1:[^\s;]+/i);
+      authorization = match ? match[0].trim() : "";
+    } else {
+      authorization = "";
+    }
+
+    // Attempt to fetch a fresh accessToken via headless Chromium (browserPool).
+    // Meta's gateway rejects stale ecto1 tokens with a 0x0e frame after ~4
+    // messages (#10727). The token is embedded in the server-rendered page
+    // HTML, which returns 403 to plain fetch (JS challenge), so a real
+    // browser is required. Result is cached for 4 min (token TTL ~5 min).
+    const freshToken = await _fetchFreshAccessTokenDispatch(cookieHeader, signal);
+    if (freshToken.ok) {
+      authorization = freshToken.token;
+      if (freshToken.updatedCookie) {
+        cookieHeader = freshToken.updatedCookie;
+      }
+      log?.info?.("MUSE-SPARK-WEB", "Fetched fresh WS accessToken via browser");
+    } else {
+      const freshError = (freshToken as Extract<AccessTokenResult, { ok: false }>).error;
+      log?.warn?.("MUSE-SPARK-WEB", `Fresh token fetch failed: ${freshError}; using static token`);
+      if (!authorization) {
+        // No static token and fresh fetch failed — can't proceed
+        return errorResult(
+          400,
+          `Missing Authorization for Meta AI WebSocket. Fresh token fetch failed: ${freshError}. Provide a valid ecto_1_sess cookie.`,
+          "missing_authorization",
+          {},
+          body
+        );
+      }
     }
 
     // Look up a prior meta.ai conversation we created for this caller +
@@ -1234,50 +1093,92 @@ export class MuseSparkWebExecutor extends BaseExecutor {
     const conversationContext = getConversationContext(cached);
 
     const prompt = cached ? parsedHistory.latestUserContent : parsedHistory.foldedPrompt;
-
     const modelInfo = getMuseSparkModelInfo(model);
-    const transformedBody = buildMetaAiRequestBody(prompt, model, conversationContext);
-    const cookieHeader = selectMetaAiCookieHeader(credentials);
+    const templateB64 = cached ? META_WS_CHAT_TEMPLATE_B64 : META_WS_HOME_TEMPLATE_B64;
+
+    // Step 1: GraphQL warmup initialises the conversation on Meta's side
+    const warmupResult = await graphqlPost(
+      META_AI_WARMUP_DOC_ID,
+      { conversationId: conversationContext.conversationId },
+      cookieHeader,
+      "Warmup",
+      signal
+    );
+    if (isGraphqlFailure(warmupResult)) {
+      evictContinuationIfNeeded(cached, continuationCacheKey);
+      log?.error?.("MUSE-SPARK-WEB", `Warmup failed: ${warmupResult.error}`);
+      return errorResult(502, warmupResult.error, "meta_ai_warmup_failed", {}, body);
+    }
+
+    // Step 2: GraphQL mode switch sets the conversation's reasoning level
+    const modeResult = await graphqlPost(
+      META_AI_MODE_SWITCH_DOC_ID,
+      { input: { conversationId: conversationContext.conversationId, mode: modelInfo.mode } },
+      cookieHeader,
+      "Mode switch",
+      signal
+    );
+    if (isGraphqlFailure(modeResult)) {
+      evictContinuationIfNeeded(cached, continuationCacheKey);
+      log?.error?.("MUSE-SPARK-WEB", `Mode switch failed: ${modeResult.error}`);
+      return errorResult(502, modeResult.error, "meta_ai_mode_switch_failed", {}, body);
+    }
+
+    // Step 3: Send message via WebSocket
+    const wsResult = await wsChat(
+      prompt,
+      conversationContext.conversationId,
+      authorization,
+      cookieHeader,
+      templateB64,
+      signal
+    );
+
     const headers = buildMetaAiHeaders(cookieHeader);
     mergeUpstreamExtraHeaders(headers, upstreamExtraHeaders);
 
-    const timeoutSignal = AbortSignal.timeout(FETCH_TIMEOUT_MS);
-    const combinedSignal = signal ? mergeAbortSignals(signal, timeoutSignal) : timeoutSignal;
-
-    const fetchResult = await postMetaAiRequest(headers, transformedBody, combinedSignal, log);
-    if (!fetchResult.ok) {
-      const err = fetchResult as { ok: false; result: MuseSparkExecuteResult };
-      return err.result;
+    if (wsResult.error) {
+      evictContinuationIfNeeded(cached, continuationCacheKey);
+      log?.error?.("MUSE-SPARK-WEB", `WS error: ${wsResult.error}`);
+      const lower = wsResult.error.toLowerCase();
+      const status = /auth|authorization|401/.test(lower) ? 401 : 502;
+      // On a 401, name the live cookie so users know what to re-paste. Meta
+      // rebranded Abra→Ecto: the retired `abra_sess` cookie is now `ecto_1_sess`.
+      const message =
+        status === 401
+          ? `${wsResult.error} — your meta.ai ecto_1_sess cookie may be missing or expired; re-paste the ecto_1_sess value from DevTools.`
+          : wsResult.error;
+      return errorResult(status, message, "meta_ai_ws_error", headers, body);
     }
 
-    const upstreamResponse = fetchResult.response;
-    if (!upstreamResponse.ok) {
-      return buildHttpErrorResult(
-        upstreamResponse,
-        headers,
-        transformedBody,
-        cached,
-        continuationCacheKey
-      );
-    }
+    const content = wsResult.content || "";
 
-    if (!upstreamResponse.body) {
+    // Empty WS response is an upstream failure, not a successful empty completion.
+    if (!content && !wsResult.deltas.length) {
+      evictContinuationIfNeeded(cached, continuationCacheKey);
+      log?.error?.("MUSE-SPARK-WEB", "WS returned empty response");
       return errorResult(
         502,
-        "Meta AI returned an empty response body",
-        "meta_ai_empty_body",
+        "Meta AI returned no assistant content",
+        "meta_ai_empty_response",
         headers,
-        transformedBody
+        body
       );
     }
 
-    const responseText = await readTextResponse(upstreamResponse.body, signal);
-    const parsed = parseMetaAiResponseText(responseText, modelInfo.isThinking);
-    if (parsed.status !== 200 || parsed.errorMessage) {
-      return buildParsedErrorResult(parsed, headers, transformedBody, cached, continuationCacheKey);
+    const deltas = wsResult.deltas.length > 0 ? wsResult.deltas : [content];
+    const parsed = {
+      content,
+      deltas,
+      reasoningContent: "",
+      reasoningDeltas: [] as string[],
+      errorCode: null as string | null,
+      errorMessage: null as string | null,
+      status: 200,
+    };
+    if (content) {
+      rememberAssistantTurn(parsed, credentials, model, parsedHistory, conversationContext);
     }
-
-    rememberAssistantTurn(parsed, credentials, model, parsedHistory, conversationContext);
-    return buildSuccessResult(parsed, stream, model, headers, transformedBody, hasTools, requestedTools);
+    return buildSuccessResult(parsed, stream, model, headers, body, hasTools, requestedTools);
   }
 }

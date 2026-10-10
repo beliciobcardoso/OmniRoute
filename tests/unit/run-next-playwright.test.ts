@@ -56,6 +56,15 @@ test("shouldUseWebpackForPlaywrightDev only opts into webpack when turbopack is 
     }),
     false
   );
+
+  // Turbopack is the default: an unset env var must NOT fall back to webpack.
+  assert.equal(
+    playwrightRunner.shouldUseWebpackForPlaywrightDev({
+      mode: "dev",
+      env: {},
+    }),
+    false
+  );
 });
 
 test("standalone asset helpers detect and rehydrate missing standalone static assets", () => {
@@ -115,5 +124,5 @@ test("standalone asset helpers detect and rehydrate missing standalone static as
   );
   assert.match(logs[0] || "", /Rehydrated standalone static\/public assets/);
 
-  fs.rmSync(tempRoot, { recursive: true, force: true });
+  fs.rmSync(tempRoot, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
 });

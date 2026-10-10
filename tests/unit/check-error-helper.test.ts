@@ -4,8 +4,12 @@
 // or helper-importing files) is locked down as a regression guard.
 import test from "node:test";
 import assert from "node:assert/strict";
+import { existsSync } from "node:fs";
 // @ts-expect-error — .mjs gate module has no type declarations; runtime shape is known.
-import { findErrorHelperViolations, KNOWN_MISSING_ERROR_HELPER } from "../../scripts/check/check-error-helper.mjs";
+import {
+  findErrorHelperViolations,
+  KNOWN_MISSING_ERROR_HELPER,
+} from "../../scripts/check/check-error-helper.mjs";
 
 type FileEntry = { path: string; source: string };
 type FindFn = (files: FileEntry[], allowlist: Set<string>) => string[];
@@ -84,17 +88,25 @@ test("flags forwarded upstream body.error.message without sanitize", () => {
 });
 
 // --- Negative cases: the gate must NOT flag these (conservative, no false positives) ---
+//
+// G-03 (#15159) INVERTED the next two cases. They used to assert "a file that
+// imports utils/error is never flagged", which is exactly the blind spot that let
+// the audit's live E-09 (deepseek-web.ts: imports the sanitizer, keeps a raw
+// file-local builder) ship green. Their fixtures contain a REAL raw leak, so
+// asserting `[]` locked the bug in. Trust is now call-scoped: an import only
+// excuses the line that actually routes through it. Do NOT "restore" these — the
+// call-scoped contract is asserted in check-error-helper-call-scope.test.ts.
 
-test("does NOT flag a file that imports utils/error (relative)", () => {
+test("G-03: a file importing only the sanitizer is STILL flagged for a raw leak", () => {
   const src = `import { sanitizeErrorMessage } from "../utils/error.ts";
   function build(err: Error) { return { error: { message: err.message } }; }`;
-  assert.deepEqual(run(src), []);
+  assert.deepEqual(run(src), ["open-sse/executors/x.ts"]);
 });
 
-test("does NOT flag a file that imports utils/error (workspace alias)", () => {
+test("G-03: importing a builder name does not license a separate raw Response body", () => {
   const src = `import { buildErrorBody } from "@omniroute/open-sse/utils/error";
   function build(err: Error) { return new Response(JSON.stringify({ error: { message: \`x \${err.message}\` } })); }`;
-  assert.deepEqual(run(src), []);
+  assert.deepEqual(run(src), ["open-sse/executors/x.ts"]);
 });
 
 test("does NOT flag raw err.message inside a saveCallLog audit row", () => {
@@ -156,31 +168,78 @@ test("an allowlisted path is suppressed even when it would otherwise flag", () =
   assert.deepEqual(find([{ path, source: src } as FileEntry], new Set([path])), []);
 });
 
-test("the shipped allowlist freezes exactly the known current violators (all scopes)", () => {
-  const frozen = [...allowlist].sort();
-  // 6A.8: expanded scope includes src/app/api/**/route.ts.
-  // The original open-sse/executors+handlers violations were resolved before 6A.8 landed,
-  // so only the newly-discovered API route violations remain frozen.
-  assert.deepEqual(frozen, [
-    // 6A.8 expanded scope: src/app/api/**/route.ts pre-existing violations
-    // TODO(6A.8): pre-existing, triage — route through buildErrorBody()/sanitizeErrorMessage()
-    "src/app/api/cli-tools/backups/route.ts",
-    "src/app/api/cli-tools/guide-settings/[toolId]/route.ts",
-    "src/app/api/logs/export/route.ts",
-    "src/app/api/models/catalog/route.ts",
-    "src/app/api/providers/test-batch/route.ts",
-    "src/app/api/settings/import-json/route.ts",
-    "src/app/api/usage/proxy-logs/route.ts",
-  ]);
+test("every shipped allowlist entry is a real on-disk source file", () => {
+  // G-03 (#15159): this gate now sees 23 pre-existing Rule #12 violations that the
+  // old file-level skip made invisible, so they are frozen (see the justification
+  // blocks in check-error-helper.mjs). Freezing is only honest if every entry
+  // points at a file that exists — a typo here would silently disable the gate
+  // for a path that later gets "fixed" by rename.
+  //
+  // Note the allowlist was NOT empty before this change either in spirit: the
+  // previous assertion was a hardcoded `[]`, which passed for a set of zero and
+  // therefore could not detect a stale or bogus entry. The gate's own
+  // `assertNoStale` in main() catches entries that stop violating; this test
+  // catches entries that never existed.
+  assert.ok(allowlist.size > 0, "allowlist should not be empty after G-03");
+  for (const entry of allowlist) {
+    assert.ok(existsSync(new URL(`../../${entry}`, import.meta.url)), `missing file: ${entry}`);
+  }
+});
+
+async function assertRouteRemovedFromMissingHelperAllowlist(path: string) {
+  const source = await import("node:fs").then((fs) => fs.readFileSync(path, "utf8"));
+
+  assert.equal(allowlist.has(path), false);
+  assert.deepEqual(find([{ path, source }], EMPTY), []);
+  assert.ok(source.includes("sanitizeErrorMessage"));
+}
+
+test("import-json route has been removed from the shipped missing-helper allowlist", async () => {
+  await assertRouteRemovedFromMissingHelperAllowlist("src/app/api/settings/import-json/route.ts");
+});
+
+test("logs export route has been removed from the shipped missing-helper allowlist", async () => {
+  await assertRouteRemovedFromMissingHelperAllowlist("src/app/api/logs/export/route.ts");
+});
+
+test("proxy logs route has been removed from the shipped missing-helper allowlist", async () => {
+  await assertRouteRemovedFromMissingHelperAllowlist("src/app/api/usage/proxy-logs/route.ts");
+});
+
+test("models catalog route has been removed from the shipped missing-helper allowlist", async () => {
+  await assertRouteRemovedFromMissingHelperAllowlist("src/app/api/models/catalog/route.ts");
+});
+
+test("cli-tools backups route has been removed from the shipped missing-helper allowlist", async () => {
+  await assertRouteRemovedFromMissingHelperAllowlist("src/app/api/cli-tools/backups/route.ts");
+});
+
+test("cli-tools guide-settings route has been removed from the shipped missing-helper allowlist", async () => {
+  await assertRouteRemovedFromMissingHelperAllowlist(
+    "src/app/api/cli-tools/guide-settings/[toolId]/route.ts"
+  );
+});
+
+test("providers test-batch route has been removed from the shipped missing-helper allowlist", async () => {
+  await assertRouteRemovedFromMissingHelperAllowlist("src/app/api/providers/test-batch/route.ts");
 });
 
 test("returns multiple violating paths and preserves input order", () => {
   const files: FileEntry[] = [
     { path: "open-sse/executors/a.ts", source: `return { error: { message: err.message } };` },
-    { path: "open-sse/executors/b.ts", source: `import { x } from "../utils/error.ts"; return { error: err.message };` },
+    {
+      // G-03: `x` is not a canonical builder, so this import buys no trust and
+      // the raw `err.message` is a violation like any other.
+      path: "open-sse/executors/b.ts",
+      source: `import { x } from "../utils/error.ts"; return { error: err.message };`,
+    },
     { path: "open-sse/executors/c.ts", source: `return { error: e.stack };` },
   ];
-  assert.deepEqual(find(files, EMPTY), ["open-sse/executors/a.ts", "open-sse/executors/c.ts"]);
+  assert.deepEqual(find(files, EMPTY), [
+    "open-sse/executors/a.ts",
+    "open-sse/executors/b.ts",
+    "open-sse/executors/c.ts",
+  ]);
 });
 
 // --- 6A.8: expanded scope (MCP server + API route.ts) ---
@@ -211,6 +270,101 @@ test("6A.8: does NOT flag api route.ts that imports utils/error", () => {
   assert.deepEqual(result, []);
 });
 
+// --- G-11 (#15159): MCP tool-result shapes the gate historically could not see ---
+
+test("G-11: flags an MCP tool result built from an alias-laundered raw error", () => {
+  // The exact advancedTools.ts catch shape: `const msg = err.message` on one line,
+  // then `${msg}` interpolated into the client-facing tool result on a later line.
+  const src = `export async function handleThing(args: unknown) {
+  try {
+    return await apiFetch("/api/x");
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    return { content: [{ type: "text" as const, text: \`Error: \${msg}\` }], isError: true };
+  }
+}`;
+  const path = "open-sse/mcp-server/tools/advancedTools.ts";
+  assert.deepEqual(find([{ path, source: src } as FileEntry], EMPTY), [path]);
+});
+
+test("G-11: flags a raw-error ternary in a tool-result error field", () => {
+  // The handleTestCombo per-provider shape (advancedTools.ts:574): the raw error
+  // sits on its own `error:` line inside a returned result object — no builder call.
+  const src = `export async function runModel() {
+  try {
+    return await apiFetch("/v1/chat/completions");
+  } catch (err) {
+    return {
+      provider: "p",
+      success: false,
+      error: err instanceof Error ? err.message : String(err),
+    };
+  }
+}`;
+  const path = "open-sse/mcp-server/tools/advancedTools.ts";
+  assert.deepEqual(find([{ path, source: src } as FileEntry], EMPTY), [path]);
+});
+
+test("G-11: does NOT flag a tool result whose alias went through toSafeMcpErrorMessage", () => {
+  const src = `import { toSafeMcpErrorMessage } from "../errorMessage.ts";
+export async function handleThing() {
+  try {
+    return await apiFetch("/api/x");
+  } catch (err) {
+    const msg = toSafeMcpErrorMessage(err, "Tool failed");
+    return { content: [{ type: "text" as const, text: \`Error: \${msg}\` }], isError: true };
+  }
+}`;
+  const path = "open-sse/mcp-server/tools/advancedTools.ts";
+  assert.deepEqual(find([{ path, source: src } as FileEntry], EMPTY), []);
+});
+
+test("G-11: does NOT flag a tainted alias sanitized at the interpolation site", () => {
+  const src = `export async function handleThing() {
+  try {
+    return await apiFetch("/api/x");
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    return { content: [{ type: "text" as const, text: \`Error: \${sanitizeErrorMessage(msg)}\` }], isError: true };
+  }
+}`;
+  const path = "open-sse/mcp-server/tools/advancedTools.ts";
+  assert.deepEqual(find([{ path, source: src } as FileEntry], EMPTY), []);
+});
+
+// --- G-11 false-positive guards (found by running the tightened gate on the repo) ---
+
+test("G-11: does NOT read a ternary `err.message : String(err)` as a field named message", () => {
+  // `err.message : String(err)` contains the text `message :`, which looks exactly
+  // like an object field named `message` to a naive field matcher. A member access
+  // is not a field: the leading `.` must disqualify it. Without this the tightened
+  // gate flags every internal helper that merely formats an error message.
+  const src = `export function describeError(err: unknown): string {
+  const message = err instanceof Error ? err.message : String(err);
+  return err instanceof Error ? err.message : String(err);
+}`;
+  const path = "open-sse/mcp-server/audit.ts";
+  assert.deepEqual(find([{ path, source: src } as FileEntry], EMPTY), []);
+});
+
+test("G-11: does NOT flag a raw error inside a logToolCall audit row", () => {
+  // logToolCall writes the MCP audit DB row — the same internal-sink class the gate
+  // already exempts for saveCallLog. The handler re-throws, so nothing client-facing
+  // is built from errorMessage here.
+  const src = `export async function handleThing(args: unknown) {
+  try {
+    return await doThing();
+  } catch (error) {
+    const duration = Date.now() - start;
+    const errorMessage = error instanceof Error ? error.message : String(error);
+    await logToolCall("omniroute_thing", args, { error: errorMessage }, duration, false, "ERROR");
+    throw error;
+  }
+}`;
+  const path = "open-sse/mcp-server/tools/compressionTools.ts";
+  assert.deepEqual(find([{ path, source: src } as FileEntry], EMPTY), []);
+});
+
 // --- 6A.8: stale-allowlist enforcement ---
 
 // @ts-expect-error — reportStaleEntries exported from the gate module
@@ -234,15 +388,7 @@ test("6A.8 stale: no stale entries when all allowlist items are still live viola
 test("6A.8: the shipped allowlist freezes the new expanded-scope known violators (api routes)", () => {
   // These are the real violations found when expanding scope to src/app/api/**/route.ts.
   // They are frozen as pre-existing; fixing one requires removing it from the allowlist.
-  const expectedApiViolators = [
-    "src/app/api/cli-tools/backups/route.ts",
-    "src/app/api/cli-tools/guide-settings/[toolId]/route.ts",
-    "src/app/api/logs/export/route.ts",
-    "src/app/api/models/catalog/route.ts",
-    "src/app/api/providers/test-batch/route.ts",
-    "src/app/api/settings/import-json/route.ts",
-    "src/app/api/usage/proxy-logs/route.ts",
-  ];
+  const expectedApiViolators: string[] = [];
   for (const p of expectedApiViolators) {
     assert.ok(allowlist.has(p), `expected allowlist to contain pre-existing API violation: ${p}`);
   }

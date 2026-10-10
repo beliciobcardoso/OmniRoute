@@ -1,13 +1,13 @@
 ---
 title: "Compliance & Audit"
-version: 3.8.2
-lastUpdated: 2026-05-13
+version: 3.8.40
+lastUpdated: 2026-06-28
 ---
 
 # Compliance & Audit
 
 > **Source of truth:** `src/lib/compliance/`, `src/app/api/compliance/`
-> **Last updated:** 2026-05-13 — v3.8.0
+> **Last updated:** 2026-06-28 — v3.8.40
 
 OmniRoute records administrative actions, authentication events, provider
 credential lifecycle changes, and MCP tool invocations to SQLite-backed audit
@@ -114,7 +114,7 @@ Two separate retention windows are honoured:
 | `PROXY_LOGS_TABLE_MAX_ROWS` | `100000` | Row-cap trim for `proxy_logs`                                     |
 
 `cleanupExpiredLogs()` runs the retention pass. It is invoked on server startup
-from `src/server-init.ts` and `src/instrumentation-node.ts`. Each run logs a
+from `src/instrumentation-node.ts`. Each run logs a
 `compliance.cleanup` audit event with the per-table delete counts. Proxy/call
 log trimming is batched (`BATCH_SIZE = 5000`) to avoid long write locks.
 

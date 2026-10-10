@@ -6,11 +6,17 @@
  * Phase 2: 'standard' mode (caveman engine).
  * Phase 3: 'aggressive' mode (summarization + tool compression + aging).
  * Phase 4: 'ultra' mode (heuristic token pruning + optional SLM tier).
- * Phase 5: 'rtk' and 'stacked' modes (tool-output filters + multi-engine pipeline).
+ * Phase 5: 'rtk', 'codex-responses', and 'stacked' modes (tool-output filters + multi-engine pipeline).
  */
 
 import { ENGINE_IDS } from "./engineCatalog.ts";
 import type { ContextBudgetConfig } from "./adaptiveCompression/types.ts";
+import type { FidelityGateConfig } from "./fidelityGate.ts";
+import type { RiskGateConfig } from "./riskGate/riskGate.ts";
+import type { PipelineCircuitBreakerConfig } from "./pipelineEngineBreaker.ts";
+import type { RiskGateStats } from "./riskGate/riskGateStep.ts";
+import type { QuantumLockConfig, QuantumLockStats } from "./quantumLock/quantumPatterns.ts";
+import type { OmniGlyphAccounting } from "./omniglyphTelemetry.ts";
 
 // Re-export so consumers that already import from this module (e.g. src/lib/db/compression.ts)
 // can get ENGINE_IDS without a second bare `@omniroute/open-sse/...engineCatalog.ts` specifier.
@@ -26,6 +32,8 @@ export type CompressionMode =
   | "aggressive"
   | "ultra"
   | "rtk"
+  | "codex-responses"
+  | "omniglyph"
   | "stacked";
 export type CavemanIntensity = "lite" | "full" | "ultra";
 export type RtkIntensity = "minimal" | "standard" | "aggressive";
@@ -39,7 +47,10 @@ export type CompressionEngineId =
   | "session-dedup"
   | "headroom"
   | "ccr"
-  | "llmlingua";
+  | "llmlingua"
+  | "relevance"
+  | "omniglyph"
+  | "codex-responses";
 
 export interface CavemanRule {
   name: string;
@@ -92,6 +103,10 @@ export interface RtkConfig {
   trustProjectFilters: boolean;
   rawOutputRetention: RtkRawOutputRetention;
   rawOutputMaxBytes: number;
+  /** #10659: cap on total raw-output files before the oldest are purged. Default: 100_000. */
+  rawOutputMaxFiles?: number;
+  /** #10659: max age (days) of retained raw-output files. Default: 30. */
+  rawOutputMaxAgeDays?: number;
   /** R5: enable grouping of near-equivalent consecutive lines. Default: false. */
   enableGrouping?: boolean;
   /** R5: minimum consecutive similar-line run to trigger grouping. Default: 3. */
@@ -100,6 +115,29 @@ export interface RtkConfig {
   stripCodeComments?: boolean;
   /** R1/N3: keep JSDoc/docstring block comments when removing comments. Default: true. */
   preserveDocstrings?: boolean;
+  /** #10: semantic command-output renderers (default off) */
+  enableRenderers?: boolean;
+  /** #10: whitelist por command-type; vazio/undefined = todos */
+  renderers?: string[];
+}
+
+/** Conservative, lossless-first Responses tool-output compression controls. */
+export interface CodexResponsesConfig {
+  enabled: boolean;
+  minBytes: number;
+  maxOutputBytes: number;
+  maxCandidateBytes: number;
+  maxLines: number;
+  minSearchMatches: number;
+  minLogLines: number;
+  preserveToolNames: string[];
+}
+
+export interface RelevanceConfig {
+  enabled: boolean;
+  overlapThreshold: number;
+  budgetPercent: number;
+  boilerplateWeight: number;
 }
 
 export interface CompressionLanguageConfig {
@@ -119,6 +157,35 @@ export interface ContextEditingConfig {
   enabled: boolean;
 }
 
+/** Cache-aligned compression: freeze a previously transformed prefix and process only new items. */
+export interface LiveZoneConfig {
+  enabled: boolean;
+}
+
+/** Perfil semântico do OmniGlyph (pacote 1.4.0+). */
+export type OmniglyphProfile = "coding-safe" | "balanced" | "aggressive" | "passthrough";
+
+/**
+ * Política do OmniGlyph escolhida pelo operador.
+ *
+ * O perfil é um TETO: `mergeCompressionProfileOptions` do pacote não deixa um
+ * override reabrir uma lane que o perfil fechou. Trocar de `aggressive` para
+ * `coding-safe` mantém system, schemas de tools e tool results nativos, ao custo
+ * medido de a engine não fazer nada até a sessão acumular histórico
+ * (`minCompressChars` vai ao máximo). Por isso o default é `aggressive`.
+ */
+export interface OmniglyphConfig {
+  profile: OmniglyphProfile;
+}
+
+/** Lite detail settings for proactive request-time transformations. */
+export interface LiteConfig {
+  /** Truncate tool-result strings over this many characters before provider dispatch. */
+  maxToolLength?: number;
+  /** When false, skip proactive tool-result truncation. */
+  compressToolResults: boolean;
+}
+
 export interface CompressionPipelineStep {
   engine: CompressionEngineId;
   intensity?: CavemanIntensity | RtkIntensity;
@@ -130,27 +197,70 @@ export interface EngineToggle {
   level?: string;
 }
 
+/** T05/C5 — system-prompt preservation intent (see `CompressionConfig.preserveSystemPromptMode`). */
+export type PreserveSystemPromptMode = "always" | "whenNoCache" | "never";
+
 export interface CompressionConfig {
   enabled: boolean;
   defaultMode: CompressionMode;
   autoTriggerMode?: CompressionMode;
   autoTriggerTokens: number;
   cacheMinutes: number;
+  /**
+   * Effective, engine-facing boolean: when truthy the system prompt is skipped
+   * (preserved, not compressed). Kept as the materialized value all engines read.
+   * Its authoritative *intent* is `preserveSystemPromptMode` (T05/C5); this boolean
+   * is the no-cache projection of that mode, refined up to `true` by
+   * `resolveCacheAwareConfig` when a cacheable prefix is detected.
+   */
   preserveSystemPrompt: boolean;
+  /**
+   * T05/C5 — authoritative system-prompt preservation intent:
+   * - `always`: never compress the system prompt.
+   * - `whenNoCache`: compress it only when there is no cache to protect
+   *   (preserve when the provider caches or `cache_control` is present). This is the
+   *   behaviour the legacy `preserveSystemPrompt: false` already had via the cache guard.
+   * - `never`: always compress the system prompt, even when it breaks a prompt cache.
+   * Optional/back-compat: absent → derived from the legacy boolean
+   * (`false → whenNoCache`, otherwise `always`).
+   */
+  preserveSystemPromptMode?: PreserveSystemPromptMode;
   mcpDescriptionCompressionEnabled?: boolean;
   comboOverrides: Record<string, CompressionMode>;
   compressionComboId?: string | null;
   stackedPipeline?: CompressionPipelineStep[];
+  /** Política do engine OmniGlyph (perfil semântico). */
+  omniglyph?: OmniglyphConfig;
+  /** Opt-in QuantumLock cache-prefix stabilization (default off). */
+  quantumLock?: QuantumLockConfig;
+  /** Opt-in per-step fidelity gate (default disabled). */
+  fidelityGate?: FidelityGateConfig;
+  /** Opt-in risk-gate pre-pass: shields sensitive spans from compression (default disabled). */
+  riskGate?: RiskGateConfig;
+  /** T02 — opt-in per-engine circuit-breaker for the stacked pipeline (default disabled). */
+  pipelineCircuitBreaker?: PipelineCircuitBreakerConfig;
   cavemanConfig?: CavemanConfig;
   cavemanOutputMode?: CavemanOutputModeConfig;
   /** Phase 4A: selected output styles (supersedes cavemanOutputMode via a back-compat shim). */
   outputStyles?: OutputStyleSelectionEntry[];
   rtkConfig?: RtkConfig;
+  codexResponsesConfig?: CodexResponsesConfig;
+  relevanceConfig?: RelevanceConfig;
   languageConfig?: CompressionLanguageConfig;
   aggressive?: AggressiveConfig;
   ultra?: UltraConfig;
+  /** Lite proactive transformation detail settings. */
+  lite?: LiteConfig;
+  /** Headroom SmartCrusher detail settings (minRows gate). */
+  headroom?: HeadroomConfig;
+  /** Session Dedup detail settings (minBlockChars / fuzzy, #8388). */
+  sessionDedup?: SessionDedupConfig;
+  /** CCR (context-cache-retrieval) detail settings (minChars / retrievalRampFactor, #8388). */
+  ccr?: CcrConfig;
   /** Provider-delegated context editing (Claude/Anthropic only). */
   contextEditing?: ContextEditingConfig;
+  /** Opt-in cache-aligned live-zone compression (default disabled). */
+  liveZone?: LiveZoneConfig;
   /** Per-engine opt-in toggles for the config panel. */
   engines: Record<string, EngineToggle>;
   /** Active combo preset id, or null if none selected. */
@@ -170,6 +280,18 @@ export interface CompressionConfig {
    */
   contextBudget?: ContextBudgetConfig;
   /**
+   * Hard-budget post-pass (#17): compress to at most this many cl100k tokens.
+   * Runs after all stacked engines. Absent → no-op.
+   * When both targetTokens and targetRatio are set, targetTokens wins.
+   */
+  targetTokens?: number;
+  /**
+   * Hard-budget post-pass (#17): compress to at most this fraction (0–1) of original tokens.
+   * Runs after all stacked engines. Absent → no-op.
+   * When both targetTokens and targetRatio are set, targetTokens wins.
+   */
+  targetRatio?: number;
+  /**
    * Phase 4 (B): which tier the `ultra` mode uses.
    * "heuristic" = Tier-A token pruner (`pruneByScore`, default, byte-identical to pre-B).
    * "slm" = Tier-B LLMLingua-2 ONNX worker when available, else fail-open to Tier-A.
@@ -181,6 +303,15 @@ export interface CompressionConfig {
    * swallowed; the lazy first-call path still applies. Default false.
    */
   ultraSlmPrewarm?: boolean;
+  /** Opt-in result memoization for deterministic engines only (default off). */
+  memoizeCompressionResults?: boolean;
+  /**
+   * #8034 — per-model/endpoint compression exclusion filter. Patterns are matched
+   * case-insensitively against both the bare model id and the `provider/model`
+   * composite (`*` is the only wildcard). Absent/empty → no exclusions, default
+   * behavior unchanged. See `open-sse/services/compression/exclusions.ts`.
+   */
+  exclusions?: string[];
 }
 
 export interface CompressionStats {
@@ -197,6 +328,15 @@ export interface CompressionStats {
   validationWarnings?: string[];
   validationErrors?: string[];
   fallbackApplied?: boolean;
+  /** #7847 observability: true when this result was served from the result memo cache. */
+  memoHit?: boolean;
+  /**
+   * Contabilidade física do OmniGlyph, normalizada pelo próprio pacote
+   * (`normalizeAccounting`). Só número e enum — ver `omniglyphTelemetry.ts`
+   * para a allowlist e o que nunca pode entrar aqui.
+   */
+  omniglyph?: OmniGlyphAccounting;
+  riskGate?: RiskGateStats;
   /**
    * Phase 4 (B): which `ultra` tier actually ran for this request.
    * "slm" — Tier-B ran and produced the output.
@@ -232,7 +372,18 @@ export interface CompressionStats {
     techniquesUsed: string[];
     rulesApplied?: string[];
     durationMs?: number;
+    rejected?: boolean;
+    rejectReason?: string;
+    /** Contabilidade física — presente só no passo omniglyph que comprimiu. */
+    omniglyph?: OmniGlyphAccounting;
   }>;
+  /** Present only when QuantumLock stabilized ≥1 fragment this run. */
+  quantumLock?: QuantumLockStats;
+  liveZone?: {
+    cacheHit: boolean;
+    frozenItems: number;
+    liveItems: number;
+  };
 }
 
 export interface CompressionResult {
@@ -241,6 +392,32 @@ export interface CompressionResult {
   stats: CompressionStats | null;
 }
 
+export const DEFAULT_CODEX_RESPONSES_CONFIG: CodexResponsesConfig = {
+  enabled: false,
+  minBytes: 512,
+  maxOutputBytes: 2 * 1024 * 1024,
+  maxCandidateBytes: 512 * 1024,
+  maxLines: 160,
+  minSearchMatches: 8,
+  minLogLines: 24,
+  preserveToolNames: [
+    "Read",
+    "Glob",
+    "Grep",
+    "Write",
+    "Edit",
+    "WebSearch",
+    "WebFetch",
+    "read",
+    "glob",
+    "grep",
+    "write",
+    "edit",
+    "web_search",
+    "web_fetch",
+  ],
+};
+
 export const DEFAULT_COMPRESSION_CONFIG: CompressionConfig = {
   enabled: false,
   defaultMode: "off",
@@ -248,6 +425,7 @@ export const DEFAULT_COMPRESSION_CONFIG: CompressionConfig = {
   autoTriggerTokens: 0,
   cacheMinutes: 5,
   preserveSystemPrompt: true,
+  preserveSystemPromptMode: "always",
   mcpDescriptionCompressionEnabled: true,
   comboOverrides: {},
   compressionComboId: null,
@@ -259,6 +437,9 @@ export const DEFAULT_COMPRESSION_CONFIG: CompressionConfig = {
   activeComboId: null,
   ultraEngine: "heuristic",
   ultraSlmPrewarm: false,
+  liveZone: { enabled: false },
+  lite: { compressToolResults: true },
+  codexResponsesConfig: { ...DEFAULT_CODEX_RESPONSES_CONFIG },
 };
 
 export const DEFAULT_CAVEMAN_CONFIG: CavemanConfig = {
@@ -300,10 +481,13 @@ export const DEFAULT_RTK_CONFIG: RtkConfig = {
   trustProjectFilters: false,
   rawOutputRetention: "never",
   rawOutputMaxBytes: 1_048_576,
+  rawOutputMaxFiles: 100_000,
+  rawOutputMaxAgeDays: 30,
   enableGrouping: false,
   groupingThreshold: 3,
   stripCodeComments: false,
   preserveDocstrings: true,
+  enableRenderers: false,
 };
 
 export const DEFAULT_COMPRESSION_LANGUAGE_CONFIG: CompressionLanguageConfig = {
@@ -311,6 +495,16 @@ export const DEFAULT_COMPRESSION_LANGUAGE_CONFIG: CompressionLanguageConfig = {
   defaultLanguage: "en",
   autoDetect: true,
   enabledPacks: ["en"],
+};
+
+/**
+ * `aggressive` é a política que os recibos publicados mediram. Medido nesta
+ * base: com `coding-safe`/`balanced`, uma sessão sem histórico acumulado para em
+ * `below_min_chars` e a engine não faz nada — como o OmniGlyph é opt-in, esse
+ * default entregaria "ligado, 0% de ganho".
+ */
+export const DEFAULT_OMNIGLYPH_CONFIG: OmniglyphConfig = {
+  profile: "aggressive",
 };
 
 export const DEFAULT_CONTEXT_EDITING_CONFIG: ContextEditingConfig = {
@@ -409,6 +603,57 @@ export const DEFAULT_ULTRA_CONFIG: UltraConfig = {
   minScoreThreshold: 0.3,
   slmFallbackToAggressive: true,
   maxTokensPerMessage: 0,
+};
+
+// ─── Headroom SmartCrusher detail settings ───────────────────────────────────
+// Persisted under compression settings key `headroom`. Engine apply reads
+// minRows from stepConfig, which the stacked runner merges from this sub-object.
+
+/** Configuration for the Headroom SmartCrusher engine detail page. */
+export interface HeadroomConfig {
+  /**
+   * Minimum number of rows in a homogeneous JSON array to trigger tabular
+   * compaction. Default 8 (matches DEFAULT_MIN_ROWS in smartcrusher.ts).
+   * Operators may lower this (e.g. 5) for denser compaction on smaller arrays.
+   */
+  minRows: number;
+}
+
+export const DEFAULT_HEADROOM_CONFIG: HeadroomConfig = {
+  minRows: 8,
+};
+
+// ─── Session Dedup detail settings ───────────────────────────────────────────
+// Persisted under compression settings key `sessionDedup` (#8388 — was previously
+// rendered on the detail page but had no sub-object to save into).
+
+/** Configuration for the Session Dedup engine detail page. */
+export interface SessionDedupConfig {
+  /** Minimum character count for a suffix block to be a dedup candidate. Matches DEFAULT_MIN_BLOCK_CHARS=80. */
+  minBlockChars: number;
+  /** Opt-in fuzzy near-duplicate dedup (replaces ~85%+ similar messages with a CCR marker). */
+  fuzzy: boolean;
+}
+
+export const DEFAULT_SESSION_DEDUP_CONFIG: SessionDedupConfig = {
+  minBlockChars: 80,
+  fuzzy: false,
+};
+
+// ─── CCR (context-cache-retrieval) detail settings ───────────────────────────
+// Persisted under compression settings key `ccr` (#8388 — same gap as session-dedup).
+
+/** Configuration for the CCR engine detail page. */
+export interface CcrConfig {
+  /** Minimum character count for a block to be a CCR candidate. Matches DEFAULT_MIN_CHARS=600. */
+  minChars: number;
+  /** How steeply frequently-retrieved blocks resist compression; 1 disables the ramp. */
+  retrievalRampFactor: number;
+}
+
+export const DEFAULT_CCR_CONFIG: CcrConfig = {
+  minChars: 600,
+  retrievalRampFactor: 2,
 };
 
 export type { McpAccessibilityConfig } from "./engines/mcpAccessibility/constants.ts";

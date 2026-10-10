@@ -5,6 +5,7 @@
  * Security: Requires admin authentication (same as other management routes).
  * Safety: Update only runs if a newer version is available on npm.
  */
+import { createHash } from "node:crypto";
 import { NextRequest, NextResponse } from "next/server";
 import { execFile } from "child_process";
 import { promisify } from "util";
@@ -17,18 +18,41 @@ import {
   PROJECT_ROOT,
 } from "@/lib/system/autoUpdate";
 import { NEWS_JSON_URL, parseActiveNewsPayload } from "@/shared/utils/releaseNotes";
-import { isNewer, resolveLatestVersion } from "@/lib/system/versionCheck";
+import {
+  clearLatestVersionCache,
+  isNewer,
+  resolveDistTagsCached,
+  resolveLatestVersionCached,
+} from "@/lib/system/versionCheck";
+import { describeReleaseChannels } from "@/lib/system/releaseChannel";
+import { resolveGlobalOmniroutePath } from "@/lib/system/globalPackagePath";
+import { restartRunningServer } from "@/lib/system/processManagerRestart";
+import { APP_CONFIG } from "@/shared/constants/appConfig";
+// #5542 — On Windows npm is `npm.cmd`; Node ≥24 refuses to execFile a `.cmd` without
+// a shell (nodejs/node#52554 → "spawn npm ENOENT"). buildNpmExecOptions enables the
+// shell on win32 only; SERVICE_VERSION_PATTERN keeps the shell-joined version safe.
+import { buildNpmExecOptions, SERVICE_VERSION_PATTERN } from "@/lib/services/installers/utils";
 
 const execFileAsync = promisify(execFile);
 
 export const dynamic = "force-dynamic";
 
 function getCurrentVersion(): string {
-  try {
-    return require("../../../../../package.json").version as string;
-  } catch {
-    return "unknown";
-  }
+  return APP_CONFIG.version;
+}
+
+/**
+ * Shared restart step for both npm-mode update flows (source-checkout and global-install
+ * below). #11885: this used to hardcode `pm2 restart omniroute` in each branch separately
+ * and silently report "skipped" — reading like a completed update — whenever pm2 wasn't
+ * the process manager. `restartRunningServer()` tries OmniRoute's own PID-file-managed
+ * supervisor first, then pm2, and this wrapper turns its honest "restart-required" outcome
+ * into an SSE step the dashboard renders as a warning instead of a false "done".
+ */
+async function sendRestartStep(send: (data: Record<string, unknown>) => void): Promise<void> {
+  send({ step: "restart", status: "running", message: "Restarting service..." });
+  const outcome = await restartRunningServer();
+  send({ step: "restart", status: outcome.status, message: outcome.message });
 }
 
 async function getNews() {
@@ -50,22 +74,45 @@ export async function GET(req: NextRequest) {
   const current = getCurrentVersion();
   const config = getAutoUpdateConfig();
 
-  const [latest, news, validation] = await Promise.all([
-    resolveLatestVersion(),
+  const cacheControl = req.headers.get("Cache-Control") ?? "";
+  const cacheOptions = {
+    bypassCache: /(?:^|,)\s*(?:no-cache|no-store)\b/i.test(cacheControl),
+    storeResult: !/(?:^|,)\s*no-store\b/i.test(cacheControl),
+  };
+  const [latest, distTags, news, validation] = await Promise.all([
+    resolveLatestVersionCached(cacheOptions),
+    resolveDistTagsCached(cacheOptions),
     getNews(),
     validateAutoUpdateRuntime(config),
   ]);
+  // Additive (rail 3.8.54): `channel` keeps meaning the deployment mode
+  // (npm / source / docker-compose) the dashboard updater relies on; the npm
+  // release channel of the running build is `releaseChannel`.
+  const { releaseChannel, channels } = describeReleaseChannels(current, distTags, latest);
 
-  const updateAvailable = isNewer(latest, current);
-
-  return NextResponse.json({
+  const body = {
     current,
     latest: latest ?? "unavailable",
-    updateAvailable,
+    updateAvailable: isNewer(latest, current),
     channel: config.mode,
     autoUpdateSupported: validation.supported,
     autoUpdateError: validation.reason,
     news,
+    releaseChannel,
+    channels,
+  };
+  const serialized = JSON.stringify(body);
+  const etag = `"${createHash("sha256").update(serialized).digest("base64url")}"`;
+  const headers = { "Cache-Control": "private, no-cache, must-revalidate", ETag: etag };
+  const validators = req.headers
+    .get("If-None-Match")
+    ?.split(",")
+    .map((value) => value.trim());
+  if (validators?.some((value) => value === etag || value === `W/${etag}`)) {
+    return new NextResponse(null, { status: 304, headers });
+  }
+  return new NextResponse(serialized, {
+    headers: { ...headers, "Content-Type": "application/json" },
   });
 }
 
@@ -75,7 +122,7 @@ export async function POST(req: NextRequest) {
   }
 
   const current = getCurrentVersion();
-  const latest = await resolveLatestVersion();
+  const latest = await resolveLatestVersionCached({ bypassCache: true });
 
   if (!latest) {
     return NextResponse.json(
@@ -123,6 +170,7 @@ export async function POST(req: NextRequest) {
       );
     }
 
+    clearLatestVersionCache();
     return NextResponse.json({
       success: true,
       message: `Update to v${latest} started. Docker rebuild is running in the background.`,
@@ -207,10 +255,11 @@ export async function POST(req: NextRequest) {
             status: "running",
             message: "Installing dependencies...",
           });
-          await execFileAsync("npm", ["install", "--legacy-peer-deps"], {
-            timeout: 300_000,
-            cwd: PROJECT_ROOT,
-          });
+          await execFileAsync(
+            "npm",
+            ["install", "--legacy-peer-deps"],
+            buildNpmExecOptions(process.platform, { cwd: PROJECT_ROOT, timeoutMs: 300_000 })
+          );
           send({ step: "rebuild", status: "done", message: "Dependencies installed" });
 
           try {
@@ -227,26 +276,14 @@ export async function POST(req: NextRequest) {
             status: "running",
             message: "Building application...",
           });
-          await execFileAsync("npm", ["run", "build"], {
-            timeout: 600_000,
-            cwd: PROJECT_ROOT,
-          });
+          await execFileAsync(
+            "npm",
+            ["run", "build"],
+            buildNpmExecOptions(process.platform, { cwd: PROJECT_ROOT, timeoutMs: 600_000 })
+          );
           send({ step: "rebuild", status: "done", message: "Build complete" });
 
-          send({ step: "restart", status: "running", message: "Restarting service..." });
-          try {
-            await execFileAsync("pm2", ["restart", "omniroute", "--update-env"], {
-              timeout: 30_000,
-              cwd: PROJECT_ROOT,
-            });
-            send({ step: "restart", status: "done", message: "Service restarted" });
-          } catch {
-            send({
-              step: "restart",
-              status: "skipped",
-              message: "PM2 not available — manual restart needed",
-            });
-          }
+          await sendRestartStep(send);
 
           send({
             step: "complete",
@@ -285,15 +322,20 @@ export async function POST(req: NextRequest) {
 
       try {
         // Step 1: Install
+        // #5542 — buildNpmExecOptions enables the shell on win32 (npm.cmd), which
+        // shell-joins argv, so the version spec must be metacharacter-free before it
+        // reaches the command line (Hard Rule #13).
+        if (!SERVICE_VERSION_PATTERN.test(latest)) {
+          send({ step: "install", status: "error", message: "Invalid version format" });
+          controller.close();
+          return;
+        }
         send({ step: "install", status: "running", message: `Installing omniroute@${latest}...` });
-          await execFileAsync(
-            "npm",
-            ["install", "-g", `omniroute@${latest}`, "--ignore-scripts", "--legacy-peer-deps"],
-            {
-              timeout: 300000,
-              cwd: PROJECT_ROOT,
-            }
-          );
+        await execFileAsync(
+          "npm",
+          ["install", "-g", `omniroute@${latest}`, "--ignore-scripts", "--legacy-peer-deps"],
+          buildNpmExecOptions(process.platform, { cwd: PROJECT_ROOT, timeoutMs: 300_000 })
+        );
         send({ step: "install", status: "done", message: `Installed omniroute@${latest}` });
 
         // Step 2: Rebuild native modules (critical for better-sqlite3)
@@ -302,37 +344,18 @@ export async function POST(req: NextRequest) {
           status: "running",
           message: "Rebuilding native modules (better-sqlite3)...",
         });
-          const globalRoot = (
-            await execFileAsync("npm", ["root", "-g"], { timeout: 10000, cwd: PROJECT_ROOT })
-          ).stdout.trim();
-        const omniPath = `${globalRoot}/omniroute/app`;
+        const omniPath = await resolveGlobalOmniroutePath();
         await execFileAsync(
           "npm",
           ["rebuild", "better-sqlite3"],
-          {
-            cwd: omniPath,
-            timeout: 120000,
-          }
+          buildNpmExecOptions(process.platform, { cwd: omniPath, timeoutMs: 120_000 })
         );
         send({ step: "rebuild", status: "done", message: "Native modules rebuilt" });
 
-        // Step 3: Restart PM2
-        send({ step: "restart", status: "running", message: "Restarting service via PM2..." });
-          try {
-            await execFileAsync("pm2", ["restart", "omniroute", "--update-env"], {
-              timeout: 30000,
-              cwd: PROJECT_ROOT,
-            });
-            send({ step: "restart", status: "done", message: "Service restarted" });
-          } catch {
-            // PM2 may not be available (Docker/manual setups)
-            send({
-              step: "restart",
-              status: "skipped",
-              message: "PM2 not available — manual restart needed",
-            });
-          }
+        // Step 3: Restart
+        await sendRestartStep(send);
 
+        clearLatestVersionCache();
         send({
           step: "complete",
           status: "done",

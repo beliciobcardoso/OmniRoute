@@ -96,6 +96,10 @@ export const DEFAULT_OBFUSCATE_WORDS = [
   // Open WebUI additions
   "openwebui",
   "open-webui",
+  // Do not add "hermes" / "hermes-agent" here. #8350 is handled by
+  // HERMES_PARAGRAPH_ANCHORS + HERMES_IDENTITY_PREFIXES (system-prompt
+  // drops only). ZWJ on the short substring "hermes" rewrites user
+  // messages and hostnames (#10484).
 ];
 
 /**
@@ -117,6 +121,19 @@ export const PI_PARAGRAPH_ANCHORS = [
   "/.pi/",
   "Pi documentation (read only when the user asks about pi itself",
 ];
+
+/**
+ * Hermes (NousResearch/hermes-agent) paragraph anchors — the doc-link
+ * paragraph injected by `agent/prompt_builder.py` on the upstream CLI.
+ * Added on top of the other anchor lists for #8350.
+ */
+export const HERMES_PARAGRAPH_ANCHORS = [
+  "hermes-agent.nousresearch.com",
+  "github.com/NousResearch/hermes-agent",
+];
+
+/** Hermes identity paragraph prefixes ("You are Hermes Agent, ..."). */
+export const HERMES_IDENTITY_PREFIXES = ["You are Hermes Agent"];
 
 // ────────────────────────────────────────────────────────────────────────────
 // Per-provider defaults.
@@ -164,12 +181,18 @@ export const DEFAULT_CLAUDE_PIPELINE: TransformOp[] = [
       ...DEFAULT_PARAGRAPH_REMOVAL_ANCHORS,
       ...OPENWEBUI_PARAGRAPH_ANCHORS,
       ...PI_PARAGRAPH_ANCHORS,
+      ...HERMES_PARAGRAPH_ANCHORS,
     ],
   },
-  // Drop "You are OpenCode" + "You are Open WebUI" identity paragraphs.
+  // Drop "You are OpenCode" + "You are Open WebUI" + "You are Hermes Agent"
+  // identity paragraphs.
   {
     kind: "drop_paragraph_if_starts_with",
-    prefixes: [...DEFAULT_IDENTITY_PREFIXES, ...OPENWEBUI_IDENTITY_PREFIXES],
+    prefixes: [
+      ...DEFAULT_IDENTITY_PREFIXES,
+      ...OPENWEBUI_IDENTITY_PREFIXES,
+      ...HERMES_IDENTITY_PREFIXES,
+    ],
   },
   // Replace the "Here is some useful information about the environment you are
   // running in:" billing-gate trigger phrase + the "if OpenCode honestly"
@@ -319,9 +342,17 @@ function applyObfuscateWords(body: RequestBody, op: ObfuscateWordsOp): void {
       if (typeof content === "string") {
         msg.content = obfuscateWithList(content, words);
       } else if (Array.isArray(content)) {
-        for (const block of content as Array<Record<string, unknown>>) {
-          if (typeof block.text === "string") {
-            block.text = obfuscateWithList(block.text, words);
+        // A signed Anthropic thinking turn covers its text siblings too. Leave
+        // the entire turn byte-for-byte intact so its signature remains valid.
+        const blocks = content as Array<Record<string, unknown>>;
+        const hasSignedThinking = blocks.some(
+          (block) => block?.type === "thinking" || block?.type === "redacted_thinking"
+        );
+        if (!hasSignedThinking) {
+          for (const block of blocks) {
+            if (typeof block.text === "string") {
+              block.text = obfuscateWithList(block.text, words);
+            }
           }
         }
       }
@@ -430,6 +461,44 @@ export function applySystemTransformPipeline(
   return applyTransformPipeline(body, providerConfig.pipeline);
 }
 
+/**
+ * Providers whose executor already runs the transforms pipeline on its own wire
+ * body: native `claude` (executors/base.ts) and the Claude-Code bridge
+ * (services/claudeCodeCompatible.ts) + every `anthropic-compatible-cc-*`
+ * provider sharing that config. The generic chatCore entry point must skip
+ * them so their configured ops never run twice for a single request.
+ */
+export function isSystemTransformsHandledDownstream(providerId: string): boolean {
+  if (!providerId) return false;
+  return (
+    providerId === PROVIDER_CLAUDE ||
+    providerId === PROVIDER_CC_BRIDGE ||
+    providerId.startsWith(`${PROVIDER_CC_BRIDGE}-`)
+  );
+}
+
+/**
+ * Generic per-provider entry point for providers whose executor does NOT apply
+ * the pipeline itself — the "any other provider key" case the module docstring
+ * covers (e.g. `kiro`, `antigravity`). No-op unless that exact provider key has
+ * an enabled pipeline in `systemTransforms.providers`.
+ *
+ * Claude-native and the Claude-Code bridge are intentionally skipped: their own
+ * wire paths already apply the same config downstream.
+ */
+export function applyProviderSystemTransforms(
+  providerId: string,
+  body: RequestBody,
+  config?: SystemTransformsConfig
+): ApplyPipelineResult {
+  if (isSystemTransformsHandledDownstream(providerId)) {
+    return { body, appliedOpKinds: [] };
+  }
+  return config === undefined
+    ? applySystemTransformPipeline(providerId, body)
+    : applySystemTransformPipeline(providerId, body, config);
+}
+
 function resolveProviderConfig(
   providerId: string,
   config: SystemTransformsConfig
@@ -449,7 +518,23 @@ function resolveProviderConfig(
 // Runtime singleton.
 // ────────────────────────────────────────────────────────────────────────────
 
-let _systemTransformsConfig: SystemTransformsConfig = DEFAULT_SYSTEM_TRANSFORMS_CONFIG;
+// Backed by globalThis so the config is shared across the SEPARATE webpack module
+// graphs Next.js builds for `instrumentation.ts` (boot-time hydration via
+// applyRuntimeSettings → setSystemTransformsConfig) and the app-route / open-sse
+// executors (per-request reads in base.ts / claudeCodeCompatible.ts). A module-local
+// `let` is duplicated per graph, so a Settings-UI override applied at boot never
+// reaches the request path (the #5312-class module-graph bug; the protective
+// compiled default still runs, but operator customizations were silently dropped).
+// Mirrors systemPrompt.ts (#2470) and thinkingBudget.ts (#5312).
+const GLOBAL_KEY = "__omniroute_systemTransforms_config__";
+const _store = globalThis as unknown as Record<string, SystemTransformsConfig | undefined>;
+
+function getStore(): SystemTransformsConfig {
+  if (!_store[GLOBAL_KEY]) {
+    _store[GLOBAL_KEY] = DEFAULT_SYSTEM_TRANSFORMS_CONFIG;
+  }
+  return _store[GLOBAL_KEY]!;
+}
 
 /**
  * Replace the active system-transforms config. Called from
@@ -460,14 +545,14 @@ let _systemTransformsConfig: SystemTransformsConfig = DEFAULT_SYSTEM_TRANSFORMS_
  */
 export function setSystemTransformsConfig(input: unknown): void {
   if (!input || typeof input !== "object") {
-    _systemTransformsConfig = DEFAULT_SYSTEM_TRANSFORMS_CONFIG;
+    _store[GLOBAL_KEY] = DEFAULT_SYSTEM_TRANSFORMS_CONFIG;
     return;
   }
   const candidate = input as Record<string, unknown>;
 
   // Legacy shape: { enabled, pipeline } → migrate to per-provider map.
   if ("pipeline" in candidate && Array.isArray(candidate.pipeline)) {
-    _systemTransformsConfig = {
+    _store[GLOBAL_KEY] = {
       providers: {
         ...DEFAULT_SYSTEM_TRANSFORMS_CONFIG.providers,
         [PROVIDER_CC_BRIDGE]: {
@@ -500,17 +585,17 @@ export function setSystemTransformsConfig(input: unknown): void {
         next.providers[providerId] = providerDefault;
       }
     }
-    _systemTransformsConfig = next;
+    _store[GLOBAL_KEY] = next;
     return;
   }
 
-  _systemTransformsConfig = DEFAULT_SYSTEM_TRANSFORMS_CONFIG;
+  _store[GLOBAL_KEY] = DEFAULT_SYSTEM_TRANSFORMS_CONFIG;
 }
 
 export function getSystemTransformsConfig(): SystemTransformsConfig {
-  return _systemTransformsConfig;
+  return getStore();
 }
 
 export function resetSystemTransformsConfig(): void {
-  _systemTransformsConfig = DEFAULT_SYSTEM_TRANSFORMS_CONFIG;
+  _store[GLOBAL_KEY] = DEFAULT_SYSTEM_TRANSFORMS_CONFIG;
 }

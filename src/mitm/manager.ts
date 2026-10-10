@@ -2,17 +2,35 @@ import { spawn, type ChildProcess } from "child_process";
 import path from "path";
 import fs from "fs";
 import { resolveMitmDataDir } from "./dataDir.ts";
-import { addDNSEntry, addDNSEntries, removeDNSEntry, removeDNSEntries } from "./dns/dnsConfig.ts";
+import {
+  removeDNSEntry,
+  removeDNSEntries,
+  checkDNSEntryForAgent,
+  checkDNSEntry,
+} from "./dns/dnsConfig.ts";
+import { provisionDnsEntries } from "./dns/provision.ts";
 import { generateCert } from "./cert/generate.ts";
-import { installCert, uninstallCert } from "./cert/install.ts";
+import { installCertResult, installCaCert } from "./cert/install.ts";
+import { loadOrCreateMitmCa, resolveMitmCertDir } from "./cert/rootCa.ts";
+import { resolveActiveCertPath } from "./cert/activeCert.ts";
 import { ALL_TARGETS } from "./targets/index.ts";
 import { detectAgent } from "./detection/index.ts";
 import type { AgentId, DetectionResult, MitmTarget } from "./types.ts";
 import { getAllAgentBridgeStates } from "@/lib/db/agentBridgeState.ts";
-import { listCustomHosts } from "@/lib/db/inspectorCustomHosts.ts";
 import { getUserBypassPatterns } from "@/lib/db/agentBridgeBypass.ts";
+import { getGheCopilotHosts } from "@/lib/db/providers.ts";
 import { configureUpstreamCa } from "./upstreamTrust.ts";
 import { createLogger } from "@/shared/utils/logger.ts";
+import {
+  buildRepairPlan,
+  collectManagedHosts,
+  performRepairSteps,
+  type RepairPlan,
+} from "./repair.ts";
+import { runPrivilegedMitmStep } from "./privilegedMitmStep.ts";
+import { removeDnsEntriesAfterFailedStart, removeStopDnsEntries } from "./stopDnsTeardown.ts";
+
+export { buildRepairPlan, collectManagedHosts, type RepairPlan };
 
 const log = createLogger("mitm-manager");
 
@@ -55,6 +73,44 @@ export function interpretMitmStartupError(stderr: string, port: number): string 
 // Store server process
 let serverProcess: ChildProcess | null = null;
 let serverPid: number | null = null;
+
+/**
+ * Test-only seam: install a fake server process (and pid) so stopMitm() can be
+ * exercised without spawning a real MITM child. Not part of the public API —
+ * only intended for unit tests that need to assert stopMitm()'s DNS/kill
+ * ordering (#1809). No-op in production code paths.
+ */
+export function __setServerProcessForTest(proc: ChildProcess | null, pid: number | null): void {
+  serverProcess = proc;
+  serverPid = pid;
+}
+
+// Set while startMitm() is in flight, from the guard check through spawn.
+// Guards a TOCTOU race: the "already running" check above only trips once
+// `serverProcess` is assigned by spawn() — ~130 lines and several awaits
+// later (DNS entries, cert generation, cert install). Two concurrent
+// startMitm() calls would both pass that check before either assigns
+// serverProcess. (upstream 9router#2316)
+let mitmStarting = false;
+
+/**
+ * Attempt to acquire the single-flight "MITM server is starting" lock.
+ * Returns `true` if acquired — the caller must release it via
+ * `releaseMitmStartLock()` in a `finally` block — or `false` if another
+ * `startMitm()` call already holds it. Exported so the concurrency guard is
+ * unit-testable without exercising startMitm()'s full side effects
+ * (DNS/cert/spawn).
+ */
+export function tryAcquireMitmStartLock(): boolean {
+  if (mitmStarting) return false;
+  mitmStarting = true;
+  return true;
+}
+
+/** Release the single-flight start lock acquired via `tryAcquireMitmStartLock()`. */
+export function releaseMitmStartLock(): void {
+  mitmStarting = false;
+}
 
 // Set when getMitmStatus() finds a stale PID file (server died without clean
 // teardown). The dashboard surfaces this to offer a one-click Repair. Cleared
@@ -114,7 +170,7 @@ export function writeTargetsJson(targets: MitmTarget[] = ALL_TARGETS): void {
     targets: targets.map((t) => ({
       id: t.id,
       name: t.name,
-      hosts: t.hosts,
+      hosts: t.id === "ghe-copilot" ? [...new Set([...t.hosts, ...getGheCopilotHosts()])] : t.hosts,
       endpointPatterns: t.endpointPatterns,
       viability: t.viability ?? "supported",
     })),
@@ -178,8 +234,12 @@ const urlPath =
     ? decodeURIComponent(MITM_SERVER_URL.pathname.slice(1))
     : decodeURIComponent(MITM_SERVER_URL.pathname);
 
-const cwdPath = path.join(process.cwd(), "src", "mitm", "server.cjs");
-const MITM_SERVER_PATH = fs.existsSync(cwdPath) ? cwdPath : urlPath;
+// Lazy-resolve to avoid module-level fs.existsSync + process.cwd() at module scope,
+// which causes Turbopack's NFT tracer to follow the path into the entire src/ tree.
+function resolveMitmServerPath(): string {
+  const cwdPath = path.join(/* turbopackIgnore: true */ process.cwd(), "src", "mitm", "server.cjs");
+  return fs.existsSync(cwdPath) ? cwdPath : urlPath;
+}
 
 // Check if a PID is alive
 function isProcessAlive(pid: number): boolean {
@@ -192,109 +252,19 @@ function isProcessAlive(pid: number): boolean {
 }
 
 /**
- * Enumerate every hostname OmniRoute may have written to /etc/hosts during
- * startMitm(): the full agent-target registry plus all custom hosts. Removal
- * via removeDNSEntries() is idempotent (absent entries are skipped), so this
- * set is intentionally over-inclusive — a host that was never spoofed costs
- * nothing to "remove", but a host we forget to list leaks machine-wide.
- * (Gap 8 — clean-stop DNS leak.)
- */
-export function collectManagedHosts(): string[] {
-  const hosts = new Set<string>();
-  for (const target of ALL_TARGETS) {
-    for (const h of target.hosts) hosts.add(h);
-  }
-  try {
-    for (const ch of listCustomHosts()) hosts.add(ch.host);
-  } catch (err) {
-    log.error({ err }, "collectManagedHosts: failed to read custom hosts (continuing)");
-  }
-  return [...hosts];
-}
-
-export interface RepairPlan {
-  dnsHostsToRemove: string[];
-  removeCert: boolean;
-  revertSystemProxy: boolean;
-}
-
-/**
- * Pure description of what a repair must undo. Separated from repairMitm() so
- * the enumeration is unit-testable without touching the OS or requiring sudo.
- * (Gap 7.)
- */
-export function buildRepairPlan(): RepairPlan {
-  return {
-    dnsHostsToRemove: collectManagedHosts(),
-    removeCert: true,
-    revertSystemProxy: true,
-  };
-}
-
-/**
- * Best-effort revert of an applied system proxy. The applied state lives
- * in-memory (captureState), so this only succeeds within the same process that
- * applied it; after a crash the previousState is gone and this is a no-op. DNS
- * + cert teardown are always reversible because they read on-disk state.
- */
-async function revertSystemProxyIfApplied(): Promise<boolean> {
-  try {
-    const { getSystemProxyState, clearSystemProxy } = await import(
-      "@/lib/inspector/captureState"
-    );
-    const state = getSystemProxyState();
-    if (!state.applied || !state.previousState) return false;
-    const { revert } = await import("./inspector/systemProxyConfig.ts");
-    await revert(state.previousState);
-    clearSystemProxy();
-    return true;
-  } catch (err) {
-    log.error({ err }, "revertSystemProxyIfApplied failed (continuing)");
-    return false;
-  }
-}
-
-/**
  * Undo every system mutation startMitm() may have made, WITHOUT requiring the
  * MITM server to be running. Safe to call when state is already clean (every
  * step is idempotent). Used by: the /repair route, the CLI cleanup subcommand,
  * and the stale-PID auto-repair on app startup. (Gap 7 — the application-layer
- * analogue of ProxyBridge's destructor + `--cleanup`.)
+ * analogue of ProxyBridge's destructor + `--cleanup`.) Steps 1-3 (DNS, cert,
+ * system-proxy) are delegated to `./repair.ts::performRepairSteps()`; the PID
+ * file + in-memory session cleanup below stays here since it touches this
+ * module's private state.
  */
 export async function repairMitm(sudoPassword: string): Promise<{ repaired: string[] }> {
-  const plan = buildRepairPlan();
-  const repaired: string[] = [];
+  const repaired = await performRepairSteps(sudoPassword);
 
-  // 1. DNS — remove every host we may have spoofed (idempotent, reads /etc/hosts).
-  try {
-    await removeDNSEntry(sudoPassword);
-    if (plan.dnsHostsToRemove.length > 0) {
-      await removeDNSEntries(plan.dnsHostsToRemove, sudoPassword);
-    }
-    repaired.push("dns");
-  } catch (err) {
-    log.error({ err }, "repairMitm: DNS cleanup failed (continuing)");
-  }
-
-  // 2. Certificate — uninstall the MITM root CA from the trust store.
-  if (plan.removeCert) {
-    try {
-      const certPath = path.join(resolveMitmDataDir(), "mitm", "server.crt");
-      if (fs.existsSync(certPath)) {
-        await uninstallCert(sudoPassword, certPath);
-        repaired.push("cert");
-      }
-    } catch (err) {
-      log.error({ err }, "repairMitm: cert removal failed (continuing)");
-    }
-  }
-
-  // 3. System proxy — best-effort revert if applied in this process.
-  if (plan.revertSystemProxy) {
-    if (await revertSystemProxyIfApplied()) repaired.push("system-proxy");
-  }
-
-  // 4. Stale PID file.
+  // Stale PID file.
   try {
     if (fs.existsSync(PID_FILE)) fs.unlinkSync(PID_FILE);
   } catch {
@@ -309,32 +279,99 @@ export async function repairMitm(sudoPassword: string): Promise<{ repaired: stri
 
 /**
  * Best-effort JS surrogate for ProxyBridge's library destructor + crash signal
- * handler. On SIGINT/SIGTERM we terminate the spawned child and warn that
- * privileged cleanup (DNS/CA/proxy) still requires a Repair — we have no sudo
- * password in a signal handler. Idempotent; never blocks process exit. (Gap 7.)
+ * handler. On SIGINT/SIGTERM we terminate the spawned child and, when a sudo
+ * password is already cached for this session (getCachedPassword()), also
+ * best-effort revert the privileged /etc/hosts entries — so a clean Ctrl+C /
+ * tray-quit does not always leave orphaned state for a manual Repair. Without
+ * a cached password we cannot prompt for one inside a signal handler, so we
+ * fall back to flagging `_orphanedStateDetected`, exactly as before.
+ * Idempotent; never blocks process exit. (Gap 7.)
  */
 export function installCleanupHandlers(): void {
   if (_cleanupHandlersInstalled) return;
   _cleanupHandlersInstalled = true;
   const onSignal = (signal: string) => {
-    try {
-      if (serverProcess && !serverProcess.killed) serverProcess.kill("SIGTERM");
-    } catch {
-      // ignore
-    }
-    log.warn(
-      { signal },
-      "MITM parent received signal — child terminated; run Repair if DNS/CA/proxy were applied."
-    );
+    void handleExitCleanup(signal);
   };
   process.once("SIGINT", () => onSignal("SIGINT"));
   process.once("SIGTERM", () => onSignal("SIGTERM"));
 }
 
 /**
- * Get MITM status
+ * Exit-cleanup body extracted from installCleanupHandlers() so it is directly
+ * unit-testable (no real OS signal needs to be delivered to the test
+ * process). Terminates the spawned MITM child, then:
+ *   - if a sudo password is cached in this session, best-effort reverts every
+ *     managed /etc/hosts entry via the same `removeDNSEntry` +
+ *     `removeDNSEntries(collectManagedHosts())` pair stopMitm() uses, so the
+ *     hosts file does not stay spoofed after a clean signal-driven exit;
+ *   - otherwise flags `_orphanedStateDetected` (surfaced by getMitmStatus()
+ *     for the dashboard's one-click Repair) — we have no way to prompt for a
+ *     password inside a signal handler. (Gap 7.)
+ * @param _depsOverride - optional dependency override, used in tests for DI.
  */
-export async function getMitmStatus(): Promise<{
+export async function handleExitCleanup(
+  signal: string,
+  _depsOverride?: {
+    getCachedPassword?: () => string | null;
+    removeDNSEntry?: (sudoPassword: string) => Promise<void>;
+    removeDNSEntries?: (hosts: string[], sudoPassword: string) => Promise<void>;
+    collectManagedHosts?: () => string[];
+  }
+): Promise<void> {
+  const deps = {
+    getCachedPassword: _depsOverride?.getCachedPassword ?? getCachedPassword,
+    removeDNSEntry: _depsOverride?.removeDNSEntry ?? removeDNSEntry,
+    removeDNSEntries: _depsOverride?.removeDNSEntries ?? removeDNSEntries,
+    collectManagedHosts: _depsOverride?.collectManagedHosts ?? collectManagedHosts,
+  };
+
+  try {
+    if (serverProcess && !serverProcess.killed) serverProcess.kill("SIGTERM");
+  } catch {
+    // ignore
+  }
+
+  const sudoPassword = deps.getCachedPassword();
+  if (!sudoPassword) {
+    _orphanedStateDetected = true;
+    log.warn(
+      { signal },
+      "MITM parent received signal — child terminated; no cached sudo password, run Repair if DNS/CA/proxy were applied."
+    );
+    return;
+  }
+
+  try {
+    await deps.removeDNSEntry(sudoPassword);
+    const managed = deps.collectManagedHosts();
+    if (managed.length > 0) {
+      await deps.removeDNSEntries(managed, sudoPassword);
+    }
+    log.info(
+      { signal },
+      "MITM parent received signal — child terminated and privileged /etc/hosts entries reverted."
+    );
+  } catch (err) {
+    _orphanedStateDetected = true;
+    log.error(
+      { err, signal },
+      "MITM parent received signal — hosts cleanup failed; run Repair if DNS/CA/proxy were applied."
+    );
+  }
+}
+
+/**
+ * Get MITM status.
+ *
+ * @param agentId - Optional agent whose hosts should be checked in DNS. When
+ * omitted, preserves the legacy Antigravity-only check (unchanged behavior
+ * for the existing no-agentId call sites: state/route.ts, server/route.ts,
+ * settings/mitm/route.ts, cli-tools/antigravity-mitm/route.ts). When
+ * provided (e.g. by the diagnose route), checks that agent's own hosts
+ * instead of always checking the Antigravity host set (#8466).
+ */
+export async function getMitmStatus(agentId?: string): Promise<{
   running: boolean;
   pid: number | null;
   dnsConfigured: boolean;
@@ -366,18 +403,29 @@ export async function getMitmStatus(): Promise<{
     }
   }
 
-  // Check DNS configuration
+  // Check DNS configuration. When an agentId is provided, check THAT agent's
+  // own hosts (#8466) instead of always checking the Antigravity host set.
+  // Fix #8656: no-agentId path now uses checkDNSEntry() which is Windows-aware
+  // (reads HOSTS_FILE = C:\Windows\System32\drivers\etc\hosts on Windows).
   let dnsConfigured = false;
   try {
-    const hostsContent = fs.readFileSync("/etc/hosts", "utf-8");
-    dnsConfigured = /\bdaily-cloudcode-pa\.googleapis\.com\b/.test(hostsContent);
+    if (agentId) {
+      dnsConfigured = checkDNSEntryForAgent(agentId);
+    } else {
+      // Use Windows-aware checkDNSEntry() instead of hardcoded /etc/hosts
+      dnsConfigured = checkDNSEntry();
+    }
   } catch {
     // Ignore
   }
 
-  // Check cert
+  // Check cert. #14070: resolve the file the active migration decision
+  // actually installs (ca.crt under the root-CA model), not always the
+  // legacy server.crt — otherwise a root-CA install with no leaf ever
+  // generated would wrongly report certExists:false.
   const certDir = path.join(resolveMitmDataDir(), "mitm");
-  const certExists = fs.existsSync(path.join(certDir, "server.crt"));
+  const rootCaEnabledForStatus = process.env.MITM_ROOT_CA_ENABLED === "true";
+  const certExists = fs.existsSync(resolveActiveCertPath(certDir, rootCaEnabledForStatus).certPath);
 
   return {
     running,
@@ -397,12 +445,35 @@ export async function startMitm(
   apiKey: string,
   sudoPassword: string,
   options: { port?: number } = {}
-): Promise<{ running: true; pid: number | null }> {
+): Promise<{ running: true; pid: number | null; certTrusted: boolean }> {
   // Check if already running
   if (serverProcess && !serverProcess.killed) {
     throw new Error("MITM proxy is already running");
   }
 
+  // Check if another startMitm() call is already in flight (TOCTOU guard —
+  // see the `mitmStarting` comment above).
+  if (!tryAcquireMitmStartLock()) {
+    throw new Error("MITM server is already starting");
+  }
+
+  try {
+    return await startMitmInternal(apiKey, sudoPassword, options);
+  } finally {
+    releaseMitmStartLock();
+  }
+}
+
+/**
+ * Internal body of startMitm(), extracted so the single-flight lock in
+ * startMitm() cleanly wraps it in try/finally without re-indenting the
+ * entire implementation.
+ */
+async function startMitmInternal(
+  apiKey: string,
+  sudoPassword: string,
+  options: { port?: number }
+): Promise<{ running: true; pid: number | null; certTrusted: boolean }> {
   // Register best-effort teardown on parent SIGINT/SIGTERM (Gap 7).
   installCleanupHandlers();
 
@@ -439,51 +510,84 @@ export async function startMitm(
     );
   }
 
-  // 1. Generate SSL certificate if not exists
-  const certPath = path.join(resolveMitmDataDir(), "mitm", "server.crt");
-  if (!fs.existsSync(certPath)) {
-    log.info("Generating SSL certificate...");
-    await generateCert();
-  }
-
-  // 2. Install certificate to system keychain
-  await installCert(sudoPassword, certPath);
-
-  // 3. Add DNS entries: Antigravity defaults + all agents with dns_enabled=true +
-  //    all custom hosts with enabled=true.
-  log.info("Adding DNS entries...");
-  await addDNSEntry(sudoPassword);
-
-  // Collect hosts from agents that have dns_enabled=true in the DB.
-  try {
-    const agentStates = getAllAgentBridgeStates();
-    const agentHostsToAdd: string[] = [];
-    for (const state of agentStates) {
-      if (!state.dns_enabled) continue;
-      const target = ALL_TARGETS.find((t) => t.id === state.agent_id);
-      if (target) {
-        agentHostsToAdd.push(...target.hosts);
+  // 1. Generate (or load the persisted) certificate material. #6684: a
+  //    pre-existing trusted legacy leaf keeps this run on the legacy
+  //    self-signed path (no silent trust-model upgrade — a MITM root CA that
+  //    can sign a leaf for ANY host is materially more powerful than the old
+  //    fixed-SAN leaf); fresh installs, and installs with `MITM_ROOT_CA_ENABLED
+  //    =true`, get the persisted root-CA + per-host-leaf model instead
+  //    (`cert/rootCa.ts`, reusing the CA/leaf crypto proven for TPROXY in
+  //    `tproxy/dynamicCert.ts`).
+  const certDir = resolveMitmCertDir();
+  const rootCaEnabled = process.env.MITM_ROOT_CA_ENABLED === "true";
+  const { mode: migrationDecision } = resolveActiveCertPath(certDir, rootCaEnabled);
+  let certPath: string;
+  if (migrationDecision === "use-legacy-leaf") {
+    certPath = path.join(resolveMitmDataDir(), "mitm", "server.crt");
+    if (!fs.existsSync(certPath)) {
+      log.info("Generating SSL certificate...");
+      try {
+        await generateCert();
+      } catch (err) {
+        log.error({ err }, "Failed to generate SSL certificate");
+        throw err;
       }
     }
-    if (agentHostsToAdd.length > 0) {
-      log.info({ count: agentHostsToAdd.length }, "Adding DNS for agent host(s)...");
-      await addDNSEntries(agentHostsToAdd, sudoPassword);
+  } else {
+    log.info("Loading (or generating) persisted MITM root CA...");
+    try {
+      const ca = await loadOrCreateMitmCa(certDir);
+      certPath = ca.certPath;
+    } catch (err) {
+      log.error({ err }, "Failed to load/generate MITM root CA");
+      throw err;
     }
-  } catch (err) {
-    log.error({ err }, "Failed to add agent DNS entries (continuing)");
   }
 
-  // Collect enabled custom hosts.
-  try {
-    const customHosts = listCustomHosts({ enabledOnly: true });
-    const customHostNames = customHosts.map((h) => h.host);
-    if (customHostNames.length > 0) {
-      log.info({ count: customHostNames.length }, "Adding DNS for custom host(s)...");
-      await addDNSEntries(customHostNames, sudoPassword);
+  // 2. Install certificate to system keychain. A failure here must NOT abort the
+  //    bridge: in containers/headless the system trust store can't be written,
+  //    so we start in "untrusted" mode and let the operator trust the CA by hand
+  //    (mirrors the best-effort "continuing" pattern used for DNS below). (#4546)
+  let certTrusted = false;
+  await runPrivilegedMitmStep(
+    sudoPassword,
+    "Skipping MITM cert trust — no sudo password available (#7938)",
+    async () => {
+      try {
+        const certResult =
+          migrationDecision === "use-root-ca"
+            ? await installCaCert(sudoPassword, certPath)
+            : await installCertResult(sudoPassword, certPath);
+        certTrusted = certResult.installed;
+        if (!certResult.installed) {
+          log.warn(
+            { reason: certResult.reason },
+            "MITM cert not auto-trusted; bridge starting in skip mode (manual trust required)"
+          );
+        }
+      } catch (err) {
+        log.error(
+          { err },
+          "installCertResult threw unexpectedly (continuing without trusted cert)"
+        );
+      }
     }
-  } catch (err) {
-    log.error({ err }, "Failed to add custom host DNS entries (continuing)");
-  }
+  );
+
+  // 3. Add DNS entries: Antigravity defaults + all agents with dns_enabled=true +
+  //    all custom hosts with enabled=true. Best-effort — see provisionDnsEntries.
+  await runPrivilegedMitmStep(
+    sudoPassword,
+    "Skipping DNS provisioning — no sudo password available (#7938)",
+    async () => {
+      log.info("Adding DNS entries...");
+      try {
+        await provisionDnsEntries(sudoPassword);
+      } catch (err) {
+        log.error({ err }, "DNS provisioning threw unexpectedly (continuing)");
+      }
+    }
+  );
 
   // 4. Start MITM server
   log.info("Starting MITM server...");
@@ -502,9 +606,7 @@ export async function startMitm(
   let ingestToken = process.env.INSPECTOR_INTERNAL_INGEST_TOKEN || "";
   if (!ingestToken) {
     try {
-      const ingestMod = await import(
-        "@/app/api/tools/traffic-inspector/internal/ingest/route"
-      );
+      const ingestMod = await import("@/app/api/tools/traffic-inspector/internal/ingest/route");
       if (typeof ingestMod.getIngestTokenForBootstrap === "function") {
         ingestToken = ingestMod.getIngestTokenForBootstrap();
       }
@@ -513,12 +615,17 @@ export async function startMitm(
     }
   }
 
-  serverProcess = spawn(process.execPath, [MITM_SERVER_PATH], {
+  serverProcess = spawn(process.execPath, [resolveMitmServerPath()], {
+    windowsHide: true,
     env: {
       ...process.env,
       ROUTER_API_KEY: apiKey,
       MITM_LOCAL_PORT: String(port),
       INSPECTOR_INTERNAL_INGEST_TOKEN: ingestToken,
+      // #6684: tell the spawned server.cjs which cert model this run resolved
+      // to (Step 1 above) so its own gate can't drift from manager.ts's
+      // migration decision.
+      MITM_CERT_MODE: migrationDecision === "use-root-ca" ? "root-ca" : "legacy",
       NODE_ENV: "production",
     },
     detached: false,
@@ -528,9 +635,13 @@ export async function startMitm(
   const proc = serverProcess;
   serverPid = proc.pid ?? null;
 
-  // Save PID to file
+  // Save PID to file — best-effort, must not orphan spawned child process
   if (serverPid !== null) {
-    fs.writeFileSync(PID_FILE, String(serverPid));
+    try {
+      fs.writeFileSync(PID_FILE, String(serverPid));
+    } catch (err) {
+      log.error({ err, pid: serverPid }, "Failed to write MITM PID file (continuing)");
+    }
   }
 
   // Buffer recent stderr so a startup failure can be reported with its real
@@ -594,21 +705,38 @@ export async function startMitm(
   });
 
   if (!started) {
+    // Step 3 above already wrote the /etc/hosts entries. Leaving them behind
+    // points every AgentBridge target hostname at 127.0.0.1:<port>, where the
+    // service that actually owns the port answers with a TLS alert — so the
+    // hostnames fail machine-wide with the bridge down and no way to recover
+    // from the UI. Revert them before surfacing the startup error.
+    await runPrivilegedMitmStep(
+      sudoPassword,
+      "Skipping DNS rollback after a failed start — no sudo password available",
+      () =>
+        removeDnsEntriesAfterFailedStart(
+          { removeDNSEntry, removeDNSEntries, collectManagedHosts },
+          sudoPassword
+        )
+    );
     throw new Error(interpretMitmStartupError(stderrBuffer, port));
   }
 
   return {
     running: true,
     pid: serverPid,
+    certTrusted,
   };
 }
 
 /**
- * Stop MITM proxy
- * @param {string} sudoPassword - Sudo password for DNS cleanup
+ * Kill the MITM server process during stop — either the in-memory
+ * `serverProcess` handle or, if that's gone, the PID recorded in `PID_FILE`.
+ * Split out of stopMitm() purely to keep that function's complexity under
+ * the repo's ratchet; behavior is unchanged from the original inline
+ * implementation.
  */
-export async function stopMitm(sudoPassword: string): Promise<{ running: false; pid: null }> {
-  // 1. Kill server process (in-memory or from PID file)
+async function killMitmServerProcessOnStop(): Promise<void> {
   const proc = serverProcess;
   if (proc && !proc.killed) {
     log.info("Stopping MITM server...");
@@ -619,41 +747,67 @@ export async function stopMitm(sudoPassword: string): Promise<{ running: false; 
     }
     serverProcess = null;
     serverPid = null;
-  } else {
-    // Fallback: kill by PID file
-    try {
-      if (fs.existsSync(PID_FILE)) {
-        const savedPid = parseInt(fs.readFileSync(PID_FILE, "utf-8").trim(), 10);
-        if (savedPid && isProcessAlive(savedPid)) {
-          log.info({ pid: savedPid }, "Killing MITM server by PID...");
-          process.kill(savedPid, "SIGTERM");
-          await new Promise((resolve) => setTimeout(resolve, 1000));
-          if (isProcessAlive(savedPid)) {
-            process.kill(savedPid, "SIGKILL");
-          }
-        }
-      }
-    } catch {
-      // Ignore
-    }
-    serverProcess = null;
-    serverPid = null;
+    return;
   }
 
-  // 2. Remove DNS entries — Antigravity defaults PLUS every agent + custom host
-  //    that startMitm() may have spoofed. removeDNSEntries is idempotent, so
-  //    over-inclusion is safe; under-inclusion leaks /etc/hosts lines that
-  //    hijack resolution machine-wide after stop (Gap 8).
-  log.info("Removing DNS entries...");
-  await removeDNSEntry(sudoPassword);
+  // Fallback: kill by PID file
   try {
-    const managed = collectManagedHosts();
-    if (managed.length > 0) {
-      await removeDNSEntries(managed, sudoPassword);
+    if (fs.existsSync(PID_FILE)) {
+      const savedPid = parseInt(fs.readFileSync(PID_FILE, "utf-8").trim(), 10);
+      if (savedPid && isProcessAlive(savedPid)) {
+        log.info({ pid: savedPid }, "Killing MITM server by PID...");
+        process.kill(savedPid, "SIGTERM");
+        await new Promise((resolve) => setTimeout(resolve, 1000));
+        if (isProcessAlive(savedPid)) {
+          process.kill(savedPid, "SIGKILL");
+        }
+      }
     }
-  } catch (err) {
-    log.error({ err }, "Failed to remove managed DNS entries during stop (continuing)");
+  } catch {
+    // Ignore
   }
+  serverProcess = null;
+  serverPid = null;
+}
+
+/**
+ * Stop MITM proxy
+ *
+ * Ordering is deliberate and load-bearing (#1809 — "connect ECONNREFUSED
+ * 127.0.0.1:443" after stop). DNS entries MUST be removed BEFORE the server
+ * process is killed: if the process dies first, any client whose DNS still
+ * resolves the target host to 127.0.0.1 (from startMitm()'s spoof) but whose
+ * MITM listener is already dead gets ECONNREFUSED against a dead port for the
+ * whole window between the two steps. Removing DNS first closes that window —
+ * once /etc/hosts no longer points at 127.0.0.1, clients fall back to real
+ * resolution regardless of when the listener actually goes away. This mirrors
+ * the DNS-first ordering already used by repairMitm() and handleExitCleanup().
+ * @param {string} sudoPassword - Sudo password for DNS cleanup
+ * @param _depsOverride - optional dependency override, used in tests for DI.
+ */
+export async function stopMitm(
+  sudoPassword: string,
+  _depsOverride?: {
+    removeDNSEntry?: (sudoPassword: string) => Promise<void>;
+    removeDNSEntries?: (hosts: string[], sudoPassword: string) => Promise<void>;
+    collectManagedHosts?: () => string[];
+  }
+): Promise<{ running: false; pid: null }> {
+  const deps = {
+    removeDNSEntry: _depsOverride?.removeDNSEntry ?? removeDNSEntry,
+    removeDNSEntries: _depsOverride?.removeDNSEntries ?? removeDNSEntries,
+    collectManagedHosts: _depsOverride?.collectManagedHosts ?? collectManagedHosts,
+  };
+
+  // 1. Remove DNS entries FIRST — see function doc + module doc above (#1809).
+  await runPrivilegedMitmStep(
+    sudoPassword,
+    "Skipping DNS teardown — no sudo password available (#7938)",
+    () => removeStopDnsEntries(deps, sudoPassword)
+  );
+
+  // 2. Kill server process (in-memory or from PID file)
+  await killMitmServerProcessOnStop();
 
   // 3. Clean up
   clearCachedPassword(); // Clear password from memory when proxy stops

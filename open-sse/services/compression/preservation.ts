@@ -20,9 +20,9 @@ function randomSentinelSeed(): string {
   const cryptoLike = globalThis.crypto;
   if (cryptoLike?.getRandomValues) {
     cryptoLike.getRandomValues(bytes);
-    return Array.from(bytes, (b) => b.toString(16).padStart(2, "0")).join("");
+    return `r${Array.from(bytes, (b) => b.toString(16).padStart(2, "0")).join("")}`;
   }
-  return Math.random().toString(36).slice(2);
+  return `r${Math.random().toString(36).slice(2)}`;
 }
 
 function ensureGlobal(pattern: RegExp): RegExp {
@@ -87,6 +87,25 @@ export function extractPreservedBlocks(
   let result = text;
 
   result = extractFrontmatter(result, addBlock);
+
+  // Whole-region patterns run before fenced code and the inline built-ins: those leave
+  // sentinels inside a region, and replacePattern skips any match that already holds one.
+  // #13457: user preservePatterns go first so an explicit user region wins.
+  // #13453: then the instruction envelopes agentic CLIs inject into user messages —
+  // compressing them inverts negations, drops emphasis and breaks the XML tags.
+  const regionPatterns: CompiledPattern[] = [
+    ...compileUserPatterns(options.preservePatterns),
+    { pattern: /<system-reminder>[\s\S]*?<\/system-reminder>/g, kind: "system_instruction" },
+    { pattern: /<instructions?>[\s\S]*?<\/instructions?>/g, kind: "system_instruction" },
+    {
+      pattern: /<project[- ]instructions?>[\s\S]*?<\/project[- ]instructions?>/g,
+      kind: "system_instruction",
+    },
+  ];
+  for (const { pattern, kind } of regionPatterns) {
+    result = replacePattern(result, ensureGlobal(pattern), kind, addBlock);
+  }
+
   result = extractFencedCodeBlocks(result, (content) => addBlock(content, "fenced_code"));
 
   const builtIns: CompiledPattern[] = [
@@ -125,10 +144,38 @@ export function extractPreservedBlocks(
     },
   ];
 
-  for (const { pattern, kind } of [...builtIns, ...compileUserPatterns(options.preservePatterns)]) {
+  for (const { pattern, kind } of builtIns) {
     result = replacePattern(result, ensureGlobal(pattern), kind, addBlock);
   }
 
+  return { text: result, blocks };
+}
+
+/**
+ * Wrap explicit literal spans (by offset) into SENTINEL placeholders, reusing
+ * the exact placeholder family that every engine already treats as opaque.
+ * Spans must be non-overlapping and pre-sorted ascending. Restored via
+ * `restorePreservedBlocks`.
+ */
+export function preserveSpans(
+  text: string,
+  spans: Array<{ start: number; end: number; kind: string }>
+): { text: string; blocks: PreservedBlock[] } {
+  if (!spans.length) return { text, blocks: [] };
+  const seed = randomSentinelSeed();
+  const blocks: PreservedBlock[] = [];
+  let result = "";
+  let cursor = 0;
+  let counter = 0;
+  for (const span of spans) {
+    if (span.start < cursor || span.end > text.length || span.start >= span.end) continue;
+    const placeholder = `${SENTINEL_PREFIX}_${seed}_${counter}\u0000`;
+    blocks.push({ placeholder, content: text.slice(span.start, span.end), kind: span.kind });
+    result += text.slice(cursor, span.start) + placeholder;
+    cursor = span.end;
+    counter++;
+  }
+  result += text.slice(cursor);
   return { text: result, blocks };
 }
 

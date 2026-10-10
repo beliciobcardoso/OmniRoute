@@ -55,6 +55,27 @@ test("resolveConnectionParams accepts access_token in providerSpecificData and a
   assert.equal(p.host, "substrate.svc.cloud.microsoft");
 });
 
+test("resolveConnectionParams parses the pasted OmniRoute credential line", () => {
+  const r = resolveConnectionParams({
+    apiKey: "access_token=tok3; chathubPath=redacted-account@redacted-tenant",
+  });
+  assert.ok(!("error" in r));
+  const p = r as { chathubPath: string; accessToken: string };
+  assert.equal(p.accessToken, "tok3");
+  assert.equal(p.chathubPath, "redacted-account@redacted-tenant");
+});
+
+test("resolveConnectionParams parses a pasted Chathub WebSocket URL", () => {
+  const r = resolveConnectionParams({
+    apiKey:
+      "wss://substrate.office.com/m365Copilot/Chathub/redacted-account%40redacted-tenant?access_token=tok4&source=officeweb",
+  });
+  assert.ok(!("error" in r));
+  const p = r as { chathubPath: string; accessToken: string };
+  assert.equal(p.accessToken, "tok4");
+  assert.equal(p.chathubPath, "redacted-account@redacted-tenant");
+});
+
 // ── WS URL building ──────────────────────────────────────────────────────
 
 test("buildWsUrl targets the substrate Chathub with the individual-tier query", () => {
@@ -65,6 +86,7 @@ test("buildWsUrl targets the substrate Chathub with the individual-tier query", 
   assert.equal(qs.get("agent"), "web");
   assert.equal(qs.get("scenario"), "OfficeWebPaidConsumerCopilot");
   assert.equal(qs.get("source"), "officeweb");
+  assert.ok(qs.get("variants")?.includes("feature.bizchatfluxv3"));
   assert.equal(qs.get("access_token"), "TOK");
   // chatsessionid == XRoutingParameterSessionKey == clientrequestid (same value)
   const sid = qs.get("chatsessionid");
@@ -74,7 +96,11 @@ test("buildWsUrl targets the substrate Chathub with the individual-tier query", 
 });
 
 test("redactWsUrl strips the access_token so the URL is safe to log", () => {
-  const url = buildWsUrl({ host: "substrate.office.com", chathubPath: "u@t", accessToken: "SECRET" });
+  const url = buildWsUrl({
+    host: "substrate.office.com",
+    chathubPath: "u@t",
+    accessToken: "SECRET",
+  });
   const redacted = redactWsUrl(url);
   assert.ok(!redacted.includes("SECRET"), "token must not survive redaction");
   assert.match(redacted, /access_token=REDACTED/);
@@ -87,23 +113,32 @@ test("newChatSessionId is 32 lowercase hex chars", () => {
 });
 
 // ── Prompt flattening ────────────────────────────────────────────────────
+// Updated for full-history flattening (tool-call support follow-up to #10732):
+// the prompt now carries the WHOLE bracketed history so multi-turn agent loops
+// keep assistant turns and tool results, instead of the last user message only.
 
-test("buildPrompt returns the last user message", () => {
+test("buildPrompt flattens the full message history in order", () => {
   const prompt = buildPrompt({
     messages: [
       { role: "user", content: "first" },
+      { role: "assistant", content: "hi there" },
       { role: "user", content: "second" },
     ],
   });
-  assert.equal(prompt, "second");
+  assert.ok(prompt.includes("[user]\nfirst"));
+  assert.ok(prompt.includes("[assistant]\nhi there"));
+  assert.ok(prompt.includes("[user]\nsecond"));
 });
 
-test("buildPrompt prepends system instructions", () => {
+test("buildPrompt keeps system instructions first, bracketed", () => {
   const prompt = buildPrompt({
     messages: [
       { role: "system", content: "Be terse." },
       { role: "user", content: "hi" },
     ],
   });
-  assert.match(prompt, /\[System Instructions\]\nBe terse\.\n\nhi$/);
+  // The no-tool path prefixes the answer-in-full instruction, then the history.
+  assert.match(prompt, /^Please answer the following request in full\./);
+  assert.match(prompt, /\[system\]\nBe terse\./);
+  assert.ok(prompt.includes("[user]\nhi"));
 });

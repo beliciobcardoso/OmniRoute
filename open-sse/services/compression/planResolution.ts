@@ -1,4 +1,4 @@
-import type { CompressionConfig, CompressionPipelineStep } from "./types.ts";
+import type { CompressionConfig, CompressionPipelineStep, CompressionStats } from "./types.ts";
 import { resolveCompressionPlan } from "./resolveCompressionPlan.ts";
 import {
   deriveDefaultPlan,
@@ -8,6 +8,13 @@ import {
 
 /** Named-combo map: combo id → its stacked pipeline (operator-defined profiles). */
 type NamedCombos = Record<string, CompressionPipelineStep[]>;
+
+const MAX_COMPRESSION_ANNOTATION_BYTES = 768;
+const NON_ASCII_HEADER_VALUE_CHARS = /[^\x20-\x7e]/g;
+
+function utf8ByteLength(value: string): number {
+  return new TextEncoder().encode(value).byteLength;
+}
 
 /** Tags a plan with the precedence layer that produced it (Phase 3 observability). */
 export function withSource(plan: DerivedPlan, source: CompressionSource): DerivedPlan {
@@ -47,12 +54,55 @@ export function planFromHeader(
   }
 
   const combo = combos[lower] ?? combos[h];
-  return combo ? withSource({ mode: "stacked", stackedPipeline: combo }, "request-header") : null;
+  // Only a real, non-empty pipeline is a chosen plan: an empty-array combo would otherwise win
+  // the precedence race and let the builtin fallback pipeline run lossy unrequested, and the
+  // plain-object lookup resolves prototype keys (constructor, toString) to truthy garbage.
+  return Array.isArray(combo) && combo.length > 0
+    ? withSource({ mode: "stacked", stackedPipeline: combo }, "request-header")
+    : null;
 }
 
 /** Renders the X-OmniRoute-Compression response header value. */
 export function formatCompressionMeta(plan: DerivedPlan): string {
   return `${plan.mode}; source=${plan.source ?? "off"}`;
+}
+
+/**
+ * Builds the annotation suffix for X-OmniRoute-Compression from compression stats.
+ * Returns "" when there are no rules to aggregate (caller skips the append).
+ * Format: `tokens=<orig>-><comp>; rules: <name>x<count>, ...` sorted by count desc.
+ * ASCII-only: this string is appended to the X-OmniRoute-Compression HTTP header,
+ * whose value is a latin-1 ByteString — a non-ASCII char (e.g. U+2192 →) throws at
+ * Response/Headers construction (500). Keep the UI badge's arrow in the JSX, not here.
+ */
+export function formatCompressionAnnotation(stats: CompressionStats): string {
+  const rules = stats.rulesApplied;
+  if (!rules || rules.length === 0) return "";
+
+  const counts = new Map<string, number>();
+  for (const rule of rules) {
+    const safeRule = rule.replace(NON_ASCII_HEADER_VALUE_CHARS, "?");
+    counts.set(safeRule, (counts.get(safeRule) ?? 0) + 1);
+  }
+
+  const sorted = [...counts.entries()].sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]));
+  const prefix = `tokens=${stats.originalTokens}->${stats.compressedTokens}; rules: `;
+  const suffix = ", ...";
+  const parts: string[] = [];
+  let bytes = utf8ByteLength(prefix);
+  for (const [name, n] of sorted) {
+    const part = `${name}x${n}`;
+    const separator = parts.length > 0 ? ", " : "";
+    const partBytes = utf8ByteLength(separator + part);
+    if (bytes + partBytes > MAX_COMPRESSION_ANNOTATION_BYTES - utf8ByteLength(suffix)) {
+      if (parts.length === 0) return "";
+      return `${prefix}${parts.join(", ")}${suffix}`;
+    }
+    parts.push(part);
+    bytes += partBytes;
+  }
+  const agg = parts.join(", ");
+  return `${prefix}${agg}`;
 }
 
 /**
@@ -83,8 +133,18 @@ export function buildNamedComboLookup(
  * silent behaviour change for installs whose backfilled engine flags don't exactly match
  * their old defaultMode.
  */
+/** The config fields the default-plan derivation reads (the dashboard preview passes its own
+ *  panel-shaped config, so the full server CompressionConfig is not required — #14700). */
+export type DefaultPlanConfig = Pick<CompressionConfig, "enabled" | "engines" | "activeComboId"> &
+  Partial<
+    Pick<
+      CompressionConfig,
+      "enginesExplicit" | "defaultMode" | "stackedPipeline" | "comboOverrides"
+    >
+  >;
+
 export function deriveDefaultPlanFromConfig(
-  config: CompressionConfig,
+  config: DefaultPlanConfig,
   comboId: string | null,
   combos: NamedCombos = {}
 ): DerivedPlan {

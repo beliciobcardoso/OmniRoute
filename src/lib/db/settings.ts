@@ -5,17 +5,24 @@
 import { getDbInstance } from "./core";
 import { backupDbFile } from "./backup";
 import { PROVIDER_ID_TO_ALIAS } from "@omniroute/open-sse/config/providerModels.ts";
+import {
+  getProxyRefusalSeq,
+  hasProxyRefusals,
+  proxyEgressKey,
+  proxySetAsideSeq,
+} from "@omniroute/open-sse/utils/proxyRefusalMemory.ts";
+import { isProxySkipRecentlyFailedEnabled } from "@/shared/utils/featureFlags";
 import { invalidateDbCache } from "./readCache";
+import { encrypt, decrypt } from "./encryption";
 import { getProxyRegistryGeneration, resolveProxyForScopeFromRegistry } from "./proxies";
+import { isEgressBucketedLockScope } from "@omniroute/open-sse/config/providerErrorRules.ts";
 import { getComboModelProvider as getComboEntryProvider } from "@/lib/combos/steps";
 import { requestBodyLimitMbFromEnv } from "@/shared/constants/bodySize";
 import { DEFAULT_RESPONSES_PREVIOUS_RESPONSE_ID_MODE } from "@/shared/constants/responsesPreviousResponseId";
+import { decodeUserinfo } from "@/shared/utils/decodeUserinfo";
+import { type JsonRecord, toRecord } from "./settings/shared";
+import { resolveNoAuthSharedProviderProxy } from "./settings/noAuthProxyFallback";
 
-type JsonRecord = Record<string, unknown>;
-type PricingModels = Record<string, JsonRecord>;
-type PricingByProvider = Record<string, PricingModels>;
-export type PricingSource = "default" | "litellm" | "modelsDev" | "user";
-export type PricingSourceMap = Record<string, Record<string, PricingSource>>;
 type ProxyValue = JsonRecord | string | null;
 type ProxyResolutionResult = {
   proxy: ProxyValue;
@@ -23,11 +30,14 @@ type ProxyResolutionResult = {
   levelId: string | null;
   source?: string;
 };
-type ProxyResolutionCacheEntry = {
+// State observed when a resolution started; an entry is stored only if it still holds.
+type ProxyResolutionStamp = {
   generation: number;
   registryGeneration: number;
-  result: ProxyResolutionResult;
+  // Proxy refusal memory sequence (see isCachedPoolMemberSetAside).
+  refusalSeq: number;
 };
+type ProxyResolutionCacheEntry = ProxyResolutionStamp & { result: ProxyResolutionResult };
 
 const PROXY_RESOLUTION_CACHE_MAX_ENTRIES = 100;
 
@@ -45,17 +55,16 @@ export function bumpProxyConfigGeneration() {
 
 function cacheProxyResolution(
   connectionId: string,
-  generation: number,
-  registryGeneration: number,
+  stamp: ProxyResolutionStamp,
   result: ProxyResolutionResult
 ) {
-  if (generation !== proxyConfigGeneration) return;
-  if (registryGeneration !== getProxyRegistryGeneration()) return;
+  if (stamp.generation !== proxyConfigGeneration) return;
+  if (stamp.registryGeneration !== getProxyRegistryGeneration()) return;
   if (proxyResolutionCache.size >= PROXY_RESOLUTION_CACHE_MAX_ENTRIES) {
     const oldestKey = proxyResolutionCache.keys().next().value;
     if (oldestKey) proxyResolutionCache.delete(oldestKey);
   }
-  proxyResolutionCache.set(connectionId, { generation, registryGeneration, result });
+  proxyResolutionCache.set(connectionId, { ...stamp, result });
 }
 type ProxyMap = Record<string, ProxyValue>;
 
@@ -65,10 +74,6 @@ interface ProxyConfig {
   combos: ProxyMap;
   keys: ProxyMap;
   [key: string]: unknown;
-}
-
-function toRecord(value: unknown): JsonRecord {
-  return value && typeof value === "object" ? (value as JsonRecord) : {};
 }
 
 function toProxyMap(value: unknown): ProxyMap {
@@ -96,18 +101,87 @@ function withFamilyDefault(value: ProxyValue): ProxyValue {
 
 // ──────────────── Settings ────────────────
 
+/** Internal key_value row — not exposed as a user-facing settings field. */
+export const SETTINGS_REVISION_KEY = "_settingsRevision";
+
+export class SettingsRevisionConflictError extends Error {
+  readonly code = "SETTINGS_REVISION_CONFLICT" as const;
+
+  constructor(public readonly currentRevision: number) {
+    super("Settings revision mismatch");
+    this.name = "SettingsRevisionConflictError";
+  }
+}
+
+function readSettingsRevision(db: ReturnType<typeof getDbInstance>): number {
+  const row = db
+    .prepare("SELECT value FROM key_value WHERE namespace = 'settings' AND key = ?")
+    .get(SETTINGS_REVISION_KEY) as { value?: string } | undefined;
+  if (!row?.value) return 0;
+  try {
+    const parsed = JSON.parse(row.value) as unknown;
+    return typeof parsed === "number" && Number.isInteger(parsed) && parsed >= 0 ? parsed : 0;
+  } catch {
+    return 0;
+  }
+}
+
+export async function getSettingsRevision(): Promise<number> {
+  return readSettingsRevision(getDbInstance());
+}
+
+/**
+ * #7274: read-fallback for the codexSessionAffinityTtlMs -> sessionAffinityTtlMs
+ * rename. Migration 124 already backfills the new key from any pre-existing
+ * old-key row for the common case, but this covers callers reading settings
+ * before that migration has had a chance to run (or any drift between the
+ * two). Only applies when the generic key was never explicitly persisted —
+ * an operator-set `sessionAffinityTtlMs` (including an explicit 0) always wins.
+ * Extracted to a leaf helper so `getSettings()` stays under the max-lines-per-
+ * function ratchet.
+ */
+function applySessionAffinityLegacyFallback(settings: Record<string, unknown>): void {
+  if (settings.sessionAffinityTtlMs === undefined) {
+    settings.sessionAffinityTtlMs =
+      typeof settings.codexSessionAffinityTtlMs === "number"
+        ? settings.codexSessionAffinityTtlMs
+        : 0;
+  }
+}
+
 export async function getSettings() {
   const db = getDbInstance();
   const rows = db.prepare("SELECT key, value FROM key_value WHERE namespace = 'settings'").all();
   const settings: Record<string, unknown> = {
-    cloudEnabled: true,
+    cloudEnabled: false,
     tailscaleEnabled: false,
     tailscaleUrl: "",
     stickyRoundRobinLimit: 3,
+    disableSessionStickiness: false,
+    // Global connection-aware expansion fallback for group-B combo strategies is opt-in.
+    connectionAwareExpansion: false,
+    promptCacheAffinityEnabled: true,
+    comboStrategy: "fallback",
+    comboStickyRoundRobinLimit: null, // null = inherit stickyRoundRobinLimit (a literal default here shadows the documented batched-rotation default of 3 — #6678 regression caught by the v3.8.47 release CI)
+    providerStrategies: {},
+    // Per-operator quota row visibility (dashboard usage tab). Keyed by
+    // provider id → { hidden: [<quota visibility key>] }. Independent of the
+    // model catalog's isHidden flag (collectHiddenQuotaModelIds in
+    // ProviderLimits/utils.tsx) — this is a personal view preference, not an
+    // admin model-catalog edit. Ported from upstream decolua/9router#2371.
+    quotaVisibility: {},
     requestRetry: 3,
     maxRetryIntervalSec: 30,
     antigravitySignatureCacheMode: "enabled",
     requireLogin: true,
+    oidcEnabled: false,
+    oidcDisablePasswordLogin: false,
+    oidcIssuer: "",
+    oidcClientId: "",
+    oidcClientSecret: "",
+    oidcScopes: ["openid", "profile", "email"],
+    oidcRedirectPath: "/api/auth/oidc/callback",
+    oidcAllowedSubjects: [], // optional sub or email whitelist
     mcpEnabled: false,
     a2aEnabled: false,
     hiddenSidebarItems: [],
@@ -121,21 +195,44 @@ export async function getSettings() {
     preferClaudeCodeForUnprefixedClaudeModels: isTruthyEnvFlag(
       process.env.OMNIROUTE_PREFER_CLAUDE_CODE_FOR_UNPREFIXED_CLAUDE_MODELS
     ),
+    // Opt-in (default "off"): short-circuits Claude Code's `--permission-mode auto`
+    // internal security-classifier request with a synthetic `<block>no</block>` ALLOW
+    // response, without calling the upstream provider. See
+    // open-sse/handlers/chatCore/claudeClassifierCompat.ts for the detector + builder.
+    claudeClassifierCompat: "off",
     autoRefreshProviderQuota: false,
+    credentialRedactionEnabled: false,
     autoRefreshProviderQuotaInterval: 180,
     comboConfigMode: "guided",
+    comboAutoPromoteEnabled: false,
     codexServiceTier: { enabled: false },
     claudeFastMode: {
       enabled: false,
-      supportedModels: ["claude-fable-5", "claude-opus-4-8", "claude-opus-4-7", "claude-opus-4-6"],
+      supportedModels: [
+        "claude-fable-5",
+        "claude-opus-5-5",
+        "claude-opus-5",
+        "claude-opus-4-8",
+        "claude-opus-4-7",
+        "claude-opus-4-6",
+      ],
     },
-    codexSessionAffinityTtlMs: 0,
+    // #7274: renamed from codexSessionAffinityTtlMs — session affinity now
+    // applies to any provider, not just Codex. No default here on purpose:
+    // the read-fallback below only kicks in while `sessionAffinityTtlMs` has
+    // never been explicitly persisted, so it can tell "never configured"
+    // apart from "operator explicitly set 0" on the new key.
     responsesPreviousResponseIdMode: DEFAULT_RESPONSES_PREVIOUS_RESPONSE_ID_MODE,
     alwaysPreserveClientCache: "auto",
     idempotencyWindowMs: 5000,
     wsAuth: false,
     maxBodySizeMb: requestBodyLimitMbFromEnv(process.env.MAX_BODY_SIZE_BYTES),
-    debugMode: true,
+    // #10312: opt-in only — a fresh install (or one missing the persisted key)
+    // must not run in debug mode; installs that persisted `true` keep it.
+    debugMode: false,
+    // Opt-in diagnostic: when true, the chat handler emits a `log.debug("TOOLS", …)`
+    // line per request summarizing tool count + MCP/hosted/client source breakdown.
+    logToolSources: false,
     // LOCAL_ONLY manage-scope bypass policy defaults (T-011 / spec §Data Model).
     // Preserves PR #2473 behaviour on migration — the bypass starts ENABLED
     // for `/api/mcp/` so existing manage-scope Bearer clients keep working.
@@ -145,18 +242,63 @@ export async function getSettings() {
     localOnlyManageScopeBypassEnabled: true,
     localOnlyManageScopeBypassPrefixes: ["/api/mcp/"],
     customBannedSignals: [],
+    autoDisableBannedScope: "all",
     proxyEnabled: true,
     perKeyProxyEnabled: false,
     customSystemPromptEnabled: false,
     customSystemPrompt: "",
+    // #6316: Opt-in filter that hides paid-only models from the /v1/models catalog.
+    // Uses isFreeModel() from src/shared/utils/freeModels.ts to detect free entries
+    // (`:free` suffix, zero-price pricing, or FREE_MODEL_BUDGETS membership). Default
+    // false preserves prior behaviour; opt-in only.
+    hidePaidModels: false,
+    // Opt-in, default off: same shape as hidePaidModels above, but requires a
+    // live hard-stop-guaranteed quota check for non-keyless free candidates.
+    // See open-sse/services/autoCombo/strictZeroCostFilter.ts.
+    freeAccessPolicy: "off",
+    // #15059: ON by default — providers whose curated verdict is `tos: "avoid"` (e.g. Antigravity)
+    // must not receive `auto` traffic on a fresh install. Opt out with PATCH /api/settings.
+    excludeTosAvoid: true,
+    // #9418: Opt-in filter that hides auto/* virtual combos from the /v1/models catalog.
+    // User-defined combos are unaffected; routing still works for hidden ids sent explicitly.
+    hideAutoCombos: false,
+    // #9418: Opt-in filter that hides no-think/* gateway variants from the /v1/models catalog.
+    // Routing still works for hidden ids sent explicitly.
+    hideNoThinkVariants: false,
+    // #11481: Opt-in explicit model exposure allow/deny list, mirrored into the
+    // auto/* combo candidate pool (open-sse/services/autoCombo/modelExposureFilter.ts)
+    // so a denied model can't sneak back in via combo routing — the same trap
+    // #6512 already fixed once for hidePaidModels. See
+    // src/shared/utils/modelExposureList.ts for the matching predicate. Empty
+    // arrays preserve prior behaviour; opt-in only.
+    modelVisibilityAllowlist: [],
+    modelVisibilityDenylist: [],
+    // #6977: Opt-in per-connection auto-ping that warms a Codex OAuth connection's
+    // quota window right after it resets, so the first real request doesn't land in
+    // a cold window. `connections` maps connection id -> enabled. Default empty map
+    // (nobody opted in) — the scheduler is a no-op until an operator flips a
+    // connection on, since pinging burns a small amount of real quota (Hard Rule #20
+    // spirit: never mutate/consume on the operator's behalf by default).
+    codexAutoPing: { connections: {} },
+    // #8848: opt-in per-connection Claude proactive warmup (empty = off for everyone).
+    claudeWarmup: { connections: {} },
   };
   for (const row of rows) {
     const record = toRecord(row);
     const key = typeof record.key === "string" ? record.key : null;
     const rawValue = typeof record.value === "string" ? record.value : null;
-    if (!key || rawValue === null) continue;
-    settings[key] = JSON.parse(rawValue);
+    if (!key || rawValue === null || key.startsWith("_")) continue;
+    try {
+      settings[key] = JSON.parse(rawValue);
+    } catch {
+      settings[key] = rawValue;
+    }
   }
+
+  if (typeof settings.oidcClientSecret === "string") {
+    settings.oidcClientSecret = decrypt(settings.oidcClientSecret) ?? "";
+  }
+  applySessionAffinityLegacyFallback(settings);
 
   // Auto-complete onboarding for pre-configured deployments (Docker/VM)
   // If INITIAL_PASSWORD is set via env, this is a headless deploy — skip the wizard
@@ -174,15 +316,35 @@ export async function getSettings() {
   return settings;
 }
 
-export async function updateSettings(updates: Record<string, unknown>) {
+export async function updateSettings(
+  updates: Record<string, unknown>,
+  options?: { expectedRevision?: number }
+) {
+  // Detect first-time setup completion before we overwrite settings.
+  let setupJustCompleted = false;
+  if (updates.setupComplete === true) {
+    try {
+      const prev = await getSettings();
+      setupJustCompleted = prev.setupComplete !== true;
+    } catch {
+      setupJustCompleted = true;
+    }
+  }
+
   const db = getDbInstance();
   const insert = db.prepare(
     "INSERT OR REPLACE INTO key_value (namespace, key, value) VALUES ('settings', ?, ?)"
   );
   const tx = db.transaction(() => {
-    for (const [key, value] of Object.entries(updates)) {
-      insert.run(key, JSON.stringify(value));
+    const currentRevision = readSettingsRevision(db);
+    if (options?.expectedRevision !== undefined && options.expectedRevision !== currentRevision) {
+      throw new SettingsRevisionConflictError(currentRevision);
     }
+    for (const [key, value] of Object.entries(updates)) {
+      const toStore = key === "oidcClientSecret" ? encrypt(value as string) : value;
+      insert.run(key, JSON.stringify(toStore));
+    }
+    insert.run(SETTINGS_REVISION_KEY, JSON.stringify(currentRevision + 1));
   });
   tx();
   backupDbFile("pre-write");
@@ -206,300 +368,23 @@ export async function updateSettings(updates: Record<string, unknown>) {
     );
   }
 
+  // Onboarding / setup finished → one-shot Codex catalog revalidation (init case).
+  if (setupJustCompleted) {
+    void import("@/shared/services/codexCatalogRevalidation")
+      .then(({ scheduleCodexCatalogRevalidationAfterInit }) => {
+        scheduleCodexCatalogRevalidationAfterInit();
+      })
+      .catch(() => {
+        // non-fatal
+      });
+  }
+
   return nextSettings;
 }
 
 export async function isCloudEnabled() {
   const settings = await getSettings();
   return settings.cloudEnabled === true;
-}
-
-// ──────────────── Pricing ────────────────
-
-function readPricingNamespace(
-  db: ReturnType<typeof getDbInstance>,
-  namespace: string
-): PricingByProvider {
-  const rows = db.prepare("SELECT key, value FROM key_value WHERE namespace = ?").all(namespace);
-  const pricing: PricingByProvider = {};
-
-  for (const row of rows) {
-    const record = toRecord(row);
-    const key = typeof record.key === "string" ? record.key : null;
-    const rawValue = typeof record.value === "string" ? record.value : null;
-    if (!key || rawValue === null) continue;
-
-    try {
-      pricing[key] = toRecord(JSON.parse(rawValue)) as PricingModels;
-    } catch {
-      // Corrupted data — skip silently, fallback to lower layers
-    }
-  }
-
-  return pricing;
-}
-
-function mergePricingLayers(layers: PricingByProvider[]): PricingByProvider {
-  const mergedPricing: PricingByProvider = {};
-
-  for (const layer of layers) {
-    for (const [provider, models] of Object.entries(layer)) {
-      if (!mergedPricing[provider]) {
-        mergedPricing[provider] = { ...models };
-        continue;
-      }
-
-      for (const [model, pricing] of Object.entries(models)) {
-        mergedPricing[provider][model] = mergedPricing[provider][model]
-          ? { ...(mergedPricing[provider][model] || {}), ...toRecord(pricing) }
-          : pricing;
-      }
-    }
-  }
-
-  return mergedPricing;
-}
-
-function buildPricingSourceMap(layers: {
-  defaults: PricingByProvider;
-  litellm: PricingByProvider;
-  modelsDev: PricingByProvider;
-  user: PricingByProvider;
-}): PricingSourceMap {
-  const sourceMap: PricingSourceMap = {};
-  const mergedPricing = mergePricingLayers([
-    layers.defaults,
-    layers.litellm,
-    layers.modelsDev,
-    layers.user,
-  ]);
-
-  for (const [provider, models] of Object.entries(mergedPricing)) {
-    sourceMap[provider] = {};
-
-    for (const model of Object.keys(models)) {
-      if (layers.user[provider]?.[model]) {
-        sourceMap[provider][model] = "user";
-      } else if (layers.modelsDev[provider]?.[model]) {
-        sourceMap[provider][model] = "modelsDev";
-      } else if (layers.litellm[provider]?.[model]) {
-        sourceMap[provider][model] = "litellm";
-      } else {
-        sourceMap[provider][model] = "default";
-      }
-    }
-  }
-
-  return sourceMap;
-}
-
-async function getPricingLayers() {
-  const db = getDbInstance();
-
-  // Layer 1: Hardcoded defaults (lowest priority)
-  const { getDefaultPricing } = await import("@/shared/constants/pricing");
-  return {
-    defaults: getDefaultPricing(),
-    litellm: readPricingNamespace(db, "pricing_synced"),
-    modelsDev: readPricingNamespace(db, "models_dev_pricing"),
-    user: readPricingNamespace(db, "pricing"),
-  };
-}
-
-export async function getPricing() {
-  const layers = await getPricingLayers();
-  // Merge: defaults → LiteLLM → models.dev → user (each layer overrides the previous)
-  return mergePricingLayers([layers.defaults, layers.litellm, layers.modelsDev, layers.user]);
-}
-
-export async function getPricingWithSources(): Promise<{
-  pricing: PricingByProvider;
-  sourceMap: PricingSourceMap;
-}> {
-  const layers = await getPricingLayers();
-  return {
-    pricing: mergePricingLayers([layers.defaults, layers.litellm, layers.modelsDev, layers.user]),
-    sourceMap: buildPricingSourceMap(layers),
-  };
-}
-
-export async function getPricingForModel(provider: string, model: string) {
-  const pricing = await getPricing();
-
-  const findKeyInsensitive = <T>(
-    obj: Record<string, T> | undefined | null,
-    key: string
-  ): T | undefined => {
-    if (!obj || !key) return undefined;
-    const lowerKey = key.toLowerCase();
-    for (const [k, v] of Object.entries(obj)) {
-      if (k.toLowerCase() === lowerKey) return v;
-    }
-    return undefined;
-  };
-
-  const pLower = (provider || "").toLowerCase();
-  let providerPricing = findKeyInsensitive<PricingModels>(pricing, pLower);
-
-  if (!providerPricing) {
-    const alias = findKeyInsensitive<string>(PROVIDER_ID_TO_ALIAS, pLower);
-    if (alias) providerPricing = findKeyInsensitive(pricing, alias);
-  }
-
-  if (!providerPricing) {
-    for (const [id, mappedAlias] of Object.entries(PROVIDER_ID_TO_ALIAS)) {
-      if (typeof mappedAlias === "string" && mappedAlias.toLowerCase() === pLower) {
-        providerPricing = findKeyInsensitive(pricing, id);
-        if (providerPricing) break;
-      }
-    }
-  }
-
-  if (!providerPricing) {
-    const np = pLower.replace(/-cn$/, "");
-    if (np && np !== pLower) {
-      providerPricing = findKeyInsensitive(pricing, np);
-    }
-  }
-
-  if (!providerPricing) return null;
-
-  const mLower = (model || "").toLowerCase();
-  let modelPricing = findKeyInsensitive<JsonRecord>(providerPricing, mLower);
-
-  if (!modelPricing) {
-    const hyphenModel = mLower.replace(/\./g, "-");
-    modelPricing = findKeyInsensitive(providerPricing, hyphenModel);
-  }
-
-  return modelPricing || null;
-}
-
-export async function updatePricing(pricingData: PricingByProvider) {
-  const db = getDbInstance();
-  const insert = db.prepare(
-    "INSERT OR REPLACE INTO key_value (namespace, key, value) VALUES ('pricing', ?, ?)"
-  );
-
-  const rows = db.prepare("SELECT key, value FROM key_value WHERE namespace = 'pricing'").all();
-  const existing: PricingByProvider = {};
-  for (const row of rows) {
-    const record = toRecord(row);
-    const key = typeof record.key === "string" ? record.key : null;
-    const rawValue = typeof record.value === "string" ? record.value : null;
-    if (!key || rawValue === null) continue;
-    existing[key] = toRecord(JSON.parse(rawValue)) as PricingModels;
-  }
-
-  const tx = db.transaction(() => {
-    for (const [provider, models] of Object.entries(pricingData)) {
-      insert.run(provider, JSON.stringify({ ...(existing[provider] || {}), ...models }));
-    }
-  });
-  tx();
-  backupDbFile("pre-write");
-  invalidateDbCache("pricing"); // Bust the pricing read cache
-  const updated: PricingByProvider = {};
-  const allRows = db.prepare("SELECT key, value FROM key_value WHERE namespace = 'pricing'").all();
-  for (const row of allRows) {
-    const record = toRecord(row);
-    const key = typeof record.key === "string" ? record.key : null;
-    const rawValue = typeof record.value === "string" ? record.value : null;
-    if (!key || rawValue === null) continue;
-    updated[key] = toRecord(JSON.parse(rawValue)) as PricingModels;
-  }
-  return updated;
-}
-
-export async function resetPricing(provider: string, model?: string) {
-  const db = getDbInstance();
-
-  if (model) {
-    const row = db
-      .prepare("SELECT value FROM key_value WHERE namespace = 'pricing' AND key = ?")
-      .get(provider);
-    if (row) {
-      const rowRecord = toRecord(row);
-      const value = typeof rowRecord.value === "string" ? rowRecord.value : "{}";
-      const models = toRecord(JSON.parse(value));
-      delete models[model];
-      if (Object.keys(models).length === 0) {
-        db.prepare("DELETE FROM key_value WHERE namespace = 'pricing' AND key = ?").run(provider);
-      } else {
-        db.prepare("UPDATE key_value SET value = ? WHERE namespace = 'pricing' AND key = ?").run(
-          JSON.stringify(models),
-          provider
-        );
-      }
-    }
-  } else {
-    db.prepare("DELETE FROM key_value WHERE namespace = 'pricing' AND key = ?").run(provider);
-  }
-
-  backupDbFile("pre-write");
-  const allRows = db.prepare("SELECT key, value FROM key_value WHERE namespace = 'pricing'").all();
-  const result: Record<string, unknown> = {};
-  for (const row of allRows) {
-    const record = toRecord(row);
-    const key = typeof record.key === "string" ? record.key : null;
-    const rawValue = typeof record.value === "string" ? record.value : null;
-    if (!key || rawValue === null) continue;
-    result[key] = JSON.parse(rawValue);
-  }
-  return result;
-}
-
-export async function resetAllPricing() {
-  const db = getDbInstance();
-  db.prepare("DELETE FROM key_value WHERE namespace = 'pricing'").run();
-  backupDbFile("pre-write");
-  return {};
-}
-
-// ──────────────── LKGP (Last Known Good Provider) ────────────────
-
-export interface LKGPRecord {
-  provider: string;
-  connectionId?: string;
-}
-
-export async function getLKGP(comboName: string, modelId: string): Promise<LKGPRecord | null> {
-  const db = getDbInstance();
-  const key = `${comboName}:${modelId}`;
-  const row = db
-    .prepare("SELECT value FROM key_value WHERE namespace = 'lkgp' AND key = ?")
-    .get(key) as { value?: string } | undefined;
-  if (!row?.value) return null;
-  try {
-    const parsed = JSON.parse(row.value);
-    if (typeof parsed === "object" && parsed !== null && "provider" in parsed) {
-      return parsed as LKGPRecord;
-    }
-    return { provider: String(parsed) };
-  } catch {
-    return { provider: row.value };
-  }
-}
-
-export async function setLKGP(
-  comboName: string,
-  modelId: string,
-  providerId: string,
-  connectionId?: string
-) {
-  const db = getDbInstance();
-  const key = `${comboName}:${modelId}`;
-  const value: LKGPRecord = { provider: providerId };
-  if (connectionId) value.connectionId = connectionId;
-  db.prepare("INSERT OR REPLACE INTO key_value (namespace, key, value) VALUES ('lkgp', ?, ?)").run(
-    key,
-    JSON.stringify(value)
-  );
-}
-
-export function clearAllLKGP(): void {
-  const db = getDbInstance();
-  db.prepare("DELETE FROM key_value WHERE namespace = 'lkgp'").run();
 }
 
 // ──────────────── Proxy Config ────────────────
@@ -540,8 +425,8 @@ function migrateProxyEntry(value: unknown): JsonRecord | null {
       port:
         url.port ||
         (url.protocol === "socks5:" ? "1080" : url.protocol === "https:" ? "443" : "8080"),
-      username: url.username ? decodeURIComponent(url.username) : "",
-      password: url.password ? decodeURIComponent(url.password) : "",
+      username: url.username ? decodeUserinfo(url.username) : "",
+      password: url.password ? decodeUserinfo(url.password) : "",
     };
   } catch {
     const parts = value.split(":");
@@ -632,20 +517,81 @@ export async function deleteProxyForLevel(level: string, id: string | null) {
   return setProxyForLevel(level, id, null);
 }
 
-export async function resolveProxyForConnection(connectionId: string, apiKeyId?: string) {
-  const cacheKey = apiKeyId ? `${connectionId}:${apiKeyId}` : connectionId;
-  const startGeneration = proxyConfigGeneration;
-  const startRegistryGeneration = getProxyRegistryGeneration();
+// With PROXY_SKIP_RECENTLY_FAILED on, a pool member set aside AFTER its resolution started is
+// not re-served from the cache: the cascade runs again so the pool can pick another member.
+// Once per set-aside event: the new entry records the sequence it started from, so a member
+// the pool hands back anyway (every member set aside) is then served from the cache instead
+// of costing a DB cascade on every request. Legacy single-proxy levels have no alternative
+// and stay cached, like a result without a proxy. The flag is read last, only on a real hit.
+function isCachedPoolMemberSetAside(entry: ProxyResolutionCacheEntry): boolean {
+  const { result } = entry;
+  if (!hasProxyRefusals() || result.source !== "registry" || result.proxy == null) return false;
+  const setAsideSeq = proxySetAsideSeq(proxyEgressKey(result.proxy));
+  if (setAsideSeq === null || setAsideSeq <= entry.refusalSeq) return false;
+  return isProxySkipRecentlyFailedEnabled();
+}
+
+// Providers that need a STABLE egress across requests, never rotated under them by this
+// cache-invalidation path (#13575): opencode's free-tier quota is bucketed by egress IP
+// (EGRESS_BUCKETED_LOCK_PROVIDERS — rotating would fragment one connection's quota across
+// several IPs), and grok-web's cf_clearance cookie is pinned to the IP/User-Agent/TLS
+// fingerprint that earned it (src/shared/providers/webSessionCredentials.ts "grok-web" —
+// rotating the egress would turn every subsequent request into a Cloudflare 403).
+function requiresStableEgress(provider: string | null): boolean {
+  if (!provider) return false;
+  return isEgressBucketedLockScope(provider) || provider.toLowerCase() === "grok-web";
+}
+
+// The chat-path cache (below) exists so a hot connection does not pay the full resolution
+// cascade on every request, but it must not FREEZE a rotating pool's choice: the registry
+// resolver (resolveProxyForScopeFromRegistry, called directly by every #6365 rotation test)
+// re-runs its strategy on every call and rotates correctly, while the cache here returned
+// the same first-resolved member forever (#13575). A cached member is stale whenever it came
+// from a live scope pool (source: "registry") and the connection is not in the two populations
+// above that need a pinned egress instead: the caller then falls through to the full cascade,
+// which re-invokes resolveProxyForScopeFromRegistry and applies the pool's own selection
+// strategy (round-robin advances, sticky holds until its window elapses, random reshuffles) —
+// no new strategy is introduced here.
+function isCachedPoolMemberDue(
+  entry: ProxyResolutionCacheEntry,
+  db: ReturnType<typeof getDbInstance>,
+  connectionId: string
+): boolean {
+  const { result } = entry;
+  if (result.source !== "registry" || result.proxy == null) return false;
+  const row = db
+    .prepare("SELECT provider FROM provider_connections WHERE id = ?")
+    .get(connectionId) as { provider?: string } | undefined;
+  const provider = typeof row?.provider === "string" ? row.provider : null;
+  return !requiresStableEgress(provider);
+}
+
+export async function resolveProxyForConnection(
+  connectionId: string,
+  apiKeyId?: string,
+  providerId?: string
+) {
+  const cacheKey = providerId
+    ? `${connectionId}:${apiKeyId || ""}:${providerId}`
+    : apiKeyId
+      ? `${connectionId}:${apiKeyId}`
+      : connectionId;
+  const stamp: ProxyResolutionStamp = {
+    generation: proxyConfigGeneration,
+    registryGeneration: getProxyRegistryGeneration(),
+    refusalSeq: getProxyRefusalSeq(),
+  };
+  const db = getDbInstance();
   const cached = proxyResolutionCache.get(cacheKey);
   if (
     cached &&
-    cached.generation === startGeneration &&
-    cached.registryGeneration === startRegistryGeneration
+    cached.generation === stamp.generation &&
+    cached.registryGeneration === stamp.registryGeneration &&
+    !isCachedPoolMemberSetAside(cached) &&
+    !isCachedPoolMemberDue(cached, db, connectionId)
   ) {
     return cached.result;
   }
-
-  const db = getDbInstance();
 
   // Step 1: Check global proxyEnabled setting
   // Read only the proxyEnabled key for performance instead of loading all settings.
@@ -691,7 +637,7 @@ export async function resolveProxyForConnection(connectionId: string, apiKeyId?:
   // fallback candidates from the proxy pool.
   if (connectionRecord && !connectionProxyEnabled) {
     const result: ProxyResolutionResult = { proxy: null, level: "direct", levelId: null };
-    cacheProxyResolution(cacheKey, startGeneration, startRegistryGeneration, result);
+    cacheProxyResolution(cacheKey, stamp, result);
     return result;
   }
 
@@ -714,14 +660,15 @@ export async function resolveProxyForConnection(connectionId: string, apiKeyId?:
 
   // Step 2: API key-level proxy (only if per-key proxy is enabled globally or per-connection)
   if (apiKeyId) {
-    // Check if per-key proxy is allowed: globally OR per-connection
-    const perKeyEnabled = globalPerKeyProxyEnabled || connectionPerKeyProxyEnabled;
+    // Check if per-key proxy is allowed: the global toggle is a true override —
+    // when it is off, no connection's per-key assignment may apply, regardless
+    // of that connection's own per_key_proxy_enabled flag (#8385).
+    const perKeyEnabled = globalPerKeyProxyEnabled && connectionPerKeyProxyEnabled;
 
     if (perKeyEnabled) {
       try {
         const apiKeyRow = db.prepare("SELECT proxy_id FROM api_keys WHERE id = ?").get(apiKeyId) as
-          | { proxy_id?: string | null }
-          | undefined;
+          { proxy_id?: string | null } | undefined;
         if (apiKeyRow?.proxy_id) {
           const proxyRow = db
             .prepare(
@@ -751,7 +698,7 @@ export async function resolveProxyForConnection(connectionId: string, apiKeyId?:
               levelId: apiKeyId,
               source: "api_key" as const,
             };
-            cacheProxyResolution(cacheKey, startGeneration, startRegistryGeneration, result);
+            cacheProxyResolution(cacheKey, stamp, result);
             return result;
           }
         }
@@ -764,7 +711,7 @@ export async function resolveProxyForConnection(connectionId: string, apiKeyId?:
   // Step 3: Account-level registry
   const registryAccount = await resolveProxyForScopeFromRegistry("account", connectionId);
   if (registryAccount?.proxy) {
-    cacheProxyResolution(cacheKey, startGeneration, startRegistryGeneration, registryAccount);
+    cacheProxyResolution(cacheKey, stamp, registryAccount);
     return registryAccount;
   }
 
@@ -775,7 +722,7 @@ export async function resolveProxyForConnection(connectionId: string, apiKeyId?:
       level: "key",
       levelId: connectionId,
     };
-    cacheProxyResolution(cacheKey, startGeneration, startRegistryGeneration, result);
+    cacheProxyResolution(cacheKey, stamp, result);
     return result;
   }
 
@@ -788,38 +735,51 @@ export async function resolveProxyForConnection(connectionId: string, apiKeyId?:
         connectionProvider
       );
       if (registryProvider?.proxy) {
-        cacheProxyResolution(cacheKey, startGeneration, startRegistryGeneration, registryProvider);
+        cacheProxyResolution(cacheKey, stamp, registryProvider);
         return registryProvider;
       }
     }
 
-    // Step 7: Legacy combo-level (only if proxy_enabled)
-    if (connectionProxyEnabled && config.combos && Object.keys(config.combos).length > 0) {
+    // Step 7: Combo-level (only if proxy_enabled). For every combo whose model
+    // list references this connection's provider, check the modern registry
+    // (proxy_assignments, scope='combo') first — this is the assignment the
+    // dashboard's Combo "Set Proxy" modal actually writes to (#7149, where the
+    // registry write path and this read path had diverged, leaving combo-level
+    // proxy assignment completely inert). Fall back to the legacy in-memory
+    // combos map for any pre-existing legacy data.
+    if (connectionProvider && connectionProxyEnabled) {
       const combos = db.prepare("SELECT id, data FROM combos").all();
       for (const comboRow of combos) {
         const comboRecord = toRecord(comboRow);
         const comboId = typeof comboRecord.id === "string" ? comboRecord.id : null;
-        if (comboId && config.combos[comboId]) {
-          try {
-            const comboRaw = typeof comboRecord.data === "string" ? comboRecord.data : null;
-            if (!comboRaw) continue;
-            const combo = toRecord(JSON.parse(comboRaw));
-            const comboModels = Array.isArray(combo.models) ? combo.models : [];
-            const usesProvider = comboModels.some(
-              (entry) => getComboModelProvider(entry) === connectionProvider
-            );
-            if (usesProvider) {
-              const result = {
-                proxy: withFamilyDefault(config.combos[comboId]),
-                level: "combo",
-                levelId: comboId,
-              };
-              cacheProxyResolution(cacheKey, startGeneration, startRegistryGeneration, result);
-              return result;
-            }
-          } catch {
-            // Ignore malformed combo records during proxy resolution.
+        if (!comboId) continue;
+        try {
+          const comboRaw = typeof comboRecord.data === "string" ? comboRecord.data : null;
+          if (!comboRaw) continue;
+          const combo = toRecord(JSON.parse(comboRaw));
+          const comboModels = Array.isArray(combo.models) ? combo.models : [];
+          const usesProvider = comboModels.some(
+            (entry) => getComboModelProvider(entry) === connectionProvider
+          );
+          if (!usesProvider) continue;
+
+          const registryCombo = await resolveProxyForScopeFromRegistry("combo", comboId);
+          if (registryCombo?.proxy) {
+            cacheProxyResolution(cacheKey, stamp, registryCombo);
+            return registryCombo;
           }
+
+          if (config.combos?.[comboId]) {
+            const result = {
+              proxy: withFamilyDefault(config.combos[comboId]),
+              level: "combo",
+              levelId: comboId,
+            };
+            cacheProxyResolution(cacheKey, stamp, result);
+            return result;
+          }
+        } catch {
+          // Ignore malformed combo records during proxy resolution.
         }
       }
     }
@@ -831,22 +791,35 @@ export async function resolveProxyForConnection(connectionId: string, apiKeyId?:
         level: "provider",
         levelId: connectionProvider,
       };
-      cacheProxyResolution(cacheKey, startGeneration, startRegistryGeneration, result);
+      cacheProxyResolution(cacheKey, stamp, result);
       return result;
+    }
+  }
+
+  // Step 8.5 (#6272): no-auth providers (mimocode, opencode, ...) share a single
+  // synthetic connectionId that never matches a `provider_connections` row, so
+  // `connectionRecord` above is null and Steps 5-8 (which require it) never run for
+  // them — a provider-level proxy assigned to a no-auth provider was silently
+  // ignored. Best-effort fallback: scan the known no-auth provider ids directly.
+  if (!connectionRecord) {
+    const noAuthFallback = await resolveNoAuthSharedProviderProxy(config.providers, providerId);
+    if (noAuthFallback) {
+      cacheProxyResolution(cacheKey, stamp, noAuthFallback);
+      return noAuthFallback;
     }
   }
 
   // Step 9: Global registry
   const registryGlobal = await resolveProxyForScopeFromRegistry("global");
   if (registryGlobal?.proxy) {
-    cacheProxyResolution(cacheKey, startGeneration, startRegistryGeneration, registryGlobal);
+    cacheProxyResolution(cacheKey, stamp, registryGlobal);
     return registryGlobal;
   }
 
   // Step 10: Legacy global
   if (config.global) {
     const result = { proxy: withFamilyDefault(config.global), level: "global", levelId: null };
-    cacheProxyResolution(cacheKey, startGeneration, startRegistryGeneration, result);
+    cacheProxyResolution(cacheKey, stamp, result);
     return result;
   }
 
@@ -862,12 +835,7 @@ export async function resolveProxyForConnection(connectionId: string, apiKeyId?:
         fallback.proxy && typeof fallback.proxy === "object"
           ? { ...fallback, proxy: withFamilyDefault(fallback.proxy as ProxyValue) }
           : fallback;
-      cacheProxyResolution(
-        cacheKey,
-        startGeneration,
-        startRegistryGeneration,
-        normalizedFallback as ProxyResolutionResult
-      );
+      cacheProxyResolution(cacheKey, stamp, normalizedFallback as ProxyResolutionResult);
       return normalizedFallback;
     }
   } catch (err) {
@@ -915,236 +883,35 @@ export async function setProxyConfig(config: Record<string, unknown>) {
   return current;
 }
 
-// ──────────────── Cache Control Metrics ────────────────
-// Cache metrics are now computed from usage_history table on-the-fly
-// This avoids race conditions and keeps a single source of truth for token data
+// ──────────────── Re-exports from leaf modules ────────────────
 
-export async function getCacheMetrics() {
-  const db = getDbInstance();
+export {
+  type PricingSource,
+  type PricingSourceMap,
+  getPricing,
+  getPricingWithSources,
+  getPricingForModel,
+  updatePricing,
+  resetPricing,
+  resetAllPricing,
+} from "./settings/pricing";
 
-  try {
-    // Aggregate totals from usage_history
-    const totalsRow = db
-      .prepare(
-        `
-      SELECT
-        COUNT(*) as totalRequests,
-        SUM(tokens_input) as totalInputTokens,
-        SUM(tokens_cache_read) as totalCachedTokens,
-        SUM(tokens_cache_creation) as totalCacheCreationTokens
-      FROM usage_history
-      WHERE tokens_cache_read > 0 OR tokens_cache_creation > 0
-    `
-      )
-      .get() as
-      | {
-          totalRequests: number;
-          totalInputTokens: number | null;
-          totalCachedTokens: number | null;
-          totalCacheCreationTokens: number | null;
-        }
-      | undefined;
+export {
+  type LKGPRecord,
+  getLKGP,
+  setLKGP,
+  clearAllLKGP,
+  clearLKGP,
+  deleteLKGPByComboName,
+  deleteLKGPRowsByComboName,
+  deleteLKGPByConnectionIds,
+} from "./settings/lkgp";
 
-    // Get all requests count (including those without cache activity)
-    const allRequestsRow = db
-      .prepare(
-        `
-      SELECT COUNT(*) as totalRequests
-      FROM usage_history
-    `
-      )
-      .get() as { totalRequests: number } | undefined;
-
-    // Aggregate by provider
-    const byProviderRows = db
-      .prepare(
-        `
-      SELECT
-        provider,
-        COUNT(*) as totalRequests,
-        SUM(CASE WHEN tokens_cache_read > 0 OR tokens_cache_creation > 0 THEN 1 ELSE 0 END) as cachedRequests,
-        SUM(CASE WHEN tokens_cache_read > 0 OR tokens_cache_creation > 0 THEN tokens_input ELSE 0 END) as inputTokens,
-        SUM(tokens_cache_read) as cachedTokens,
-        SUM(tokens_cache_creation) as cacheCreationTokens
-      FROM usage_history
-      WHERE provider IS NOT NULL
-      GROUP BY provider
-      HAVING cachedRequests > 0
-    `
-      )
-      .all() as Array<{
-      provider: string;
-      totalRequests: number;
-      cachedRequests: number;
-      inputTokens: number | null;
-      cachedTokens: number | null;
-      cacheCreationTokens: number | null;
-    }>;
-
-    // Aggregate by combo strategy (direct requests stored as 'direct')
-    const byStrategyRows = db
-      .prepare(
-        `
-      SELECT
-        COALESCE(combo_strategy, 'direct') as strategy,
-        COUNT(*) as requests,
-        SUM(tokens_input) as inputTokens,
-        SUM(tokens_cache_read) as cachedTokens,
-        SUM(tokens_cache_creation) as cacheCreationTokens
-      FROM usage_history
-      WHERE (tokens_cache_read > 0 OR tokens_cache_creation > 0)
-      GROUP BY combo_strategy
-    `
-      )
-      .all() as Array<{
-      strategy: string;
-      requests: number;
-      inputTokens: number | null;
-      cachedTokens: number | null;
-      cacheCreationTokens: number | null;
-    }>;
-
-    const tokensSaved = totalsRow?.totalCachedTokens || 0;
-
-    const AVG_INPUT_PRICE_PER_MILLION = 3;
-    const CACHE_DISCOUNT = 0.9;
-    const estimatedCostSaved =
-      Math.round((tokensSaved / 1_000_000) * AVG_INPUT_PRICE_PER_MILLION * CACHE_DISCOUNT * 100) /
-      100;
-
-    // Build byProvider object
-    const byProvider: Record<
-      string,
-      {
-        requests: number;
-        totalRequests: number;
-        cachedRequests: number;
-        inputTokens: number;
-        cachedTokens: number;
-        cacheCreationTokens: number;
-      }
-    > = {};
-    for (const row of byProviderRows) {
-      byProvider[row.provider] = {
-        requests: row.cachedRequests,
-        totalRequests: row.totalRequests,
-        cachedRequests: row.cachedRequests,
-        inputTokens: row.inputTokens || 0,
-        cachedTokens: row.cachedTokens || 0,
-        cacheCreationTokens: row.cacheCreationTokens || 0,
-      };
-    }
-
-    // Build byStrategy object
-    const byStrategy: Record<
-      string,
-      {
-        requests: number;
-        inputTokens: number;
-        cachedTokens: number;
-        cacheCreationTokens: number;
-      }
-    > = {};
-    for (const row of byStrategyRows) {
-      byStrategy[row.strategy] = {
-        requests: row.requests,
-        inputTokens: row.inputTokens || 0,
-        cachedTokens: row.cachedTokens || 0,
-        cacheCreationTokens: row.cacheCreationTokens || 0,
-      };
-    }
-
-    return {
-      totalRequests: allRequestsRow?.totalRequests || totalsRow?.totalRequests || 0,
-      requestsWithCacheControl: totalsRow?.totalRequests || 0,
-      totalInputTokens: totalsRow?.totalInputTokens || 0,
-      totalCachedTokens: totalsRow?.totalCachedTokens || 0,
-      totalCacheCreationTokens: totalsRow?.totalCacheCreationTokens || 0,
-      tokensSaved,
-      estimatedCostSaved,
-      byProvider,
-      byStrategy,
-      lastUpdated: new Date().toISOString(),
-    };
-  } catch (error) {
-    console.error("Failed to fetch cache metrics from usage_history:", error);
-    return {
-      totalRequests: 0,
-      requestsWithCacheControl: 0,
-      totalInputTokens: 0,
-      totalCachedTokens: 0,
-      totalCacheCreationTokens: 0,
-      tokensSaved: 0,
-      estimatedCostSaved: 0,
-      byProvider: {},
-      byStrategy: {},
-      lastUpdated: new Date().toISOString(),
-    };
-  }
-}
-
-export async function updateCacheMetrics(_metrics: Record<string, unknown>) {
-  // No-op: metrics are now computed from usage_history on-the-fly
-  // The usage_history table is the single source of truth
-  return getCacheMetrics();
-}
-
-export interface CacheTrendPoint {
-  timestamp: string;
-  requests: number;
-  cachedRequests: number;
-  inputTokens: number;
-  cachedTokens: number;
-  cacheCreationTokens: number;
-}
-
-export async function getCacheTrend(hours = 24): Promise<CacheTrendPoint[]> {
-  const db = getDbInstance();
-
-  try {
-    const rows = db
-      .prepare(
-        `
-        SELECT
-          strftime('%Y-%m-%dT%H:00:00Z', timestamp) as hour,
-          COUNT(*) as requests,
-          SUM(CASE WHEN tokens_cache_read > 0 OR tokens_cache_creation > 0 THEN 1 ELSE 0 END) as cachedRequests,
-          SUM(tokens_input) as inputTokens,
-          SUM(tokens_cache_read) as cachedTokens,
-          SUM(tokens_cache_creation) as cacheCreationTokens
-        FROM usage_history
-        WHERE timestamp >= datetime('now', ?)
-        GROUP BY hour
-        ORDER BY hour ASC
-      `
-      )
-      .all(`-${hours} hours`) as Array<{
-      hour: string;
-      requests: number;
-      cachedRequests: number;
-      inputTokens: number | null;
-      cachedTokens: number | null;
-      cacheCreationTokens: number | null;
-    }>;
-
-    return rows.map((r) => ({
-      timestamp: r.hour,
-      requests: r.requests,
-      cachedRequests: r.cachedRequests,
-      inputTokens: r.inputTokens || 0,
-      cachedTokens: r.cachedTokens || 0,
-      cacheCreationTokens: r.cacheCreationTokens || 0,
-    }));
-  } catch (error) {
-    console.error("Failed to fetch cache trend:", error);
-    return [];
-  }
-}
-
-export async function resetCacheMetrics() {
-  // No-op: cache metrics are computed from usage_history.
-  console.warn(
-    "resetCacheMetrics is deprecated - cache metrics are now computed from usage_history"
-  );
-  return getCacheMetrics();
-}
+export {
+  type CacheTrendPoint,
+  getCacheMetrics,
+  updateCacheMetrics,
+  getCacheTrend,
+  resetCacheMetrics,
+} from "./settings/cacheMetrics";
+export { getCachedSettings } from "./readCache";

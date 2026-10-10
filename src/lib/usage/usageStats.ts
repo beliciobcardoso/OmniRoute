@@ -12,7 +12,9 @@ import { getApiKeys } from "../db/apiKeys";
 import { getPendingRequests } from "./usageHistory";
 import { getAccountDisplayName } from "@/lib/display/names";
 import { calculateCost } from "./costCalculator";
+import { isFlatRateProvider } from "./flatRateProviders";
 import { getRawDataCutoffDate, isAggregationEnabled } from "./aggregateHistory";
+import { toNumber } from "@/shared/utils/numeric";
 
 type JsonRecord = Record<string, unknown>;
 type UsageBucket = {
@@ -42,15 +44,6 @@ type ActiveRequest = {
 
 function asRecord(value: unknown): JsonRecord {
   return value && typeof value === "object" && !Array.isArray(value) ? (value as JsonRecord) : {};
-}
-
-function toNumber(value: unknown): number {
-  if (typeof value === "number" && Number.isFinite(value)) return value;
-  if (typeof value === "string" && value.trim().length > 0) {
-    const parsed = Number(value);
-    return Number.isFinite(parsed) ? parsed : 0;
-  }
-  return 0;
 }
 
 function toStringOrEmpty(value: unknown): string {
@@ -166,9 +159,12 @@ async function calculateAggregateCost(row: JsonRecord): Promise<number> {
       cacheCreation: toNumber(row.cost_tokens_cache_creation ?? row.tokens_cache_creation),
       reasoning: toNumber(row.cost_tokens_reasoning ?? row.tokens_reasoning),
     },
-    { serviceTier }
+    { provider, serviceTier, flatRateAsZero: true }
   );
-  return storedCost + calculatedCost;
+  // daily_usage_summary stores API-equivalent value so the dedicated costs
+  // view can preserve history. This legacy stats surface keeps billed-cost
+  // semantics for flat-rate subscriptions.
+  return (isFlatRateProvider(provider) ? 0 : storedCost) + calculatedCost;
 }
 
 function addUsage(
@@ -272,7 +268,11 @@ export async function getConnectionSpendUsdSinceAdded(
       cacheCreation: Number(row.cacheCreation ?? 0),
       reasoning: Number(row.reasoning ?? 0),
     };
-    costUsd += await calculateCost(provider, model, tokens, { provider, model });
+    costUsd += await calculateCost(provider, model, tokens, {
+      provider,
+      model,
+      flatRateAsZero: true,
+    });
   }
 
   return { costUsd: Math.max(0, costUsd), requests };
@@ -289,7 +289,7 @@ export async function getUsageStats() {
   const sourceSql = buildUsageSourceSql(aggregationEnabled);
   const sourceParams = aggregationEnabled && cutoffDate ? [cutoffDate, cutoffDate] : [];
 
-  const { getProviderConnections } = await import("@/lib/localDb");
+  const { getProviderConnections } = await import("@/lib/db/providers");
   let allConnections: unknown[] = [];
   try {
     const loadedConnections = await getProviderConnections();
@@ -318,6 +318,10 @@ export async function getUsageStats() {
   }
 
   const pendingRequests = getPendingRequests();
+  const publicPendingRequests = {
+    byModel: pendingRequests.byModel,
+    byAccount: pendingRequests.byAccount,
+  };
 
   const stats: {
     totalRequests: number;
@@ -329,7 +333,7 @@ export async function getUsageStats() {
     byAccount: Record<string, UsageBreakdown>;
     byApiKey: Record<string, UsageBreakdown>;
     last10Minutes: UsageBucket[];
-    pending: ReturnType<typeof getPendingRequests>;
+    pending: Pick<ReturnType<typeof getPendingRequests>, "byModel" | "byAccount">;
     activeRequests: ActiveRequest[];
   } = {
     totalRequests: 0,
@@ -341,7 +345,7 @@ export async function getUsageStats() {
     byAccount: {},
     byApiKey: {},
     last10Minutes: [],
-    pending: pendingRequests,
+    pending: publicPendingRequests,
     activeRequests: [],
   };
 

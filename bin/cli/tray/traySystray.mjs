@@ -14,30 +14,33 @@ export function isTraySupported() {
   return true;
 }
 
-function loadSystray2() {
-  const candidates = [
-    () => {
-      const { createRequire } = require("module");
-      const req = createRequire(import.meta.url);
-      return req("systray2").default;
-    },
-  ];
-  for (const attempt of candidates) {
-    try {
-      return attempt();
-    } catch {}
-  }
-  return null;
+// systray2 is NOT a static dependency — it is lazily installed into
+// ~/.omniroute/runtime by trayRuntime.ts (loadSystray). The previous inline
+// loader called `require("module")`, which throws `ReferenceError: require is
+// not defined` in this ESM file (package "type":"module"); the throw was
+// silently swallowed, so the tray never appeared on macOS/Linux with no error
+// printed (#4605, regressed in v3.8.34). Delegate to the runtime loader, which
+// resolves systray2 from the runtime dir and surfaces install/import failures.
+async function loadSystray2() {
+  const { loadSystray } = await import("../runtime/trayRuntime.ts");
+  return loadSystray();
 }
 
 function getIconBase64() {
-  const iconPath = join(__dirname, "icons", "icon.png");
+  // Icon ships at bin/cli/tray/icon.png — the previous "icons/icon.png" path
+  // never existed, so the tray was created with an empty icon (#4605).
+  // systray2 expects an ICO payload on Windows; the PNG asset is used elsewhere.
+  // (ported from #13991, credit @prabhtheone)
+  const iconPath = join(__dirname, process.platform === "win32" ? "icon.ico" : "icon.png");
   if (existsSync(iconPath)) return readFileSync(iconPath).toString("base64");
   return "";
 }
 
-export function initSystrayUnix({ port, onQuit, onOpenDashboard, onShowLogs }) {
-  const SysTray = loadSystray2();
+export async function initSystrayUnix(
+  { port, onQuit, onOpenDashboard, onShowLogs },
+  loadCtor = loadSystray2
+) {
+  const SysTray = await loadCtor();
   if (!SysTray) return null;
 
   const autostartEnabled = isAutostartEnabled();
@@ -57,7 +60,10 @@ export function initSystrayUnix({ port, onQuit, onOpenDashboard, onShowLogs }) {
     tray = new SysTray({
       menu: {
         icon: getIconBase64(),
-        isTemplateIcon: process.platform === "darwin",
+        // isTemplateIcon must be false: icon.png is a full-color RGBA logo, and
+        // macOS template mode uses only the alpha channel → a solid white square
+        // (the icon looked "missing" even when the tray loaded). (PR #1080)
+        isTemplateIcon: false,
         title: "",
         tooltip: `OmniRoute — port ${port}`,
         items,
@@ -93,9 +99,7 @@ export function initSystrayUnix({ port, onQuit, onOpenDashboard, onShowLogs }) {
     }
   });
 
-  tray.ready().catch((err) => {
-    process.stderr.write(`[omniroute][tray] systray2 failed: ${err?.message ?? String(err)}\n`);
-  });
+  await tray.ready();
 
   return tray;
 }

@@ -1,7 +1,13 @@
 import { NextResponse } from "next/server";
-import { getProviderConnectionById } from "@/models";
-import { getSyncedAvailableModelsForConnection } from "@/lib/db/models";
+import { defaultLogger as log } from "@omniroute/open-sse/utils/logger";
+import { getCachedProviderConnectionById } from "@/lib/db/readCache";
+import {
+  deleteImportedCustomModels,
+  deleteSyncedAvailableModelsForProvider,
+  getSyncedAvailableModelsForConnection,
+} from "@/lib/db/models";
 import { selectModelsForImport } from "@/shared/utils/freeModels";
+import { resolveEffectiveAvailableModels } from "@/shared/utils/modelListResolution";
 import {
   importManagedModels,
   type ManagedModelImportMode,
@@ -10,10 +16,28 @@ import { saveCallLog } from "@/lib/usage/callLogs";
 import { isAuthenticated } from "@/shared/utils/apiAuth";
 import {
   buildModelSyncInternalHeaders,
+  fetchModelSyncInternal,
+  getModelSyncInternalBaseUrl,
   isModelSyncInternalRequest,
 } from "@/shared/services/modelSyncScheduler";
+import { autoSyncCodexProfilesFromLiveCatalog } from "@/lib/cli-helper/codexProfileAutoSync";
+import { autoSyncClaudeProfilesFromLiveCatalog } from "@/lib/cli-helper/claudeProfileAutoSync";
+import { getSearchProvider } from "@omniroute/open-sse/config/searchRegistry.ts";
+import { providerUsesCuratedModelsOnly } from "@/lib/providers/modelListingCapability";
+import {
+  fetchVolcPlanModels,
+  providerToVolcPlanKind,
+} from "@/lib/providers/volcenginePlanModelDiscovery";
+import { replaceSyncedAvailableModelsForConnection } from "@/lib/db/models";
 import { GET as getProviderModels } from "../models/route";
+import { isDegradedDiscovery } from "./degradedLocalCatalog";
 import { sanitizeErrorMessage } from "@omniroute/open-sse/utils/error";
+import { findStaleComboModelRefs, type StaleComboModelRef } from "@/lib/combos/staleModelRefs";
+import {
+  isStaleComboAutoPruneEnabled,
+  pruneStaleComboModelRefs,
+} from "@/lib/combos/staleModelPrune";
+import { logAuditEvent } from "@/lib/compliance/index";
 
 type JsonRecord = Record<string, unknown>;
 
@@ -165,19 +189,35 @@ function getModelSyncChannelLabel(connection: unknown) {
 // await the same promise; the underlying HTTP probe runs exactly once per
 // process. Resolves on first HTTP response (any status — even 4xx confirms the
 // server is up); rejects only if maxWaitMs elapses with consistent network
-// errors.
+// errors. On rejection the promise is NOT memorized: the gate re-probes for the
+// next caller after the retry window, so a boot-time failure cannot condemn the
+// process to the in-process fallback for its whole lifetime.
 let __loopbackReadyPromise: Promise<void> | null = null;
+let __loopbackLastFailureAt = 0;
+
+/** Anti-storm bound: minimum interval between two probes after a failure. */
+const LOOPBACK_RETRY_MIN_INTERVAL_MS = 30_000;
 
 export type EnsureReadyOptions = {
   fetch?: typeof fetch;
   maxWaitMs?: number;
   pollMs?: number;
+  /** Minimum interval between two probes after a failure (anti-storm). */
+  minRetryIntervalMs?: number;
 };
 
 export async function ensureLoopbackServerReady(opts: EnsureReadyOptions = {}): Promise<void> {
   if (__loopbackReadyPromise != null) return __loopbackReadyPromise;
+  const minRetryIntervalMs = opts.minRetryIntervalMs ?? LOOPBACK_RETRY_MIN_INTERVAL_MS;
+  if (Date.now() - __loopbackLastFailureAt < minRetryIntervalMs) {
+    // Anti-storm window: reject immediately without re-probing — callers in the
+    // same burst all fall back to the in-process route.
+    throw new Error(
+      `loopback server not ready (probe failed ${Date.now() - __loopbackLastFailureAt}ms ago; retry after ${minRetryIntervalMs}ms)`
+    );
+  }
   __loopbackReadyPromise = (async () => {
-    const f = opts.fetch ?? fetch;
+    const f = opts.fetch ?? fetchModelSyncInternal;
     const maxWaitMs = opts.maxWaitMs ?? 30_000;
     const pollMs = opts.pollMs ?? 250;
     const deadline = Date.now() + maxWaitMs;
@@ -188,10 +228,10 @@ export async function ensureLoopbackServerReady(opts: EnsureReadyOptions = {}): 
         // readiness — we only care that the dispatcher succeeds (no
         // ECONNREFUSED). Using a synthetic connection id so no real DB lookup
         // is needed; the 404 is sufficient proof the server is dispatching.
-        const probePort = process.env.OMNIROUTE_PORT || process.env.PORT || "20128";
         const res = await f(
-          `http://127.0.0.1:${probePort}/api/providers/__readiness_probe__/models`,
+          `${getModelSyncInternalBaseUrl()}/api/providers/__readiness_probe__/models`,
           {
+            redirect: "error",
             signal: AbortSignal.timeout(2_000),
           }
         );
@@ -203,12 +243,23 @@ export async function ensureLoopbackServerReady(opts: EnsureReadyOptions = {}): 
     }
     throw new Error(`loopback server not ready within ${maxWaitMs}ms: ${String(lastErr)}`);
   })();
+  void __loopbackReadyPromise.catch((err) => {
+    // Memorize success only: release the gate for the next probe, bounded by
+    // the anti-storm window. The handler does not reject — callers receive the
+    // rejection of the original promise.
+    __loopbackLastFailureAt = Date.now();
+    __loopbackReadyPromise = null;
+    console.warn(
+      `[ModelSync] Loopback server readiness probe failed; falling back to in-process route: ${String(err)}`
+    );
+  });
   return __loopbackReadyPromise;
 }
 
 /** Test helper: reset the cached promise so tests can re-exercise the probe. */
 export function __resetLoopbackReadinessForTests(): void {
   __loopbackReadyPromise = null;
+  __loopbackLastFailureAt = 0;
 }
 
 // ---------------------------------------------------------------------------
@@ -261,7 +312,7 @@ export async function selfFetchWithRetry(
   url: string,
   opts: SelfFetchWithRetryOptions = {}
 ): Promise<Response> {
-  const f = opts.fetch ?? fetch;
+  const f = opts.fetch ?? fetchModelSyncInternal;
   // Reduced from 5 to 3: the readiness gate now handles the boot race.
   // Retries here are only for transient failures after server is confirmed up.
   const maxRetries = opts.maxRetries ?? 3;
@@ -274,11 +325,9 @@ export async function selfFetchWithRetry(
   if (opts.skipReadinessGate !== true) {
     try {
       await ensureLoopbackServerReady({ fetch: f });
-    } catch (err) {
+    } catch {
       // Readiness probe timed out — fall straight through to in-process fallback.
-      console.warn(
-        `[ModelSync] Loopback server readiness probe failed; falling back to in-process route immediately (${connLabel}): ${String(err)}`
-      );
+      // The transition is logged once by the gate itself (per probe, not per caller).
       if (opts.inProcessFallback) {
         return opts.inProcessFallback();
       }
@@ -318,30 +367,21 @@ export async function selfFetchWithRetry(
 // ---------------------------------------------------------------------------
 
 async function fetchProviderModelsForSync(request: Request, connectionId: string) {
-  // Construct a safe localhost URL from the incoming request's origin.
-  // The route only accepts authenticated or internal-scheduler requests,
-  // and the path is hardcoded — no user-controlled URL components reach fetch.
-  // Always use 127.0.0.1 (IPv4) — never "localhost" which may resolve to ::1
-  // (IPv6) in containers, causing TypeError: fetch failed even when the HTTP
-  // server is bound only to 0.0.0.0 (IPv4 only).
-  const SAFE_HOSTS = new Set(["localhost", "127.0.0.1", "0.0.0.0", "::1"]);
-  const incomingUrl = new URL(request.url);
-  const loopbackPort =
-    SAFE_HOSTS.has(incomingUrl.hostname) && incomingUrl.port
-      ? incomingUrl.port
-      : process.env.PORT || "20128";
-  const safeOrigin = `http://127.0.0.1:${loopbackPort}`;
-  const modelsPath = `/api/providers/${encodeURIComponent(connectionId)}/models?refresh=true`;
+  const safeOrigin = getModelSyncInternalBaseUrl();
+  const modelsPath =
+    `/api/providers/${encodeURIComponent(connectionId)}/models` +
+    "?refresh=true&excludeCustom=true";
   const headers = {
     cookie: request.headers.get("cookie") || "",
+    "x-omniroute-model-surface": "chat",
     ...buildModelSyncInternalHeaders(),
   };
 
-  const targetUrl = new URL(modelsPath, safeOrigin).href;
+  const targetUrl = `${safeOrigin}${modelsPath}`;
 
   // Wrap fetch so it forwards the required headers on every retry attempt.
   const fetchWithHeaders: typeof fetch = (input, init) =>
-    fetch(input as string, { ...init, headers });
+    fetchModelSyncInternal(input, { ...init, headers, redirect: "error" });
 
   return selfFetchWithRetry(targetUrl, {
     fetch: fetchWithHeaders,
@@ -373,9 +413,12 @@ async function fetchProviderModelsForSync(request: Request, connectionId: string
 export async function POST(request: Request, { params }: { params: Promise<{ id: string }> }) {
   const start = Date.now();
   const { id } = await params;
+  const requestUrl = new URL(request.url);
   const mode = (
-    new URL(request.url).searchParams.get("mode") === "import" ? "merge" : "sync"
+    requestUrl.searchParams.get("mode") === "import" ? "merge" : "sync"
   ) as ManagedModelImportMode;
+  // quiet=1: boot revalidation path — skip chatty ModelSync console lines
+  const quiet = requestUrl.searchParams.get("quiet") === "1";
   let logProvider = "unknown";
   let channelLabel: string | null = null;
 
@@ -387,13 +430,111 @@ export async function POST(request: Request, { params }: { params: Promise<{ id:
       );
     }
 
-    const connection = await getProviderConnectionById(id);
+    const connection = await getCachedProviderConnectionById(id);
     if (!connection) {
       return NextResponse.json({ error: "Connection not found" }, { status: 404 });
     }
 
     logProvider = toNonEmptyString(connection.provider) || "unknown";
     channelLabel = getModelSyncChannelLabel(connection);
+
+    // Volcano Ark plan providers: discover models live from the console API
+    // (cookie+csrf captured at bind time). The chat API has no /models
+    // endpoint, so the default discovery path below cannot serve them.
+    const volcPlanKind = providerToVolcPlanKind(logProvider);
+    if (volcPlanKind) {
+      const psd =
+        connection.providerSpecificData && typeof connection.providerSpecificData === "object"
+          ? (connection.providerSpecificData as JsonRecord)
+          : {};
+      const cookie = toNonEmptyString(psd.volcConsoleCookie) || "";
+      const csrf = toNonEmptyString(psd.volcCsrfToken) || "";
+      const duration = Date.now() - start;
+      let discovered;
+      try {
+        discovered = await fetchVolcPlanModels(volcPlanKind, cookie, csrf);
+      } catch (err: unknown) {
+        const message = err instanceof Error ? err.message : String(err);
+        await saveCallLog({
+          method: "POST",
+          path: `/api/providers/${id}/sync-models`,
+          status: 401,
+          model: "model-sync",
+          provider: logProvider,
+          sourceFormat: "-",
+          connectionId: id,
+          duration,
+          error: message,
+          requestType: "model-sync",
+          ...(channelLabel ? { responseBody: { channel: channelLabel } } : {}),
+        }).catch(() => undefined);
+        return NextResponse.json(
+          { error: sanitizeErrorMessage(message) || "Volcano plan discovery failed" },
+          { status: 401 }
+        );
+      }
+      const previous = await getSyncedAvailableModelsForConnection(logProvider, id);
+      const synced = await replaceSyncedAvailableModelsForConnection(logProvider, id, discovered);
+      const prevIds = new Set(previous.map((m) => String(m.id)));
+      const added = synced.filter((m) => !prevIds.has(String(m.id))).length;
+      const removed = previous.filter(
+        (m) => !synced.some((n) => String(n.id) === String(m.id))
+      ).length;
+      await saveCallLog({
+        method: "GET",
+        path: `/api/providers/${id}/models`,
+        status: 200,
+        model: "model-sync",
+        provider: logProvider,
+        sourceFormat: "console-discovery",
+        connectionId: id,
+        duration: Date.now() - start,
+        requestType: "model-sync",
+        responseBody: {
+          source: "volcengine-plan-console-discovery",
+          plan: volcPlanKind,
+          syncedModels: synced.length,
+          added,
+          removed,
+          provider: logProvider,
+          channel: channelLabel,
+          mode,
+        },
+      }).catch(() => undefined);
+      return NextResponse.json({
+        ok: true,
+        provider: logProvider,
+        connectionId: id,
+        source: "volcengine-plan-console-discovery",
+        plan: volcPlanKind,
+        mode,
+        syncedModels: synced.length,
+        availableModelsCount: synced.length,
+        modelChanges: { added, removed, total: added + removed },
+        models: synced,
+      });
+    }
+
+    const isSearchProvider = getSearchProvider(logProvider) !== null;
+    if (providerUsesCuratedModelsOnly(logProvider) || isSearchProvider) {
+      const [removedSyncedLists, removedImportedModelIds] = await Promise.all([
+        deleteSyncedAvailableModelsForProvider(logProvider),
+        deleteImportedCustomModels(logProvider),
+      ]);
+      return NextResponse.json({
+        provider: logProvider,
+        connectionId: id,
+        source: isSearchProvider ? "search" : "curated",
+        skipped: isSearchProvider ? "search-provider" : "curated-models-only",
+        syncedModels: 0,
+        availableModelsCount: 0,
+        models: [],
+        cleanup: {
+          removedSyncedLists,
+          removedImportedModels: removedImportedModelIds.length,
+        },
+      });
+    }
     const previousSyncedAvailableModelsForConnection = await getSyncedAvailableModelsForConnection(
       logProvider,
       id
@@ -442,9 +583,9 @@ export async function POST(request: Request, { params }: { params: Promise<{ id:
 
     const modelSource = toNonEmptyString(modelsData.source)?.toLowerCase() || "unknown";
     const modelWarning = toNonEmptyString(modelsData.warning);
-    if (modelSource === "local_catalog") {
+    if (isDegradedDiscovery(modelsData)) {
       const responseError =
-        modelWarning || "Remote model discovery failed; local catalog fallback not synced";
+        modelWarning || "Remote model discovery failed; catalog fallback not synced";
       await saveCallLog({
         method: "GET",
         path: `/api/providers/${id}/models`,
@@ -476,8 +617,7 @@ export async function POST(request: Request, { params }: { params: Promise<{ id:
 
     const allFetchedModels = modelsData.models || [];
     const importFreeOnly = Boolean(
-      (connection.providerSpecificData as Record<string, unknown> | undefined)
-        ?.importFreeModelsOnly
+      (connection.providerSpecificData as Record<string, unknown> | undefined)?.importFreeModelsOnly
     );
     const { models: fetchedModels, freeFilterEmpty } = selectModelsForImport(
       logProvider,
@@ -501,15 +641,25 @@ export async function POST(request: Request, { params }: { params: Promise<{ id:
       previousSyncedAvailableModels: previousSyncedAvailableModelsForConnection,
     });
 
-    const effectiveAvailableModels =
-      discoveredModels.length > 0 ? discoveredModels : syncedAvailableModels;
+    const effectiveAvailableModels = resolveEffectiveAvailableModels(
+      freeFilterEmpty,
+      discoveredModels,
+      syncedAvailableModels
+    );
+    if (freeFilterEmpty) {
+      log.warn(
+        "SYNC",
+        `freeFilterEmpty: ${Array.isArray(allFetchedModels) ? allFetchedModels.length : 0} fetched, 0 free — not falling back to stale syncedAvailableModels (${logProvider})`
+      );
+    }
     const modelChanges = summarizeModelChanges(
       previousSyncedAvailableModels,
       effectiveAvailableModels
     );
     const customModelChanges = summarizeModelChanges(previousModels, persistedModels);
-    const syncedModelsCount =
-      effectiveAvailableModels.length > 0
+    const syncedModelsCount = freeFilterEmpty
+      ? 0
+      : effectiveAvailableModels.length > 0
         ? effectiveAvailableModels.length
         : persistedModels.filter((model) => isManagedSyncedModel(model)).length;
     const availableModelsCount = new Set(
@@ -520,6 +670,103 @@ export async function POST(request: Request, { params }: { params: Promise<{ id:
     const importedCount = importedChanges.added;
     const updatedCount = importedChanges.updated;
     const shouldLog = modelChanges.total > 0 || customModelChanges.total > 0;
+
+    if (shouldLog && !quiet) {
+      void autoSyncCodexProfilesFromLiveCatalog(request, `model-sync:${logProvider}`)
+        .then((syncResult) => {
+          if (syncResult.ok) {
+            console.log(
+              `[ModelSync] Codex profile auto-sync wrote ${syncResult.written} profile(s), skipped ${syncResult.skipped} (${logProvider})`
+            );
+          } else {
+            console.log(
+              `[ModelSync] Codex profile auto-sync skipped for ${logProvider}: ${syncResult.reason}`
+            );
+          }
+        })
+        .catch((err) => {
+          console.log(
+            `[ModelSync] Codex profile auto-sync failed for ${logProvider}:`,
+            err?.message || err
+          );
+        });
+
+      void autoSyncClaudeProfilesFromLiveCatalog(request, `model-sync:${logProvider}`)
+        .then((syncResult) => {
+          if (syncResult.ok) {
+            console.log(
+              `[ModelSync] Claude profile auto-sync wrote ${syncResult.written} profile(s), skipped ${syncResult.skipped} (${logProvider})`
+            );
+          } else {
+            console.log(
+              `[ModelSync] Claude profile auto-sync skipped for ${logProvider}: ${syncResult.reason}`
+            );
+          }
+        })
+        .catch((err) => {
+          console.log(
+            `[ModelSync] Claude profile auto-sync failed for ${logProvider}:`,
+            err?.message || err
+          );
+        });
+    } else if (shouldLog && quiet) {
+      // Still update profiles; suppress console noise from boot revalidation.
+      void autoSyncCodexProfilesFromLiveCatalog(request, `model-sync:${logProvider}`).catch(
+        () => undefined
+      );
+      void autoSyncClaudeProfilesFromLiveCatalog(request, `model-sync:${logProvider}`).catch(
+        () => undefined
+      );
+    }
+
+    // #13505: flag combo steps pinned to models this sync dropped. Failed and
+    // degraded syncs returned above; a free-only import is a deliberate subset,
+    // so it never prunes. Errors must not fail the sync, so they are swallowed.
+    let staleComboRefs: StaleComboModelRef[] = [];
+    let prunedComboRefs: StaleComboModelRef[] = [];
+    try {
+      staleComboRefs = await findStaleComboModelRefs(logProvider);
+      if (
+        staleComboRefs.length > 0 &&
+        !importFreeOnly &&
+        !freeFilterEmpty &&
+        isStaleComboAutoPruneEnabled()
+      ) {
+        prunedComboRefs = await pruneStaleComboModelRefs(staleComboRefs);
+        for (const ref of prunedComboRefs) {
+          logAuditEvent({
+            action: "combo.stale_model_ref.pruned",
+            actor: "system",
+            target: ref.comboName,
+            resourceType: "combo",
+            details: { connectionId: id, provider: logProvider, ...ref },
+          });
+        }
+        staleComboRefs = staleComboRefs.filter((ref) => !prunedComboRefs.includes(ref));
+      }
+      if (staleComboRefs.length > 0) {
+        if (!quiet) {
+          log.warn(
+            "SYNC",
+            `${staleComboRefs.length} combo step(s) pin models missing from the ${logProvider} catalog: ${staleComboRefs.map((ref) => `${ref.comboName} -> ${ref.model}`).join(", ")}`
+          );
+        }
+        // Audit only when the catalog changed, so periodic syncs don't repeat it.
+        if (shouldLog) {
+          logAuditEvent({
+            action: "combo.stale_model_refs.flagged",
+            actor: "system",
+            target: logProvider,
+            resourceType: "combo",
+            details: { connectionId: id, staleComboRefs },
+          });
+        }
+      }
+    } catch (error) {
+      if (!quiet) {
+        log.warn("SYNC", `stale combo ref check failed for ${logProvider}: ${String(error)}`);
+      }
+    }
 
     if (shouldLog) {
       await saveCallLog({
@@ -564,6 +811,8 @@ export async function POST(request: Request, { params }: { params: Promise<{ id:
       logged: shouldLog,
       models: persistedModels,
       importedModels,
+      staleComboRefs,
+      prunedComboRefs,
     });
   } catch (error: any) {
     // Log error

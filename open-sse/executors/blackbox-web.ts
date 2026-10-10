@@ -7,11 +7,12 @@ import {
 import { FETCH_TIMEOUT_MS } from "../config/constants.ts";
 import { normalizeSessionCookieHeader } from "@/lib/providers/webCookieAuth";
 import { prepareToolMessages, buildToolAwareResult } from "../translator/webTools.ts";
+import { sanitizeErrorMessage } from "../utils/error.ts";
 
 const BLACKBOX_CHAT_API = "https://app.blackbox.ai/api/chat";
 const BLACKBOX_DEFAULT_COOKIE = "next-auth.session-token";
 const BLACKBOX_USER_AGENT =
-  "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/147.0.0.0 Safari/537.36";
+  "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36";
 
 const SESSION_CACHE_TTL_MS = 5 * 60_000; // 5 minutes
 
@@ -304,9 +305,7 @@ export class BlackboxWebExecutor extends BaseExecutor {
     upstreamExtraHeaders,
   }: ExecuteInput) {
     const bodyObj = (body || {}) as Record<string, unknown>;
-    const messages = bodyObj.messages as
-      | Array<Record<string, unknown>>
-      | undefined;
+    const messages = bodyObj.messages as Array<Record<string, unknown>> | undefined;
     if (!messages || !Array.isArray(messages) || messages.length === 0) {
       const errorResponse = new Response(
         JSON.stringify({
@@ -325,7 +324,10 @@ export class BlackboxWebExecutor extends BaseExecutor {
       };
     }
 
-    const { hasTools, requestedTools, effectiveMessages } = prepareToolMessages(bodyObj, messages as Array<{ role: string; content: unknown }>);
+    const { hasTools, requestedTools, effectiveMessages } = prepareToolMessages(
+      bodyObj,
+      messages as Array<{ role: string; content: unknown }>
+    );
     const chatId = crypto.randomUUID().slice(0, 7);
     const parsedMessages = parseOpenAIMessages(effectiveMessages, chatId);
     if (parsedMessages.length === 0) {
@@ -508,7 +510,7 @@ export class BlackboxWebExecutor extends BaseExecutor {
         signal: combinedSignal,
       });
     } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
+      const message = sanitizeErrorMessage(error instanceof Error ? error.message : String(error));
       log?.error?.("BLACKBOX-WEB", `Fetch failed: ${message}`);
       const errorResponse = new Response(
         JSON.stringify({
@@ -649,12 +651,25 @@ export class BlackboxWebExecutor extends BaseExecutor {
     const created = Math.floor(Date.now() / 1000);
 
     if (hasTools) {
-      const { content, toolCalls, finishReason } = buildToolAwareResult(responseText, requestedTools, "bbx");
+      const { content, toolCalls, finishReason } = buildToolAwareResult(
+        responseText,
+        requestedTools,
+        "bbx"
+      );
       if (toolCalls) {
         const toolResponse = new Response(
           JSON.stringify({
-            id, object: "chat.completion", created, model,
-            choices: [{ index: 0, message: { role: "assistant", content: null, tool_calls: toolCalls }, finish_reason: finishReason }],
+            id,
+            object: "chat.completion",
+            created,
+            model,
+            choices: [
+              {
+                index: 0,
+                message: { role: "assistant", content: null, tool_calls: toolCalls },
+                finish_reason: finishReason,
+              },
+            ],
           }),
           { status: 200, headers: { "Content-Type": "application/json" } }
         );
@@ -663,7 +678,11 @@ export class BlackboxWebExecutor extends BaseExecutor {
       const finalResponse = stream
         ? new Response(buildStreamingResponse(content, model, id, created), {
             status: 200,
-            headers: { "Content-Type": "text/event-stream", "Cache-Control": "no-cache", "X-Accel-Buffering": "no" },
+            headers: {
+              "Content-Type": "text/event-stream",
+              "Cache-Control": "no-cache",
+              "X-Accel-Buffering": "no",
+            },
           })
         : buildNonStreamingResponse(content, model, id, created);
       return { response: finalResponse, url: BLACKBOX_CHAT_API, headers, transformedBody };

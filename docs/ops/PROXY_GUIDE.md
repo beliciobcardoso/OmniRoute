@@ -1,7 +1,7 @@
 ---
 title: "🌐 OmniRoute Proxy Guide"
-version: 3.8.2
-lastUpdated: 2026-05-13
+version: 3.8.40
+lastUpdated: 2026-06-28
 ---
 
 # 🌐 OmniRoute Proxy Guide
@@ -79,8 +79,6 @@ Even outside blocked regions, proxies are useful for:
 | **Settings Route**   | `src/app/api/settings/proxy/route.ts`        | Legacy proxy config API (GET/PUT/DELETE)                   |
 | **Management Route** | `src/app/api/v1/management/proxies/route.ts` | Registry CRUD API (GET/POST/PATCH/DELETE)                  |
 | **1proxy DB**        | `src/lib/db/oneproxy.ts`                     | Free proxy marketplace persistence                         |
-| **1proxy Sync**      | `src/lib/oneproxySync.ts`                    | Fetches proxies from 1proxy API                            |
-| **1proxy Rotator**   | `src/lib/oneproxyRotator.ts`                 | Rotation strategies (quality/random/sequential)            |
 
 ---
 
@@ -505,13 +503,9 @@ For exposing your OmniRoute instance to the public internet (Cloudflare/ngrok/Ta
 
 ## Environment Variables
 
-| Variable                         | Default                               | Description                                                    |
-| -------------------------------- | ------------------------------------- | -------------------------------------------------------------- |
-| `ENABLE_SOCKS5_PROXY`            | `true`                                | Enable SOCKS5 proxy support (default `true` in `.env.example`) |
-| `ONEPROXY_ENABLED`               | `true`                                | Enable 1proxy integration                                      |
-| `ONEPROXY_API_URL`               | `https://1proxy-api.aitradepulse.com` | 1proxy API endpoint                                            |
-| `ONEPROXY_MAX_PROXIES`           | `500`                                 | Maximum proxies to sync                                        |
-| `ONEPROXY_MIN_QUALITY_THRESHOLD` | `50`                                  | Minimum quality score to import                                |
+| Variable              | Default | Description                                                    |
+| --------------------- | ------- | -------------------------------------------------------------- |
+| `ENABLE_SOCKS5_PROXY` | `true`  | Enable SOCKS5 proxy support (default `true` in `.env.example`) |
 
 ---
 
@@ -620,19 +614,19 @@ Without this, a dead proxy would block every request for the full `PROXY_TIMEOUT
 
 ### Tunable Environment Variables
 
-| Variable | Default | Purpose |
-|----------|---------|---------|
-| `PROXY_FAST_FAIL_TIMEOUT_MS` | `2000` | TCP connection timeout per health check |
-| `PROXY_HEALTH_CACHE_TTL_MS` | `30000` | How long a health result is cached |
+| Variable                     | Default | Purpose                                 |
+| ---------------------------- | ------- | --------------------------------------- |
+| `PROXY_FAST_FAIL_TIMEOUT_MS` | `2000`  | TCP connection timeout per health check |
+| `PROXY_HEALTH_CACHE_TTL_MS`  | `30000` | How long a health result is cached      |
 
 **Recommended values:**
 
-| Scenario | Fast-fail timeout | Cache TTL | Reasoning |
-|----------|-------------------|-----------|-----------|
-| High-throughput API gateway | 1500ms | 60000ms | Aggressive fail-fast, longer cache to reduce checks |
-| Geo-distributed nodes | 3000ms | 15000ms | Slower networks need more time; shorter cache for fast failover |
-| Dev / testing | 1000ms | 10000ms | Quick iteration on local proxies |
-| Stealth / anti-detection | 2500ms | 45000ms | Avoid rapid probing that could trigger rate limits |
+| Scenario                    | Fast-fail timeout | Cache TTL | Reasoning                                                       |
+| --------------------------- | ----------------- | --------- | --------------------------------------------------------------- |
+| High-throughput API gateway | 1500ms            | 60000ms   | Aggressive fail-fast, longer cache to reduce checks             |
+| Geo-distributed nodes       | 3000ms            | 15000ms   | Slower networks need more time; shorter cache for fast failover |
+| Dev / testing               | 1000ms            | 10000ms   | Quick iteration on local proxies                                |
+| Stealth / anti-detection    | 2500ms            | 45000ms   | Avoid rapid probing that could trigger rate limits              |
 
 ### Inspecting Proxy Health
 
@@ -645,7 +639,7 @@ for (const s of statuses) {
 }
 
 // Force re-check a specific proxy
-invalidateProxyHealth("http://user:pass@1.2.3.4:8080");
+invalidateProxyHealth("http://user:pass@203.0.113.7:8080");
 ```
 
 The `stale` flag is `true` when the cache entry has exceeded `HEALTH_CACHE_TTL_MS` and the next request will trigger a fresh check.
@@ -654,11 +648,11 @@ The `stale` flag is `true` when the cache entry has exceeded `HEALTH_CACHE_TTL_M
 
 The health check uses sensible defaults based on the URL scheme:
 
-| Scheme | Default port |
-|--------|-------------|
-| `http://` | 8080 |
-| `https://` | 443 |
-| `socks5://` / `socks5h://` | 1080 |
+| Scheme                     | Default port |
+| -------------------------- | ------------ |
+| `http://`                  | 8080         |
+| `https://`                 | 443          |
+| `socks5://` / `socks5h://` | 1080         |
 
 Custom ports in the URL (`http://host:9999`) always take precedence over the scheme default.
 
@@ -672,15 +666,15 @@ OmniRoute tracks per-proxy usage to help operators diagnose routing patterns, la
 
 For every request through a configured proxy, OmniRoute records:
 
-| Metric | Description |
-|--------|-------------|
-| `proxy_url` | Full proxy URL (with auth credentials masked) |
-| `provider` | Upstream provider ID (openai, anthropic, etc.) |
+| Metric       | Description                                     |
+| ------------ | ----------------------------------------------- |
+| `proxy_url`  | Full proxy URL (with auth credentials masked)   |
+| `provider`   | Upstream provider ID (openai, anthropic, etc.)  |
 | `latency_ms` | Total round-trip time including proxy handshake |
-| `connect_ms` | TCP connect time only |
-| `status` | HTTP status code from upstream |
-| `error` | Error class if request failed |
-| `timestamp` | ISO 8601 UTC |
+| `connect_ms` | TCP connect time only                           |
+| `status`     | HTTP status code from upstream                  |
+| `error`      | Error class if request failed                   |
+| `timestamp`  | ISO 8601 UTC                                    |
 
 ### Accessing the Data
 
@@ -736,11 +730,11 @@ When multiple proxies are assigned to a scope, OmniRoute uses a **rotation strat
 
 ### Available Strategies
 
-| Strategy | When to use | Trade-off |
-|----------|-------------|-----------|
-| `quality` (default) | Production with mixed-quality proxies | Favors high-rated proxies; may starve low-rated ones |
-| `random` | Load distribution, privacy | Even distribution; ignores quality signals |
-| `sequential` | Debugging, deterministic testing | Cycles through proxies in order; easy to reason about |
+| Strategy            | When to use                           | Trade-off                                             |
+| ------------------- | ------------------------------------- | ----------------------------------------------------- |
+| `quality` (default) | Production with mixed-quality proxies | Favors high-rated proxies; may starve low-rated ones  |
+| `random`            | Load distribution, privacy            | Even distribution; ignores quality signals            |
+| `sequential`        | Debugging, deterministic testing      | Cycles through proxies in order; easy to reason about |
 
 ### Decision Tree
 
@@ -763,7 +757,7 @@ When multiple proxies are assigned to a scope, OmniRoute uses a **rotation strat
    │         │              builds quality
    │         │              data over time)
    │         │
-   │    Use `quality` 
+   │    Use `quality`
    │    (best for
    │    mixed quality)
    │
@@ -772,47 +766,47 @@ Use `random`
 evenly)
 ```
 
-### Configuring Rotation Strategy
+## Automatic Failure Exclusion for Your Own Proxies
 
-```ts
-import { rotateOneproxyProxy } from "omniroute/oneproxyRotator";
+The 1proxy marketplace pool already auto-degrades failed proxies on its own (see
+[Proxy Quality Scores](#proxy-quality-scores)). For
+proxies **you** added to the registry, the background health scheduler
+(`src/lib/proxyHealth/scheduler.ts`) provides the same "exclude a dead member from
+the chain automatically" behavior, without deleting anything:
 
-// In a one-off script
-const proxy = await rotateOneproxyProxy({ strategy: "quality" });
-if (proxy) {
-  console.log(`Selected: ${proxy.host}:${proxy.port}, quality=${proxy.qualityScore}`);
-}
+```bash
+# .env — soft-disable a proxy after 3 consecutive failed probes, re-enable it
+# automatically once it starts answering probes again.
+PROXY_AUTO_DISABLE=true
+PROXY_AUTO_REMOVE_AFTER=3
 ```
 
-### Resetting Sequential Index
+How it fits into a multi-proxy chain:
 
-When using `sequential` strategy, the internal index accumulates. To reset:
+1. The scheduler probes every registered proxy every `PROXY_HEALTH_INTERVAL_MS`
+   (default 10 min; minimum 1 min).
+2. After `PROXY_AUTO_REMOVE_AFTER` consecutive **conclusive** failures (a real
+   connection failure — a timeout or the probe target's own 5xx never counts, see
+   [Proxy Health Checking](#proxy-health-checking-v3816)), the proxy's `status` is
+   set to `dead`.
+3. `dead` is one of the statuses the alive-status filter used by pool/rotation
+   resolution excludes, so a scope's rotation (round-robin / random / sticky /
+   latency — see [Rotation Strategy Decision Tree](#rotation-strategy-decision-tree))
+   immediately stops handing that proxy to new requests. No other proxies in the
+   pool are affected, and the whole pool never silently falls back to a direct
+   connection — see the [4-Level Proxy System](#4-level-proxy-system) fail-closed
+   guard.
+4. The scheduler keeps probing `dead` proxies on the same interval. The next
+   successful probe flips `status` back to `active` and it re-enters rotation —
+   no manual re-add required.
 
-```ts
-import { resetSequentialIndex } from "omniroute/oneproxyRotator";
-
-resetSequentialIndex();
-```
-
-Useful when:
-- Restarting a load test
-- Recovering from a proxy outage (so you don't cycle through dead ones first)
-- Manually rebalancing after adding new proxies
-
-### Marking a Proxy as Failed
-
-When a proxy consistently fails, mark it manually so the rotator will skip it:
-
-```ts
-import { failOneproxyProxy } from "omniroute/oneproxyRotator";
-
-const removed = await failOneproxyProxy("1.2.3.4", 8080);
-if (removed) {
-  console.log("Proxy marked as failed; rotator will skip it");
-}
-```
-
-The proxy is **not deleted** — it's marked unhealthy and won't be selected until the next successful health check (via `proxyHealth.ts`) or manual reset.
+This is deliberately **opt-in and non-destructive**: by default the scheduler only
+counts and logs failures (see policy C in `decision.ts`), and `PROXY_AUTO_DISABLE`
+never deletes a row — that is what the separate, more aggressive
+`PROXY_AUTO_REMOVE` flag is for. If both are set to `true`, `PROXY_AUTO_REMOVE`
+wins (a proxy about to be deleted has no use for a soft-disable in between). See
+the [Environment Config](../reference/ENVIRONMENT.md) reference for the full
+variable list.
 
 ---
 

@@ -39,13 +39,12 @@ test("parseCliProxyAuthRecord maps a claude (anthropic) auth file", () => {
   });
 });
 
-test("parseCliProxyAuthRecord maps gemini → gemini-cli with project_id", () => {
+test("parseCliProxyAuthRecord skips discontinued gemini records", () => {
   const parsed = parseCliProxyAuthRecord(
     { type: "gemini", access_token: "at", project_id: "proj-9" },
     T0
   );
-  assert.equal(parsed?.provider, "gemini-cli");
-  assert.equal(parsed?.projectId, "proj-9");
+  assert.equal(parsed, null);
 });
 
 test("parseCliProxyAuthRecord returns null for unknown type or missing access token", () => {
@@ -56,13 +55,36 @@ test("parseCliProxyAuthRecord returns null for unknown type or missing access to
 });
 
 test("every CLIPROXY_TYPE_TO_PROVIDER target is a real OAuth provider id", () => {
-  // codex/antigravity/claude/gemini-cli/qwen/kimi are all OmniRoute providers
+  // codex/antigravity/claude/kimi/muse-code are all OmniRoute providers
   for (const provider of Object.values(CLIPROXY_TYPE_TO_PROVIDER)) {
     assert.ok(
-      ["claude", "codex", "antigravity", "gemini-cli", "qwen", "kimi"].includes(provider),
+      ["claude", "codex", "antigravity", "kimi", "muse-code"].includes(provider),
       `unexpected provider mapping: ${provider}`
     );
   }
+});
+
+test("parseCliProxyAuthRecord maps a Meta Muse OAuth file keeping dca + minted key", () => {
+  const parsed = parseCliProxyAuthRecord(
+    {
+      type: "meta",
+      auth_kind: "oauth",
+      access_token: "LLM|minted",
+      api_key: "LLM|minted",
+      dca_token: "dca:durable",
+      base_url: "https://api.meta.ai/v1",
+      email: "muse@example.com",
+      name: "Muse User",
+      expired: "2030-01-01T00:00:00Z",
+    },
+    T0
+  );
+  assert.equal(parsed?.provider, "muse-code");
+  assert.equal(parsed?.accessToken, "LLM|minted");
+  assert.equal(parsed?.refreshToken, "dca:durable");
+  assert.equal(parsed?.expiresAt, null);
+  assert.equal(parsed?.providerSpecificData?.dcaToken, "dca:durable");
+  assert.equal(parsed?.providerSpecificData?.baseUrl, "https://api.meta.ai/v1");
 });
 
 test("resolveCliProxyExpiry handles absolute `expired` (string + unix) and relative `expires_in`", () => {
@@ -74,10 +96,7 @@ test("resolveCliProxyExpiry handles absolute `expired` (string + unix) and relat
     resolveCliProxyExpiry({ expired: 1_800_000_000 }, T0),
     new Date(1_800_000_000 * 1000).toISOString()
   );
-  assert.equal(
-    resolveCliProxyExpiry({ expires_in: 60 }, T0),
-    new Date(T0 + 60_000).toISOString()
-  );
+  assert.equal(resolveCliProxyExpiry({ expires_in: 60 }, T0), new Date(T0 + 60_000).toISOString());
   assert.equal(resolveCliProxyExpiry({}, T0), null);
 });
 
@@ -95,7 +114,10 @@ test("toConnectionPayload produces a createProviderConnection-shaped oauth paylo
   assert.equal(payload.authType, "oauth");
   assert.equal(payload.email, "c@d.com");
   assert.equal(payload.accessToken, "at");
-  assert.equal((payload.providerSpecificData as Record<string, unknown>).importedFrom, "cliproxyapi");
+  assert.equal(
+    (payload.providerSpecificData as Record<string, unknown>).importedFrom,
+    "cliproxyapi"
+  );
 });
 
 test("scanCliProxyAuthDir reads importable files and counts skips", async () => {
@@ -118,7 +140,7 @@ test("scanCliProxyAuthDir reads importable files and counts skips", async () => 
     assert.equal(candidates[0].provider, "antigravity");
     assert.equal(skipped, 2); // unknown type + broken json
   } finally {
-    await fs.rm(dir, { recursive: true, force: true });
+    await fs.rm(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
   }
 });
 

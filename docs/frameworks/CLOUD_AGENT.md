@@ -1,13 +1,13 @@
 ---
 title: "Cloud Agents"
-version: 3.8.31
-lastUpdated: 2026-06-20
+version: 3.8.40
+lastUpdated: 2026-06-28
 ---
 
 # Cloud Agents
 
 > **Source of truth:** `src/lib/cloudAgent/` and `src/app/api/v1/agents/tasks/`
-> **Last updated:** 2026-06-20 — v3.8.31 (frontmatter refresh; 4 agents incl. cursor-cloud)
+> **Last updated:** 2026-06-28 — v3.8.40 (frontmatter refresh; 4 agents incl. cursor-cloud)
 
 OmniRoute orchestrates third-party cloud-hosted coding agents (Codex Cloud, Cursor,
 Devin, Jules) as long-running tasks. Each agent is wrapped behind a uniform interface so
@@ -24,11 +24,11 @@ artifact, and supports follow-up messages and (in some providers) plan approval 
 
 ## Supported Agents
 
-| Provider ID   | Class             | Source                               | Upstream Base URL                       | Plan Approval |
-| ------------- | ----------------- | ------------------------------------ | --------------------------------------- | ------------- |
-| `jules`       | `JulesAgent`      | `src/lib/cloudAgent/agents/jules.ts` | `https://jules.googleapis.com/v1alpha`  | Yes           |
-| `devin`       | `DevinAgent`      | `src/lib/cloudAgent/agents/devin.ts` | `https://api.devin.ai/v1`               | Yes           |
-| `codex-cloud` | `CodexCloudAgent` | `src/lib/cloudAgent/agents/codex.ts` | `https://api.openai.com/v1/codex/cloud` | No (auto)     |
+| Provider ID    | Class              | Source                                | Upstream Base URL                       | Plan Approval |
+| -------------- | ------------------ | ------------------------------------- | --------------------------------------- | ------------- |
+| `jules`        | `JulesAgent`       | `src/lib/cloudAgent/agents/jules.ts`  | `https://jules.googleapis.com/v1alpha`  | Yes           |
+| `devin`        | `DevinAgent`       | `src/lib/cloudAgent/agents/devin.ts`  | `https://api.devin.ai/v1`               | Yes           |
+| `codex-cloud`  | `CodexCloudAgent`  | `src/lib/cloudAgent/agents/codex.ts`  | `https://api.openai.com/v1/codex/cloud` | No (auto)     |
 | `cursor-cloud` | `CursorCloudAgent` | `src/lib/cloudAgent/agents/cursor.ts` | `https://api.cursor.com/v0`             | No (auto)     |
 
 Registry: `src/lib/cloudAgent/registry.ts` — exports `getAgent(providerId)`,
@@ -311,8 +311,9 @@ upstream, terminate the task in the provider's own console.
 
 These auxiliary endpoints under `src/app/api/cloud/` are used by remote clients
 (the CLI, the Electron app, or sync workers) to read provider connection metadata
-and resolve model aliases. They are authenticated with a **regular API key**
-(via `validateApiKey`), not the management auth used by the task endpoints.
+and resolve model aliases. They are authenticated with an **API key**
+(via `validateApiKey`), not the management auth used by the task endpoints; what
+`/api/cloud/auth` returns depends on the key's scope (see below).
 
 | Method | Path                            | Purpose                                                             |
 | ------ | ------------------------------- | ------------------------------------------------------------------- |
@@ -323,8 +324,12 @@ and resolve model aliases. They are authenticated with a **regular API key**
 | PUT    | `/api/cloud/models/alias`       | Set a model alias (and auto-sync to Cloud if enabled)               |
 
 `/api/cloud/auth` never returns raw `apiKey` / `accessToken` / `refreshToken`. It
-returns `hasApiKey`, `hasAccessToken`, `hasRefreshToken`, and a masked preview
-(`maskedApiKey`: first 4 + `****` + last 4).
+returns `hasApiKey`, `hasAccessToken`, `hasRefreshToken` for the active connections the key
+may use (a key restricted with `allowedConnections` only sees those). For an API key with
+the `manage` or `admin` scope, including the deployment key from `OMNIROUTE_API_KEY`, it also
+returns a masked preview (`maskedApiKey`: up to 4 characters at each end, fewer for a short
+key, none for 8 characters or fewer) and the connection's `projectId`. Both fields are left
+out of the response for any other key.
 
 ## Credentials Resolution
 
