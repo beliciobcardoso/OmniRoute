@@ -78,23 +78,7 @@ export const importClaudeAuthBulkSchema = z.object({
   overwriteExisting: z.boolean().optional(),
 });
 
-// ──── Gemini CLI Auth Import Schema ────
-
-export const importGeminiAuthSchema = z.object({
-  source: z.discriminatedUnion("kind", [
-    z.object({ kind: z.literal("json"), json: z.unknown() }),
-    z.object({
-      kind: z.literal("text"),
-      text: z.string().max(256 * 1024, "oauth_creds.json content exceeds 256KB"),
-    }),
-  ]),
-  name: z.string().min(1).max(200).optional(),
-  email: z.string().email("Must be a valid email").optional(),
-  overwriteExisting: z.boolean().optional(),
-});
-
 // ──── Antigravity CLI (`agy`) Auth Import Schema ────
-// Same source/options shape as gemini-cli; the parser handles the agy-specific token JSON.
 
 export const importAgyAuthSchema = z.object({
   source: z.discriminatedUnion("kind", [
@@ -115,22 +99,6 @@ export const importAgyAuthSchema = z.object({
 export const applyLocalAgyAuthSchema = z.object({
   name: z.string().min(1).max(200).optional(),
   email: z.string().email("Must be a valid email").optional(),
-  overwriteExisting: z.boolean().optional(),
-});
-
-// ──── Gemini CLI Auth Import Bulk Schema ────
-
-export const importGeminiAuthBulkSchema = z.object({
-  entries: z
-    .array(
-      z.object({
-        json: z.unknown(),
-        name: z.string().min(1).max(200).optional(),
-        email: z.string().email("Must be a valid email").optional(),
-      })
-    )
-    .min(1, "At least one entry is required")
-    .max(50, "At most 50 entries per bulk import"),
   overwriteExisting: z.boolean().optional(),
 });
 
@@ -165,7 +133,10 @@ export const oauthPollSchema = z.object({
 
 /** Import a raw API token (e.g. WINDSURF_API_KEY) without going through the browser OAuth flow. */
 export const oauthImportTokenSchema = z.object({
-  token: z.string().trim().min(1, "Token is required"),
+  token: z.union([
+    z.string().trim().min(1, "Token is required"),
+    z.record(z.string(), z.unknown()),
+  ]),
   connectionId: z.string().optional(),
 });
 
@@ -185,9 +156,23 @@ export const oauthDeviceCompleteSchema = z.object({
   connectionId: z.string().optional(),
 });
 
+/**
+ * Persist credentials obtained by the local remote-login helper. Google's
+ * `firstparty/nativeapp` consent only releases the auth code when the loopback
+ * redirect is reachable, which never happens on a remote VPS install — so the
+ * helper (`omniroute login antigravity`) runs the OAuth on the user's own machine
+ * and emits a single-line credential blob. The dashboard pastes that blob here;
+ * the server decodes + finalizes + persists. See src/lib/oauth/credentialBlob.ts.
+ */
+export const oauthPasteCredentialsSchema = z.object({
+  blob: z.string().trim().min(1, "credential blob is required"),
+  connectionId: z.string().optional(),
+});
+
 export const cursorImportSchema = z.object({
   accessToken: z.string().trim().min(1, "Access token is required"),
   machineId: z.string().trim().optional(),
+  refreshToken: z.string().trim().min(1).optional(),
 });
 
 export const traeImportSchema = z.object({
@@ -198,17 +183,32 @@ export const traeImportSchema = z.object({
   scope: z.string().trim().optional(),
   tenant: z.string().trim().optional(),
   region: z.string().trim().optional(),
+  // Real account region (e.g. "SG") sent as the x-user-region header — the
+  // "US" default only works for US accounts and produces a 401 for others
+  // (#12190). Optional so existing imports keep behaving as before.
+  userRegion: z.string().trim().optional(),
+  userTimezone: z.string().trim().optional(),
 });
 
 export const kiroImportSchema = z.object({
   refreshToken: z.string().trim().min(1, "Refresh token is required"),
   region: z.string().trim().default("us-east-1"),
+  // IDC (organization) token fields — present when auto-detected from an IDC SSO
+  // cache token with a clientIdHash (#2059). Optional for backward compatibility.
+  clientId: z.string().optional(),
+  clientSecret: z.string().optional(),
+  authMethod: z.string().optional(),
+  profileArn: z.string().optional(),
+  // External IdP ("Your organization" / Microsoft Entra) token fields — present
+  // when authMethod === "external_idp". The token is refreshed via a public-client
+  // OAuth2 grant against `tokenEndpoint` using `clientId` + `scopes` (no secret).
+  tokenEndpoint: z.string().optional(),
+  scopes: z.union([z.string(), z.array(z.string())]).optional(),
 });
 
-export const kiroSocialExchangeSchema = z.object({
-  code: z.string().trim().min(1, "Code is required"),
-  codeVerifier: z.string().trim().min(1, "Code verifier is required"),
-  provider: z.enum(["google", "github"]),
+export const kiroApiKeyImportSchema = z.object({
+  apiKey: z.string().trim().min(1, "API key is required"),
+  region: z.string().trim().default("us-east-1"),
 });
 
 export const zedImportSchema = z.object({

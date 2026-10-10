@@ -1,7 +1,7 @@
 ---
 title: "📖 Setup Guide — OmniRoute"
-version: 3.8.31
-lastUpdated: 2026-06-20
+version: 3.8.50
+lastUpdated: 2026-08-18
 ---
 
 # 📖 Setup Guide — OmniRoute
@@ -31,15 +31,16 @@ omniroute
 
 Dashboard opens at `http://localhost:20128` and API base URL is `http://localhost:20128/v1`.
 
+> **npm users:** If npm warns that install scripts were blocked (e.g., `omniroute`, `better-sqlite3`), see [Troubleshooting — npm install-scripts blocked](./TROUBLESHOOTING.md#npm-install-scripts-blocked-warning-global-install).
+
 ### pnpm
 
 ```bash
-pnpm install -g omniroute
-pnpm approve-builds -g   # Select all packages → approve
+pnpm add -g omniroute@latest --allow-build=better-sqlite3 --allow-build=@swc/core
 omniroute
 ```
 
-> **pnpm users:** `pnpm approve-builds -g` is required to enable native build scripts for `better-sqlite3` and `@swc/core`.
+> **pnpm users:** the `--allow-build` flag is required to enable native build scripts for `better-sqlite3` and `@swc/core`. The `pnpm approve-builds -g` command is not supported for global installs on pnpm v11.
 
 ### Arch Linux (AUR)
 
@@ -56,6 +57,8 @@ The [AUR package](https://aur.archlinux.org/packages/omniroute-bin) installs Omn
 npm install
 PORT=20128 DASHBOARD_PORT=20129 NEXT_PUBLIC_BASE_URL=http://localhost:20129 npm run dev
 ```
+
+> **Windows note:** By default, OmniRoute uses `%APPDATA%\omniroute` when the legacy `%USERPROFILE%\.omniroute` directory is not present. Set `DATA_DIR` to choose a different data-directory location.
 
 > **Note:** `npm install` auto-generates `.env` from `.env.example` on first run. Subsequent installs will not overwrite an existing `.env`, so customizations are preserved. To re-seed, delete `.env` before re-running.
 
@@ -150,7 +153,7 @@ omniroute providers validate
 ```txt
 Base URL: http://localhost:20128/v1
 API Key:  [copy from Endpoint page]
-Model:    if/kimi-k2-thinking (or any provider/model prefix)
+Model:    if/qwen3.8-max-preview (or any provider/model prefix)
 ```
 
 If your editor cannot send `Authorization: Bearer ...`, use the tokenized compatibility base instead:
@@ -162,7 +165,7 @@ Chat URL: http://localhost:20128/api/v1/vscode/YOUR_KEY/chat/completions
 Ollama Tags URL: http://localhost:20128/api/v1/vscode/YOUR_KEY/api/tags
 ```
 
-Works with Claude Code, Codex CLI, Gemini CLI, Cursor, Cline, OpenClaw, OpenCode, and OpenAI-compatible SDKs.
+Works with Claude Code, Codex CLI, Cursor, Cline, OpenClaw, OpenCode, and OpenAI-compatible SDKs.
 
 #### Auto-configure with `setup-*`
 
@@ -180,15 +183,16 @@ omniroute setup-cursor       # prints Cursor's in-app steps
 omniroute setup-roo          # Roo Code import + autoImport pointer
 omniroute setup-crush        # ~/.config/crush/crush.json
 omniroute setup-goose        # ~/.config/goose/config.yaml
-omniroute setup-qwen         # ~/.qwen/settings.json
 omniroute setup-aider        # ~/.aider.conf.yml
-omniroute setup-gemini       # Gemini CLI (native /v1beta endpoint)
+omniroute setup-qwen         # ~/.qwen/settings.json + ~/.qwen/.env
 ```
 
 Each accepts `--remote <url> --api-key <key>` to configure a local tool against a
-**remote** OmniRoute, plus `--dry-run` to preview. The launchers
-`omniroute launch` (Claude Code) and `omniroute launch-codex` (Codex) spawn the CLI
-with the right env injected, writing no config at all.
+**remote** OmniRoute, plus `--dry-run` to preview. To launch a CLI with the right
+env injected and no config written at all, use the generic launcher
+`omniroute run <target>` (claude, codex, aider, goose, opencode, qwen, gemini);
+the legacy per-tool launchers `omniroute launch` (Claude Code) and
+`omniroute launch-codex` (Codex) remain available.
 
 For the full table (what each command writes, every flag, local vs remote, base-URL
 `/v1` conventions), see **[CLI Integrations](./CLI-INTEGRATIONS.md)**.
@@ -245,7 +249,7 @@ Add to your MCP settings:
 }
 ```
 
-**Full MCP documentation:** [MCP Server README](../../open-sse/mcp-server/README.md) — 87 tools, IDE configs, Python/TS/Go clients.
+**Full MCP documentation:** [MCP Server README](../../open-sse/mcp-server/README.md) — 110 tools, IDE configs, Python/TS/Go clients.
 
 ### A2A Setup (Agent-to-Agent Protocol)
 

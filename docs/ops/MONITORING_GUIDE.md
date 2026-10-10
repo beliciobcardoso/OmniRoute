@@ -1,7 +1,7 @@
 ---
 title: "Monitoring & Observability Guide"
-version: 3.8.16
-lastUpdated: 2026-06-08
+version: 3.8.50
+lastUpdated: 2026-10-07
 ---
 
 # Monitoring & Observability Guide
@@ -9,6 +9,7 @@ lastUpdated: 2026-06-08
 > **TL;DR**: OmniRoute ships with built-in health monitoring, provider autopilot, quota tracking, and observability hooks. This guide covers the dashboard, alerts, and troubleshooting.
 
 **Sources:**
+
 - `src/lib/monitoring/observability.ts` — observability snapshot
 - `src/lib/monitoring/comboHealthAutopilot.ts` — combo health autopilot
 - `src/lib/monitoring/providerHealthAutopilot.ts` — provider autopilot
@@ -50,30 +51,31 @@ OmniRoute has **3 layers of monitoring**:
 
 The top-level health dashboard shows:
 
-| Section | What it shows |
-|---------|---------------|
-| **Server status** | Uptime, version, port, active connections |
-| **Database** | Connection, integrity, WAL size, recent migrations |
-| **Provider summary** | Active count, healthy count, breaker open count |
-| **Quota monitors** | Active sessions, alerting, exhausted |
-| **Recent errors** | Last 10 errors with stack traces |
-| **Resource usage** | Memory, CPU, heap pressure indicator |
+| Section              | What it shows                                      |
+| -------------------- | -------------------------------------------------- |
+| **Server status**    | Uptime, version, port, active connections          |
+| **Database**         | Connection, integrity, WAL size, recent migrations |
+| **Provider summary** | Active count, healthy count, breaker open count    |
+| **Quota monitors**   | Active sessions, alerting, exhausted               |
+| **Recent errors**    | Last 10 errors with stack traces                   |
+| **Resource usage**   | Memory, CPU, heap pressure indicator               |
 
 ### `/dashboard/providers` (Provider Health)
 
 Per-provider dashboard:
 
-| Column | Description |
-|--------|-------------|
-| Provider | Provider ID + display name |
-| Health | Green/yellow/red status |
-| Circuit | Open/closed/half-open state |
-| Connections | Count of connections, last refresh |
-| Models | Available models, health per model |
-| Cost | Today's cost, 7-day trend |
-| Errors | Last 24h error count, top error class |
+| Column      | Description                           |
+| ----------- | ------------------------------------- |
+| Provider    | Provider ID + display name            |
+| Health      | Green/yellow/red status               |
+| Circuit     | Open/closed/half-open state           |
+| Connections | Count of connections, last refresh    |
+| Models      | Available models, health per model    |
+| Cost        | Today's cost, 7-day trend             |
+| Errors      | Last 24h error count, top error class |
 
 Click a provider to see:
+
 - Recent requests with latency breakdown
 - Per-connection health scores
 - Per-model lockouts
@@ -101,9 +103,29 @@ Per-combo:
 
 ## Health Check API
 
-> **Note:** Only `GET /api/monitoring/health` is exposed as a REST endpoint. All other monitoring data (provider health, autopilot issues, quota monitors, token health, latency) is accessed via the **MCP tool** `observability_snapshot` or the **dashboard** pages — there are no dedicated REST routes for these.
+OmniRoute exposes **two** HTTP health surfaces. They are not interchangeable for orchestrators.
 
-### System Health
+| Path                         | Purpose                                                       | Weight                            | Use for                                                          |
+| ---------------------------- | ------------------------------------------------------------- | --------------------------------- | ---------------------------------------------------------------- |
+| `GET /healthz`               | Lifecycle liveness/readiness (`ok` / `starting` / `stopping`) | Trivial (phase flag only)         | Kubernetes **readiness**; soft **liveness** if you must use HTTP |
+| `GET /api/monitoring/health` | Deep system + provider summary (DB, heap, catalog counts, …)  | Heavy (sync DB / monitoring work) | Dashboards, blackbox deep checks, Docker’s built-in healthcheck  |
+
+> **Note:** Provider health matrices, autopilot issues, quota monitors, token health, and latency detail beyond `/api/monitoring/health` are available via the **MCP tool** `observability_snapshot` or the **dashboard** pages — there are no dedicated REST routes for those.
+
+Both routes run on the **same Node event loop** as request handling. A CPU-bound path (large `GET /v1/models` catalog work, long-context compression / token counting) can delay **all** HTTP handlers, including `/healthz`. Event-loop busy ≠ process dead. Prefer fixing the hog; probe tuning only reduces false kills.
+
+### Lightweight orchestrator probe
+
+```bash
+GET /healthz
+# or HEAD /healthz
+```
+
+- **200** + body `ok` when the server lifecycle phase is ready
+- **503** + `starting` / `stopping` during boot or shutdown
+- Implementation: `src/app/healthz/route.ts` (no DB ping)
+
+### System Health (deep)
 
 ```bash
 GET /api/monitoring/health
@@ -133,6 +155,113 @@ Response:
 }
 ```
 
+#### `credentialHealth`: probe-cache vs SQLite `test_status`
+
+`GET /api/monitoring/health` → `credentialHealth` is the **in-memory probe-cache
+gauge**, not a live dump of `provider_connections.test_status`. After #12532 the
+request path reads `getCachedCredentialHealthSummary()` only; background probes
+refresh the cache off the event loop.
+
+| Layer                    | Where                                                                 | What it means                                                                                                                                                                                            |
+| ------------------------ | --------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Probe-cache gauge        | `credentialHealth.total` / `healthy` / `failed` / `unknown` / `stale` | Last credential-health probe results still held in process memory. `source` is always `probe-cache`.                                                                                                     |
+| Failed connection detail | `credentialHealth.failedConnections`                                  | Present **only when `failed > 0`**. Bounded list of cache rows with `status=error` (`connectionId`, `status`, sanitized `lastError` / `lastErrorType`). `failedOmitted` is set when the list was capped. |
+| SQLite sticky status     | `credentialHealth.staleDbNonOkCount`                                  | Count of **active** (`is_active=1`) connection rows whose persisted `test_status` is a known non-ok (`error`, `expired`, `credits_exhausted`, `banned`, `deactivated`, `unavailable`).                   |
+
+The two layers can disagree on purpose:
+
+- Gauge `failed=0` while `staleDbNonOkCount>0` — SQLite still has a sticky
+  `test_status` (for example `expired` or `credits_exhausted`) that the latest
+  probe-cache snapshot does not count as `status=error`.
+- Gauge `failed>0` while SQLite looks healthy — a recent probe failed and is
+  cached; the DB row has not been updated, or was later cleared.
+
+Do not alert solely on `provider_connections.test_status` when scraping this
+endpoint. Use `failed` + `failedConnections` for live probe failures, and
+`staleDbNonOkCount` when you need the persisted sticky-status count.
+
+### Kubernetes probe recommendations
+
+OmniRoute is a **single Node process** (one event loop). Stock Docker `HEALTHCHECK` targets lightweight `/healthz`. `/api/monitoring/health` is **too heavy** for kubelet liveness intervals.
+
+| Probe           | Recommended target                                                               | Notes                                                                                                                                                                                                                                                                                                                               |
+| --------------- | -------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **Startup**     | HTTP `GET /healthz` with a long `failureThreshold` (or large `startPeriod`)      | Cold start + SQLite migration can exceed a few seconds                                                                                                                                                                                                                                                                              |
+| **Readiness**   | HTTP `GET /healthz`                                                              | Lifecycle `ok` / `starting` / `stopping` (200 vs 503). Still flaps if the loop is CPU-blocked. A **200 in multiple seconds is not healthy** (#10303) — it means the event loop was starved before the 3-byte handler ran                                                                                                            |
+| **Liveness**    | HTTP `GET /livez`, **or TCP** on the main service port (`PORT`, default `20128`) | `/livez` is process-alive only (always 200 if the handler runs). It still shares the event loop — busy ≠ dead, and it does not detect event-loop starvation (#10303) any better than TCP does. Prefer **TCP** if HTTP probes time out under catalog/compression load; do **not** kill the pod on short event-loop stalls either way |
+| **Deep health** | `GET /api/monitoring/health` from an external checker                            | Not for kubelet `livenessProbe` / tight `readinessProbe`                                                                                                                                                                                                                                                                            |
+
+Example shape (adjust thresholds to your cold-start and compression load):
+
+```yaml
+ports:
+  - name: http
+    containerPort: 20128
+startupProbe:
+  httpGet:
+    path: /healthz
+    port: http
+  failureThreshold: 30
+  periodSeconds: 5
+readinessProbe:
+  httpGet:
+    path: /healthz
+    port: http
+  periodSeconds: 5
+  timeoutSeconds: 2
+  failureThreshold: 6
+livenessProbe:
+  httpGet:
+    path: /livez
+    port: http
+  periodSeconds: 10
+  timeoutSeconds: 3
+  failureThreshold: 6
+  # Under event-loop stall HTTP /livez can still time out. TCP is the
+  # conservative alternative:
+  # tcpSocket:
+  #   port: http
+```
+
+**Do not** point kubelet **liveness** at `/api/monitoring/health`. That path does real DB/monitoring work and will false-positive under load.
+
+Related: [#10052](https://github.com/diegosouzapw/OmniRoute/issues/10052) (probes while the event loop is busy), [#9685](https://github.com/diegosouzapw/OmniRoute/issues/9685) / [#10055](https://github.com/diegosouzapw/OmniRoute/pull/10055) (catalog pricing hog), [#10117](https://github.com/diegosouzapw/OmniRoute/issues/10117) (compression token-count hog).
+
+### systemd watchdog (frozen event loop)
+
+On a systemd host, OmniRoute tells the service manager when it is ready and keeps pinging it, so a server whose event loop is stuck gets killed and restarted instead of staying up and silent. The pings come from the server's own event loop: when it blocks, they stop, and systemd restarts the service once `WatchdogSec` elapses without one.
+
+[`omniroute autostart enable`](../../bin/cli/tray/autostart.mjs) already writes a user unit with this. A unit you write yourself (the default `Type=simple`) gets no watchdog, so add these lines to its `[Service]` section:
+
+```ini
+[Service]
+Type=notify
+NotifyAccess=all
+WatchdogSec=180
+TimeoutStartSec=300
+```
+
+The generated unit sets `Restart=on-failure`, so add that line as well — without it the watchdog only kills the stuck service instead of restarting it.
+
+- `Type=notify`: the service is "started" when the server sends `READY=1`, not when the process forks. `TimeoutStartSec` bounds a slow start.
+- `NotifyAccess=all`: the pings are sent by the server process, which is a child of the `omniroute serve` supervisor.
+- `WatchdogSec`: pings go out every 60 seconds, so use **120 or more**. Smaller values would restart a healthy server.
+- Run `omniroute serve` in the foreground. `--daemon` detaches the server from the unit's cgroup and the notify handshake never completes.
+
+Check that it is active after a restart:
+
+```bash
+systemctl --user show omniroute -p WatchdogUSec -p WatchdogTimestamp
+```
+
+`WatchdogUSec` shows the configured delay and `WatchdogTimestamp` moves forward every minute. A restart caused by the watchdog is recorded as `Result=watchdog`. To turn the pings off while keeping the unit as it is, set `OMNIROUTE_DISABLE_SD_NOTIFY=1`; without a `NOTIFY_SOCKET` (terminal, Docker, Electron, Windows) nothing is sent.
+
+The watchdog only checks that the event loop keeps running. A server that is slow but still turning is not restarted.
+
+### Optional request-path work (memory, skills, token refresh)
+
+Memory extraction, skills injection, and OAuth token refresh share the **main Node event loop** with `/healthz`. They are dashboard-toggle features (`memoryEnabled`, `skillsEnabled`), not a worker pool. See [Environment — event-loop cost](../reference/ENVIRONMENT.md#event-loop-cost-of-memory-skills-and-token-refresh-10349).
+
 ### Provider Health
 
 > **No REST endpoint.** Provider health data is available via the MCP tool `observability_snapshot` or the dashboard `/dashboard/providers` page.
@@ -153,27 +282,27 @@ The `providerHealthAutopilot.ts` module is a **self-healing system** that:
 
 ### Issue Types Detected
 
-| Issue kind | Severity | Example condition |
-|------------|----------|-------------------|
-| `provider_circuit_open` | critical | Circuit breaker open after 5 failures |
-| `provider_circuit_half_open` | warning | Circuit testing recovery |
-| `connection_cooldown` | warning | Connection in cooldown after 429 |
-| `stale_connection_error` | warning | Last refresh failed 30+ minutes ago |
-| `terminal_connection_error` | critical | OAuth revoked, key invalid |
-| `inactive_connection` | info | Connection disabled in settings |
-| `model_lockout` | warning | Specific model in quarantine |
-| `quota_monitor_warning` | warning | Quota at 80%+ usage |
+| Issue kind                   | Severity | Example condition                     |
+| ---------------------------- | -------- | ------------------------------------- |
+| `provider_circuit_open`      | critical | Circuit breaker open after 5 failures |
+| `provider_circuit_half_open` | warning  | Circuit testing recovery              |
+| `connection_cooldown`        | warning  | Connection in cooldown after 429      |
+| `stale_connection_error`     | warning  | Last refresh failed 30+ minutes ago   |
+| `terminal_connection_error`  | critical | OAuth revoked, key invalid            |
+| `inactive_connection`        | info     | Connection disabled in settings       |
+| `model_lockout`              | warning  | Specific model in quarantine          |
+| `quota_monitor_warning`      | warning  | Quota at 80%+ usage                   |
 
 ### Action Types Generated
 
-| Action | Risk | Description |
-|--------|------|-------------|
-| `clear_provider_breaker` | medium | Reset the circuit breaker to closed |
-| `clear_connection_cooldown` | low | Remove cooldown from a connection |
-| `clear_stale_connection_error` | low | Clear stale error flag |
-| `clear_model_lockout` | low | Re-enable a quarantined model |
-| `reactivate_connection` | medium | Re-enable a deactivated connection |
-| `deactivate_connection` | high | Disable a problematic connection |
+| Action                         | Risk   | Description                         |
+| ------------------------------ | ------ | ----------------------------------- |
+| `clear_provider_breaker`       | medium | Reset the circuit breaker to closed |
+| `clear_connection_cooldown`    | low    | Remove cooldown from a connection   |
+| `clear_stale_connection_error` | low    | Clear stale error flag              |
+| `clear_model_lockout`          | low    | Re-enable a quarantined model       |
+| `reactivate_connection`        | medium | Re-enable a deactivated connection  |
+| `deactivate_connection`        | high   | Disable a problematic connection    |
 
 ### API
 
@@ -217,7 +346,7 @@ interface QuotaMonitorSnapshot {
   provider: string;
   accountId: string;
   status: "starting" | "idle" | "healthy" | "warning" | "exhausted" | "error";
-  lastQuotaPercent: number | null;  // 0-100
+  lastQuotaPercent: number | null; // 0-100
   lastQuotaUsed: number | null;
   lastQuotaTotal: number | null;
   lastResetAt: string | null;
@@ -230,14 +359,14 @@ interface QuotaMonitorSnapshot {
 
 ### Status Meanings
 
-| Status | When | UI action |
-|--------|------|-----------|
-| `starting` | Initial poll in progress | Spinner |
-| `idle` | No recent activity | Hidden from dashboard |
-| `healthy` | Quota > 50% remaining | Green dot |
-| `warning` | Quota < 50% remaining | Yellow alert |
-| `exhausted` | Quota = 0% | Red block, route to next provider |
-| `error` | Polling failed | Red dot, retry soon |
+| Status      | When                     | UI action                         |
+| ----------- | ------------------------ | --------------------------------- |
+| `starting`  | Initial poll in progress | Spinner                           |
+| `idle`      | No recent activity       | Hidden from dashboard             |
+| `healthy`   | Quota > 50% remaining    | Green dot                         |
+| `warning`   | Quota < 50% remaining    | Yellow alert                      |
+| `exhausted` | Quota = 0%               | Red block, route to next provider |
+| `error`     | Polling failed           | Red dot, retry soon               |
 
 ### API
 
@@ -270,7 +399,7 @@ The MCP tool `observability_snapshot` returns a **complete system snapshot** for
       "ageMs": 109
     }
   ],
-  "quotaMonitors": { /* see above */ },
+  "quotaMonitors": {/* see above */},
   "uptime": 12345,
   "version": "3.8.16"
 }
@@ -318,11 +447,11 @@ Token health check configuration is handled internally by `tokenHealthCheck.ts`.
 
 OmniRoute supports **3 alert channels**:
 
-| Channel | Setup | Use case |
-|---------|-------|----------|
-| Dashboard banner | Always on | In-app notifications |
-| Webhook | Configure URL | Slack, Discord, PagerDuty |
-| Log | Default | For external log aggregation |
+| Channel          | Setup         | Use case                     |
+| ---------------- | ------------- | ---------------------------- |
+| Dashboard banner | Always on     | In-app notifications         |
+| Webhook          | Configure URL | Slack, Discord, PagerDuty    |
+| Log              | Default       | For external log aggregation |
 
 ### Webhook Configuration
 
@@ -330,17 +459,17 @@ OmniRoute supports **3 alert channels**:
 
 ### Alert Types
 
-| Alert | When | Default severity |
-|-------|------|------------------|
-| `provider_circuit_open` | Circuit opens | critical |
-| `provider_circuit_half_open` | Circuit testing recovery | info |
-| `quota_warning` | Quota at 80%+ | warning |
-| `quota_exhausted` | Quota at 100% | critical |
-| `token_refresh_failed` | 3+ consecutive refresh failures | warning |
-| `token_expired` | Token past expiry | critical |
-| `combo_target_unhealthy` | Combo target in cooldown for 1h+ | warning |
-| `db_integrity_warning` | FK violations > 0 | warning |
-| `heap_pressure` | Heap usage > 80% of threshold | warning |
+| Alert                        | When                             | Default severity |
+| ---------------------------- | -------------------------------- | ---------------- |
+| `provider_circuit_open`      | Circuit opens                    | critical         |
+| `provider_circuit_half_open` | Circuit testing recovery         | info             |
+| `quota_warning`              | Quota at 80%+                    | warning          |
+| `quota_exhausted`            | Quota at 100%                    | critical         |
+| `token_refresh_failed`       | 3+ consecutive refresh failures  | warning          |
+| `token_expired`              | Token past expiry                | critical         |
+| `combo_target_unhealthy`     | Combo target in cooldown for 1h+ | warning          |
+| `db_integrity_warning`       | FK violations > 0                | warning          |
+| `heap_pressure`              | Heap usage > 80% of threshold    | warning          |
 
 ---
 
@@ -348,18 +477,18 @@ OmniRoute supports **3 alert channels**:
 
 ### Tracked Metrics
 
-| Metric | Type | Source |
-|--------|------|--------|
-| `request_count` | counter | `services/usage.ts` |
-| `request_latency_ms` | histogram | `services/usage.ts` |
-| `tokens_consumed` | counter | `services/usage.ts` |
-| `cost_usd` | counter | `services/usage.ts` |
-| `provider_errors` | counter | `services/errorClassifier.ts` |
-| `circuit_state_changes` | counter | `services/resilience.ts` |
-| `cache_hits` | counter | `services/signatureCache.ts` |
-| `compression_savings` | histogram | `services/compression/stats.ts` |
-| `quota_used` | gauge | `services/quotaMonitor.ts` |
-| `memory_used_mb` | gauge | `observability.ts` |
+| Metric                  | Type      | Source                          |
+| ----------------------- | --------- | ------------------------------- |
+| `request_count`         | counter   | `services/usage.ts`             |
+| `request_latency_ms`    | histogram | `services/usage.ts`             |
+| `tokens_consumed`       | counter   | `services/usage.ts`             |
+| `cost_usd`              | counter   | `services/usage.ts`             |
+| `provider_errors`       | counter   | `services/errorClassifier.ts`   |
+| `circuit_state_changes` | counter   | `services/resilience.ts`        |
+| `cache_hits`            | counter   | `services/signatureCache.ts`    |
+| `compression_savings`   | histogram | `services/compression/stats.ts` |
+| `quota_used`            | gauge     | `services/quotaMonitor.ts`      |
+| `memory_used_mb`        | gauge     | `observability.ts`              |
 
 ### Latency Percentiles (p50/p95/p99)
 
@@ -376,12 +505,19 @@ For now, scrape `/api/monitoring/health` with any HTTP-based monitoring system (
 ## Alerting Recipes
 
 ### Slack
+
 > **Note:** Webhook alerting is configured through the dashboard Settings page — there are no dedicated webhook env vars (`grep -rn` returns zero hits). See the Settings UI for webhook URL, event filtering, and payload customization.
+
 ### Discord
+
 > Webhook alerting uses the same Settings UI flow as Slack. Discord accepts the same JSON payload shape.
+
 ### PagerDuty
+
 > Webhook alerting uses the same Settings UI flow. PagerDuty Events API v2 routing keys are configured in the Settings UI.
+
 ### Custom Webhook (JSON)
+
 > Any HTTP endpoint that accepts POST with JSON body will work. Configure the URL in the Settings UI.
 
 ---
@@ -395,13 +531,7 @@ Create a `~/.omniroute/dashboard.json`:
 ```json
 {
   "health": {
-    "sections": [
-      "server_status",
-      "database",
-      "providers",
-      "quota_monitors",
-      "recent_errors"
-    ],
+    "sections": ["server_status", "database", "providers", "quota_monitors", "recent_errors"],
     "refresh_interval_ms": 5000
   }
 }
@@ -463,7 +593,7 @@ node --expose-gc -e "global.gc(); console.log(process.memoryUsage())"
 
 ## See Also
 
-- [USAGE_QUOTA_GUIDE.md](../features/USAGE_QUOTA_GUIDE.md) — usage & cost tracking
+- [USAGE_QUOTA_GUIDE.md](../guides/USAGE_QUOTA_GUIDE.md) — usage & cost tracking
 - [DATABASE_GUIDE.md](./DATABASE_GUIDE.md) — DB schema + health
 - [PROXY_GUIDE.md](./PROXY_GUIDE.md) — proxy health (separate cache)
 - [ARCHITECTURE.md](../architecture/ARCHITECTURE.md) — system architecture

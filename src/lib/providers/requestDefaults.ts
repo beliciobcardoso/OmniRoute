@@ -4,8 +4,18 @@ const CLAUDE_CODE_COMPATIBLE_PROVIDER_PREFIX = "anthropic-compatible-cc-";
 import { normalizeExcludedModelPatterns } from "@/domain/connectionModelRules";
 import { normalizeRoutingTags } from "@/domain/tagRouter";
 import { normalizeOpenRouterPreset } from "@/shared/constants/openRouterPreset";
+import { isForbiddenCustomHeaderName } from "@/shared/constants/upstreamHeaders";
+import { normalizePeakHourProtection } from "@/lib/providers/peakHourProtection";
+import { normalizeDetectedReasoningControl } from "@/shared/reasoning/reasoningControl";
 
-export const CODEX_REASONING_EFFORT_VALUES = ["none", "low", "medium", "high", "xhigh"] as const;
+export const CODEX_REASONING_EFFORT_VALUES = [
+  "none",
+  "low",
+  "medium",
+  "high",
+  "xhigh",
+  "max",
+] as const;
 
 export type CodexReasoningEffort = (typeof CODEX_REASONING_EFFORT_VALUES)[number];
 
@@ -65,6 +75,10 @@ export function normalizeClaudeCodeCompatibleRedactThinking(value: unknown): tru
   return value === true ? true : undefined;
 }
 
+export function normalizeClaudeCodeCompatibleSummarizeThinking(value: unknown): true | undefined {
+  return value === true ? true : undefined;
+}
+
 export function normalizeRequestDefaults(
   provider: string | null | undefined,
   value: unknown
@@ -104,9 +118,66 @@ export function normalizeRequestDefaults(
     } else {
       delete normalized.redactThinking;
     }
+
+    const summarizeThinking = normalizeClaudeCodeCompatibleSummarizeThinking(
+      record.summarizeThinking
+    );
+    if (summarizeThinking) {
+      normalized.summarizeThinking = true;
+    } else {
+      delete normalized.summarizeThinking;
+    }
   }
 
   return Object.keys(normalized).length > 0 ? normalized : undefined;
+}
+
+const CACHE_PASSTHROUGH_VALUES = new Set(["strip", "openai-format", "claude-format"]);
+
+// #6880 — per-connection prompt-cache capability override: strip unknown keys / invalid
+// types, drop the sub-object entirely when nothing valid survives.
+export function normalizeCacheOverride(value: unknown): JsonRecord | undefined {
+  const record = asRecord(value);
+  if (Object.keys(record).length === 0) return undefined;
+
+  const normalized: JsonRecord = {};
+  if (typeof record.supportsPromptCaching === "boolean") {
+    normalized.supportsPromptCaching = record.supportsPromptCaching;
+  }
+  if (
+    typeof record.cacheControlPassthrough === "string" &&
+    CACHE_PASSTHROUGH_VALUES.has(record.cacheControlPassthrough)
+  ) {
+    normalized.cacheControlPassthrough = record.cacheControlPassthrough;
+  }
+
+  return Object.keys(normalized).length > 0 ? normalized : undefined;
+}
+
+// #6880 — extracted so normalizeProviderSpecificData() stays under the
+// max-lines-per-function gate: normalizes the two nested-object sub-fields
+// (requestDefaults, cache) in one pass.
+function normalizeNestedSubObjects(
+  provider: string | null | undefined,
+  normalized: JsonRecord
+): void {
+  if ("requestDefaults" in normalized) {
+    const requestDefaults = normalizeRequestDefaults(provider, normalized.requestDefaults);
+    if (requestDefaults) {
+      normalized.requestDefaults = requestDefaults;
+    } else {
+      delete normalized.requestDefaults;
+    }
+  }
+
+  if ("cache" in normalized) {
+    const cache = normalizeCacheOverride(normalized.cache);
+    if (cache) {
+      normalized.cache = cache;
+    } else {
+      delete normalized.cache;
+    }
+  }
 }
 
 export function normalizeProviderSpecificData(
@@ -118,21 +189,60 @@ export function normalizeProviderSpecificData(
 
   const normalized: JsonRecord = { ...record };
 
-  if ("requestDefaults" in normalized) {
-    const requestDefaults = normalizeRequestDefaults(provider, normalized.requestDefaults);
-    if (requestDefaults) {
-      normalized.requestDefaults = requestDefaults;
-    } else {
-      delete normalized.requestDefaults;
-    }
+  normalizeNestedSubObjects(provider, normalized);
+
+  if (
+    normalized.reasoningControl !== undefined &&
+    normalized.reasoningControl !== null &&
+    normalized.reasoningControl !== "chat-template" &&
+    normalized.reasoningControl !== "openai"
+  ) {
+    delete normalized.reasoningControl;
+  }
+  const hasExplicitReasoningControl =
+    normalized.reasoningControl === "chat-template" || normalized.reasoningControl === "openai";
+  if (hasExplicitReasoningControl) {
+    delete normalized.detectedReasoningControl;
+  } else if ("detectedReasoningControl" in normalized) {
+    const detected = normalizeDetectedReasoningControl(normalized.detectedReasoningControl);
+    if (detected) normalized.detectedReasoningControl = detected;
+    else delete normalized.detectedReasoningControl;
   }
 
   if ("openaiStoreEnabled" in normalized && typeof normalized.openaiStoreEnabled !== "boolean") {
     delete normalized.openaiStoreEnabled;
   }
 
+  if (provider === "codex") {
+    if (normalized.codexFingerprintMode === null) delete normalized.codexFingerprintMode;
+    if (normalized.codex_fingerprint_mode === null) delete normalized.codex_fingerprint_mode;
+    if (normalized.codexPromptCacheKeyScope === null) delete normalized.codexPromptCacheKeyScope;
+  }
+
+  // Hugging Face Bill-To account (X-HF-Bill-To header source): the edit modal
+  // sends explicit `null` to clear a previously-saved value (the PUT route
+  // merges { ...existing, ...incoming }, so omitting the key would keep it).
+  // Only a non-empty string survives normalization.
+  if ("billTo" in normalized) {
+    if (typeof normalized.billTo === "string" && normalized.billTo.trim()) {
+      normalized.billTo = normalized.billTo.trim();
+    } else {
+      delete normalized.billTo;
+    }
+  }
+
+  if (
+    "preserveEncryptedReasoning" in normalized &&
+    typeof normalized.preserveEncryptedReasoning !== "boolean"
+  ) {
+    delete normalized.preserveEncryptedReasoning;
+  }
+
   if ("blockExtraUsage" in normalized && typeof normalized.blockExtraUsage !== "boolean") {
     delete normalized.blockExtraUsage;
+  }
+  if ("allowPaidCredits" in normalized && typeof normalized.allowPaidCredits !== "boolean") {
+    delete normalized.allowPaidCredits;
   }
 
   // #2997: per-connection transient-cooldown opt-out — only persist a real boolean.
@@ -140,8 +250,34 @@ export function normalizeProviderSpecificData(
     delete normalized.disableCooling;
   }
 
+  // Claude OAuth usage-wall opt-ins (open-sse/services/claudeLowPriority.ts) — only
+  // persist real booleans; both default to off when absent.
+  if ("lowPriorityMode" in normalized && typeof normalized.lowPriorityMode !== "boolean") {
+    delete normalized.lowPriorityMode;
+  }
+  if ("autoLimitReset" in normalized && typeof normalized.autoLimitReset !== "boolean") {
+    delete normalized.autoLimitReset;
+  }
+
+  if ("peakHourProtection" in normalized) {
+    const peakHourProtection = normalizePeakHourProtection(normalized.peakHourProtection);
+    if (peakHourProtection) {
+      normalized.peakHourProtection = peakHourProtection;
+    } else {
+      delete normalized.peakHourProtection;
+    }
+  }
+
   if ("autoFetchModels" in normalized && typeof normalized.autoFetchModels !== "boolean") {
     delete normalized.autoFetchModels;
+  }
+
+  // Per-connection operator timeout — only persist a real integer.
+  if (
+    "timeoutMs" in normalized &&
+    (typeof normalized.timeoutMs !== "number" || !Number.isInteger(normalized.timeoutMs))
+  ) {
+    delete normalized.timeoutMs;
   }
 
   if ("preset" in normalized) {
@@ -196,6 +332,30 @@ export function normalizeProviderSpecificData(
     delete normalized.excluded_models;
   }
 
+  // #8369: connection-level custom upstream headers — sanitize each key against the
+  // forbidden-header denylist and drop entries with non-string or empty values.
+  if ("customHeaders" in normalized) {
+    const raw = normalized.customHeaders;
+    if (raw && typeof raw === "object" && !Array.isArray(raw)) {
+      const cleaned: Record<string, string> = {};
+      for (const [key, value] of Object.entries(raw as Record<string, unknown>)) {
+        const trimmedKey = key.trim();
+        if (!trimmedKey) continue;
+        if (isForbiddenCustomHeaderName(trimmedKey)) continue;
+        if (typeof value === "string" && value.trim().length > 0) {
+          cleaned[trimmedKey] = value.trim();
+        }
+      }
+      if (Object.keys(cleaned).length > 0) {
+        normalized.customHeaders = cleaned;
+      } else {
+        delete normalized.customHeaders;
+      }
+    } else {
+      delete normalized.customHeaders;
+    }
+  }
+
   return Object.keys(normalized).length > 0 ? normalized : undefined;
 }
 
@@ -204,6 +364,10 @@ export function sanitizeProviderSpecificDataForResponse(value: unknown): JsonRec
   if (Object.keys(record).length === 0) return undefined;
 
   const sanitized: JsonRecord = { ...record };
+  delete sanitized.accessToken;
+  delete sanitized.refreshToken;
+  delete sanitized.idToken;
+  delete sanitized.apiKey;
   delete sanitized.consoleApiKey;
   delete sanitized.secretAccessKey;
   delete sanitized.awsSecretAccessKey;
@@ -216,6 +380,29 @@ export function sanitizeProviderSpecificDataForResponse(value: unknown): JsonRec
   delete sanitized.ollamaCloudUsageCookie;
   delete sanitized.ollamaCloudCookie;
   delete sanitized.usageCookie;
+  // Qwen/Alibaba Token Plan console session — a browser credential for the operator's
+  // cloud-console account, same class as the ollama/opencode cookies above. The edit
+  // modal initializes these fields empty and the PUT merge preserves unsent keys, so
+  // stripping them here cannot clobber the stored values.
+  delete sanitized.qwenCloudCookie;
+  delete sanitized.qwenCloudSecToken;
+  delete sanitized.alibabaConsoleCookie;
+  delete sanitized.alibabaConsoleSecToken;
+  delete sanitized.xiaomiMimoConsoleCookie;
+  delete sanitized.runtimeKey;
+  delete sanitized.validationId;
+  delete sanitized.volcConsoleCookie;
+  delete sanitized.volcCsrfToken;
+  // System-managed Codex fingerprint seed: never exposed through the API
+  // (mirrors sub2api stripping `codex_fingerprint_seed`); the server-side
+  // partial-update merge keeps it alive without the client round-tripping it.
+  delete sanitized.codexFingerprintSeed;
+  // Runtime-only Codex identity carriers (in-memory per request, never
+  // persisted) — strip defensively if they ever leak into a response payload.
+  delete sanitized.codexClientIdentity;
+  delete sanitized.codexOriginalIdentityHeaders;
+  delete sanitized.codexTurnStateEcho;
+  if (sanitized.browserCdpEndpoint) sanitized.browserCdpEndpoint = "configured";
   return sanitized;
 }
 
@@ -286,6 +473,7 @@ export function getCodexRequestDefaults(providerSpecificData: unknown): {
 export function getClaudeCodeCompatibleRequestDefaults(providerSpecificData: unknown): {
   context1m?: true;
   redactThinking?: true;
+  summarizeThinking?: true;
 } {
   const defaults = getProviderRequestDefaults(
     "anthropic-compatible-cc-default",
@@ -293,8 +481,12 @@ export function getClaudeCodeCompatibleRequestDefaults(providerSpecificData: unk
   );
   const context1m = normalizeClaudeCodeCompatibleContext1m(defaults.context1m);
   const redactThinking = normalizeClaudeCodeCompatibleRedactThinking(defaults.redactThinking);
+  const summarizeThinking = normalizeClaudeCodeCompatibleSummarizeThinking(
+    defaults.summarizeThinking
+  );
   return {
     ...(context1m ? { context1m } : {}),
     ...(redactThinking ? { redactThinking } : {}),
+    ...(summarizeThinking ? { summarizeThinking } : {}),
   };
 }

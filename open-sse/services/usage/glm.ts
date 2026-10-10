@@ -11,7 +11,8 @@
 
 import { toNumber, toRecord, toTitleCase, toPercentage } from "./scalars.ts";
 import { type UsageQuota } from "./quota.ts";
-import { getGlmQuotaUrl } from "../../config/glmProvider.ts";
+import { buildGlmQuotaFetch, getGlmTeamQuotaConfig } from "../../config/glmProvider.ts";
+import { fetchGlmResetCardCount } from "./glmResetCards.ts";
 
 type JsonRecord = Record<string, unknown>;
 
@@ -23,6 +24,7 @@ function getGlmTokenQuotaName(
   const number = toNumber(limit.number, 0);
 
   if (unit === 3 && number === 5) return "session";
+  if (unit === 6 && number === 1) return "weekly";
   if ((unit === 4 && number === 7) || (unit === 3 && number >= 24 * 7)) return "weekly";
 
   return existingQuotas.session ? "weekly" : "session";
@@ -83,19 +85,53 @@ export function glmMonthlyRemainingPercentage(total: number, remaining: number):
   return Math.max(0, Math.min(100, Math.round(remaining)));
 }
 
+function glmTeamQuotaIncompleteMessage(missing: "glmOrganizationId" | "glmProjectId"): string {
+  const fieldLabel = missing === "glmOrganizationId" ? "Organization ID" : "Project ID";
+  return `GLM team plan quota requires both Organization ID and Project ID. Add the missing ${fieldLabel} on this connection.`;
+}
+
+function glmTeamQuotaHintMessage(): string {
+  return "This API key appears to be a GLM Coding team plan. Add Organization ID and Project ID on this connection to view usage.";
+}
+
+function sanitizeGlmQuotaErrorMessage(msg: unknown): string {
+  if (typeof msg !== "string" || !msg.trim()) {
+    return "Unable to fetch GLM quota.";
+  }
+  return msg.trim();
+}
+
+function shouldSuggestGlmTeamQuota(
+  teamConfig: ReturnType<typeof getGlmTeamQuotaConfig>,
+  _providerSpecificData: unknown,
+  _json: JsonRecord,
+  upstreamMsg: string
+): boolean {
+  if (teamConfig.state !== "none") return false;
+  return /coding\s*plan|不存在.*plan|没有.*coding|团队|编码套餐/i.test(upstreamMsg);
+}
+
+/**
+ * A reset card can only clear the 5-hour or the weekly coding-plan window, so a key that
+ * reports neither can never have one banked — used to skip the extra reset-card request.
+ */
+function hasResettableGlmWindow(quotas: Record<string, UsageQuota>): boolean {
+  return Boolean(quotas.session || quotas.weekly);
+}
+
 export async function getGlmUsage(apiKey: string, providerSpecificData?: Record<string, unknown>) {
   if (!apiKey) {
     return { message: "API key not available. Add a coding plan API key to view usage." };
   }
 
-  const quotaUrl = getGlmQuotaUrl(providerSpecificData);
+  const teamConfig = getGlmTeamQuotaConfig(providerSpecificData);
+  if (teamConfig.state === "incomplete") {
+    return { message: glmTeamQuotaIncompleteMessage(teamConfig.missing) };
+  }
 
-  const res = await fetch(quotaUrl, {
-    headers: {
-      Authorization: `Bearer ${apiKey}`,
-      Accept: "application/json",
-    },
-  });
+  const { url: quotaUrl, headers } = buildGlmQuotaFetch(apiKey, providerSpecificData);
+
+  const res = await fetch(quotaUrl, { headers });
 
   if (!res.ok) {
     if (res.status === 401) throw new Error("Invalid API key");
@@ -103,8 +139,19 @@ export async function getGlmUsage(apiKey: string, providerSpecificData?: Record<
   }
 
   const json = await res.json();
-  if (toNumber(json.code, 200) === 401 || json.success === false) {
+  if (!json || typeof json !== "object") {
+    throw new Error("Invalid JSON response from GLM quota API");
+  }
+  if (toNumber(json.code, 200) === 401) {
     throw new Error("Invalid API key");
+  }
+
+  if (json.success === false) {
+    const upstreamMsg = sanitizeGlmQuotaErrorMessage(json.msg ?? json.message);
+    if (shouldSuggestGlmTeamQuota(teamConfig, providerSpecificData, toRecord(json), upstreamMsg)) {
+      return { message: glmTeamQuotaHintMessage() };
+    }
+    return { message: upstreamMsg };
   }
 
   const data = toRecord(json.data);
@@ -117,15 +164,30 @@ export async function getGlmUsage(apiKey: string, providerSpecificData?: Record<
     const resetMs = toNumber(src.nextResetTime, 0);
     const resetAt = resetMs > 0 ? new Date(resetMs).toISOString() : null;
 
-    if (type === "TOKENS_LIMIT") {
+    // Z.ai coding-plan keys (CREDIT-based, e.g. GLM Coding Max/Lite) report
+    // CREDIT_LIMIT rows with the same unit/number semantics as TOKENS_LIMIT
+    // (unit=3/number=5 → 5-hour window, unit=6/number=1 → weekly). Without
+    // this branch every CREDIT_LIMIT row is dropped and the quota card
+    // renders empty for subscription keys.
+    if (type === "TOKENS_LIMIT" || type === "CREDIT_LIMIT") {
       const quotaName = getGlmTokenQuotaName(src, quotas);
       const usedPercent = toPercentage(src.percentage);
       const remaining = Math.max(0, 100 - usedPercent);
 
+      // CREDIT_LIMIT rows (z.ai coding-plan keys) carry absolute credits on
+      // top of the percentage: usage = window total, currentValue = consumed,
+      // remaining = credits left. Prefer them so the quota card renders
+      // "3341 / 28000" like z.ai's own dashboard instead of a percent-only
+      // scale. TOKENS_LIMIT rows without absolute fields keep the percent path.
+      const totalCredits = toNumber(src.usage, 0);
+      const usedCredits = totalCredits > 0 ? toNumber(src.currentValue, usedPercent) : usedPercent;
+      const remainingCredits = totalCredits > 0 ? toNumber(src.remaining, remaining) : remaining;
+      const total = totalCredits > 0 ? totalCredits : 100;
+
       quotas[quotaName] = {
-        used: usedPercent,
-        total: 100,
-        remaining,
+        used: usedCredits,
+        total,
+        remaining: remainingCredits,
         remainingPercentage: remaining,
         resetAt,
         displayName: getGlmQuotaDisplayName(quotaName),
@@ -178,5 +240,21 @@ export async function getGlmUsage(apiKey: string, providerSpecificData?: Record<
         : "";
   const plan = levelRaw ? toTitleCase(levelRaw.replace(/\s*plan$/i, "")) : null;
 
-  return { plan, quotas: orderGlmQuotas(quotas) };
+  const orderedQuotas = orderGlmQuotas(quotas);
+
+  // Coding Plan Reset Cards live on a separate endpoint, so surfacing the banked count costs
+  // one extra request. Only pay it for keys that actually report a resettable window — a
+  // pay-as-you-go key can never hold a card — and keep it best-effort (the helper never
+  // throws). The count is tri-state: a successful list reports a number (0 is an
+  // authoritative "no cards"), while a transport/envelope failure reports null so the
+  // cache layer can preserve the previously known count instead of erasing it.
+  const bankedResetCredits = hasResettableGlmWindow(quotas)
+    ? await fetchGlmResetCardCount(apiKey, providerSpecificData)
+    : 0;
+
+  return {
+    plan,
+    quotas: orderedQuotas,
+    ...(bankedResetCredits !== null ? { bankedResetCredits } : {}),
+  };
 }

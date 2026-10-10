@@ -41,8 +41,10 @@ test("each skill dir has SKILL.md with frontmatter", async () => {
     }
     // Skills `omni-*` são GERADOS por src/lib/agentSkills/generator.ts (alguns em
     // estado "no endpoints mapped yet", sem refs de uso) — o invariante de uso vale
-    // só para os manifests manuscritos (cli-* e config-*).
-    if (!dir.startsWith("omni-")) {
+    // só para os manifests manuscritos (cli-* e config-*). `ponytail` é a entrada
+    // `external` do catálogo (#9058, conteúdo MIT de terceiro) — não descreve uso
+    // do OmniRoute, então também fica fora do invariante.
+    if (!dir.startsWith("omni-") && dir !== "ponytail") {
       assert.ok(
         content.includes("OMNIROUTE_") || content.includes("omniroute "),
         `${dir}: missing usage references (OMNIROUTE_* env vars or omniroute CLI commands)`
@@ -77,4 +79,26 @@ test("description field is meaningful (≥50 chars)", async () => {
     // reais a usa; o invariante verificável é descrição substantiva (≥50 chars).
     assert.ok(desc.length >= 50, `${dir}: description too short (${desc.length})`);
   }
+});
+
+// #15665: skills linked to `skills/omniroute-*/SKILL.md` after those dirs were renamed to
+// `omni-*`/`cli-*`, so agents following the raw URLs hit a 404. Every link to another skill
+// manifest (raw GitHub URL or relative path) must resolve to a dir that exists today.
+// HTML comments are skipped: `<!-- Migrated from skills/omniroute-x/SKILL.md -->` is
+// provenance, not a link.
+test("every skills/<dir>/SKILL.md reference inside a skill resolves (#15665)", async () => {
+  const dirs = await listSkillDirs();
+  const existing = new Set(dirs);
+  const broken: string[] = [];
+  let checked = 0;
+  for (const dir of dirs) {
+    const raw = await readFile(join(SKILLS_DIR, dir, "SKILL.md"), "utf-8");
+    const content = raw.replace(/<!--[\s\S]*?-->/g, "");
+    for (const m of content.matchAll(/skills\/([A-Za-z0-9_.-]+)\/SKILL\.md/g)) {
+      checked++;
+      if (!existing.has(m[1])) broken.push(`${dir} -> skills/${m[1]}/SKILL.md`);
+    }
+  }
+  assert.ok(checked > 0, "no cross-skill references found — the extraction regex is broken");
+  assert.deepEqual(broken, [], `dangling skill links:\n${broken.join("\n")}`);
 });

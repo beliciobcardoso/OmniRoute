@@ -4,6 +4,20 @@ import assert from "node:assert/strict";
 const { AgentSkillSchema, SkillCoverageSchema, ListQuerySchema, GenerateBodySchema } =
   await import("../../src/lib/agentSkills/schemas.ts");
 
+test("agent skills schemas module exposes runtime validators", async () => {
+  const schemas = await import("../../src/lib/agentSkills/schemas.ts");
+
+  for (const key of [
+    "AgentSkillSchema",
+    "GenerateBodySchema",
+    "ListQuerySchema",
+    "SkillCategorySchema",
+    "SkillCoverageSchema",
+  ]) {
+    assert.equal(typeof schemas[key].safeParse, "function", `${key} should stay exported`);
+  }
+});
+
 // ─── AgentSkillSchema ─────────────────────────────────────────────────────────
 
 test("AgentSkillSchema — valid api skill parses successfully", () => {
@@ -105,7 +119,15 @@ test("AgentSkillSchema — optional fields absent parses successfully", () => {
 
 test("AgentSkillSchema — .parse throws on invalid input", () => {
   assert.throws(() => {
-    AgentSkillSchema.parse({ id: "bad id", name: "", description: "", category: "api", area: "x", rawUrl: "x", githubUrl: "x" });
+    AgentSkillSchema.parse({
+      id: "bad id",
+      name: "",
+      description: "",
+      category: "api",
+      area: "x",
+      rawUrl: "x",
+      githubUrl: "x",
+    });
   });
 });
 
@@ -113,9 +135,10 @@ test("AgentSkillSchema — .parse throws on invalid input", () => {
 
 test("SkillCoverageSchema — valid coverage parses successfully", () => {
   const input = {
-    api: { have: 22, total: 22 },
-    cli: { have: 20, total: 20 },
-    totalSkills: 42,
+    api: { have: 23, total: 23 },
+    cli: { have: 21, total: 21 },
+    config: { have: 1, total: 1 },
+    totalSkills: 45,
     generatedAt: new Date().toISOString(),
   };
   const result = SkillCoverageSchema.safeParse(input);
@@ -125,8 +148,9 @@ test("SkillCoverageSchema — valid coverage parses successfully", () => {
 test("SkillCoverageSchema — wrong total literal (api.total=21) fails", () => {
   const input = {
     api: { have: 21, total: 21 },
-    cli: { have: 20, total: 20 },
-    totalSkills: 41,
+    cli: { have: 21, total: 21 },
+    config: { have: 1, total: 1 },
+    totalSkills: 44,
     generatedAt: new Date().toISOString(),
   };
   const result = SkillCoverageSchema.safeParse(input);
@@ -135,9 +159,10 @@ test("SkillCoverageSchema — wrong total literal (api.total=21) fails", () => {
 
 test("SkillCoverageSchema — wrong total literal (cli.total=19) fails", () => {
   const input = {
-    api: { have: 22, total: 22 },
-    cli: { have: 19, total: 19 },
-    totalSkills: 41,
+    api: { have: 23, total: 23 },
+    cli: { have: 20, total: 20 },
+    config: { have: 1, total: 1 },
+    totalSkills: 44,
     generatedAt: new Date().toISOString(),
   };
   const result = SkillCoverageSchema.safeParse(input);
@@ -146,9 +171,10 @@ test("SkillCoverageSchema — wrong total literal (cli.total=19) fails", () => {
 
 test("SkillCoverageSchema — invalid datetime fails", () => {
   const input = {
-    api: { have: 22, total: 22 },
-    cli: { have: 20, total: 20 },
-    totalSkills: 42,
+    api: { have: 23, total: 23 },
+    cli: { have: 21, total: 21 },
+    config: { have: 1, total: 1 },
+    totalSkills: 45,
     generatedAt: "not-a-date",
   };
   const result = SkillCoverageSchema.safeParse(input);
@@ -157,9 +183,10 @@ test("SkillCoverageSchema — invalid datetime fails", () => {
 
 test("SkillCoverageSchema — negative have value fails", () => {
   const input = {
-    api: { have: -1, total: 22 },
-    cli: { have: 20, total: 20 },
-    totalSkills: 42,
+    api: { have: -1, total: 23 },
+    cli: { have: 21, total: 21 },
+    config: { have: 1, total: 1 },
+    totalSkills: 45,
     generatedAt: new Date().toISOString(),
   };
   const result = SkillCoverageSchema.safeParse(input);
@@ -182,6 +209,14 @@ test("ListQuerySchema — valid category parses successfully", () => {
   assert.equal(result.success, true);
   if (result.success) {
     assert.equal(result.data.category, "api");
+  }
+});
+
+test("ListQuerySchema — config category parses successfully", () => {
+  const result = ListQuerySchema.safeParse({ category: "config" });
+  assert.equal(result.success, true);
+  if (result.success) {
+    assert.equal(result.data.category, "config");
   }
 });
 

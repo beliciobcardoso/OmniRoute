@@ -7,10 +7,10 @@ import { upsertSemanticMemoryPoint, deleteSemanticMemoryPoint } from "./qdrant";
 import { Memory, MemoryType } from "./types";
 import { logger } from "../../../open-sse/utils/logger.ts";
 import { sanitizeErrorMessage } from "../../../open-sse/utils/error.ts";
-import { resolveEmbeddingSource, embed } from "./embedding";
+import { resolveEmbeddingSource, embedWithRetry, withMeasuredDimensions } from "./embedding";
 import { getVectorStore } from "./vectorStore";
 import { getMemorySettings } from "./settings";
-import { markMemoryNeedsReindex } from "@/lib/localDb";
+import { markMemoryNeedsReindex } from "@/lib/db/memoryVec";
 
 const log = logger("MEMORY_STORE");
 
@@ -30,6 +30,9 @@ interface MemoryRow {
   created_at: string;
   updated_at: string;
   expires_at: string | null;
+  // TV6 typed-decay columns (migration 111). Optional so a pre-migration row still maps.
+  access_count?: number | null;
+  last_accessed_at?: string | null;
 }
 
 // Memory cache configuration
@@ -79,6 +82,8 @@ function rowToMemory(row: MemoryRow): Memory {
     createdAt: new Date(String(row.created_at)),
     updatedAt: new Date(String(row.updated_at)),
     expiresAt: row.expires_at ? new Date(String(row.expires_at)) : null,
+    accessCount: typeof row.access_count === "number" ? row.access_count : 0,
+    lastAccessedAt: row.last_accessed_at ? new Date(String(row.last_accessed_at)) : null,
   };
 }
 
@@ -117,11 +122,24 @@ function safeMarkNeedsReindex(id: string, needs: boolean): void {
 function scheduleVectorUpsert(id: string, content: string): void {
   setImmediate(async () => {
     try {
+      // The upsert is fire-and-forget and embeddings are slow (potion loads
+      // lazily). Health-check verification (and user deletes) can remove the
+      // memory before this callback runs — skip quietly instead of spamming
+      // "memory not found" warnings every sweep interval.
+      const db = getDbInstance();
+      const exists = db.prepare("SELECT rowid FROM memories WHERE id = ?").get(id);
+      if (!exists) {
+        log.debug("memory.vec.upsert.skipped_deleted", { id });
+        return;
+      }
+
       const settings = await getMemorySettings();
       const resolution = resolveEmbeddingSource(settings);
       if (!resolution.source) return;
 
-      const embeddingResult = await embed(content, settings);
+      // #13601: one retry before giving up — a single transient embed failure
+      // must not skip vectorization. The warn below keeps the cause visible.
+      const embeddingResult = await embedWithRetry(content, settings);
       if (!("vector" in embeddingResult)) {
         log.warn("memory.vec.embed.fail", {
           id,
@@ -138,7 +156,18 @@ function scheduleVectorUpsert(id: string, content: string): void {
         return;
       }
 
-      await vec.ensureReady(resolution);
+      // The vector in hand is the lazy probe the resolution is waiting for: the
+      // registry has no width for a self-hosted endpoint, so without this
+      // ensureReady() never creates vec_memories and every upsert below fails
+      // into the catch, leaving the memory stored but never vectorized (#12154).
+      const ready = await vec.ensureReady(
+        withMeasuredDimensions(resolution, embeddingResult.vector.length)
+      );
+      if (!ready.ready) {
+        log.warn("memory.vec.ensure_ready.skipped", { id, reason: ready.reason });
+        safeMarkNeedsReindex(id, true);
+        return;
+      }
       await vec.upsertVector(id, embeddingResult.vector);
       safeMarkNeedsReindex(id, false);
     } catch (err: unknown) {
@@ -155,7 +184,7 @@ function scheduleVectorUpsert(id: string, content: string): void {
  * Create a new memory entry (UPSERT: updates existing if same apiKeyId + key)
  */
 export async function createMemory(
-  memory: Omit<Memory, "id" | "createdAt" | "updatedAt">
+  memory: Omit<Memory, "id" | "createdAt" | "updatedAt" | "accessCount" | "lastAccessedAt">
 ): Promise<Memory> {
   const db = getDbInstance();
   const now = new Date().toISOString();
@@ -190,6 +219,11 @@ export async function createMemory(
       createdAt: new Date(String(existing.created_at)),
       updatedAt: new Date(now),
       expiresAt: memory.expiresAt ?? null,
+      // Preserve the existing access telemetry on UPSERT (an update is not a fresh access).
+      accessCount: typeof existing.access_count === "number" ? existing.access_count : 0,
+      lastAccessedAt: existing.last_accessed_at
+        ? new Date(String(existing.last_accessed_at))
+        : null,
     };
 
     // Invalidate and update cache
@@ -248,6 +282,8 @@ export async function createMemory(
     memory.expiresAt?.toISOString() ?? null
   );
 
+  // memory_id (the FTS5 content_rowid) is assigned by the memory_fts_ai_assign trigger.
+
   const createdMemory: Memory = {
     id,
     apiKeyId: memory.apiKeyId,
@@ -259,6 +295,8 @@ export async function createMemory(
     createdAt: new Date(now),
     updatedAt: new Date(now),
     expiresAt: memory.expiresAt ?? null,
+    accessCount: 0,
+    lastAccessedAt: null,
   };
 
   // Cache the newly created memory
@@ -338,8 +376,7 @@ export async function updateMemory(
 
   // Fetch current state to detect content/key change (needed for vector re-gen)
   const currentRow = db.prepare("SELECT content, key FROM memories WHERE id = ?").get(id) as
-    | { content: string; key: string | null }
-    | undefined;
+    { content: string; key: string | null } | undefined;
 
   // Build dynamic update query
   const fields: string[] = [];
@@ -384,8 +421,7 @@ export async function updateMemory(
   invalidateMemoryCache(id);
 
   // Regenerate vector if content or key changed (fire-and-forget)
-  const contentChanged =
-    updates.content !== undefined && updates.content !== currentRow?.content;
+  const contentChanged = updates.content !== undefined && updates.content !== currentRow?.content;
   const keyChanged = updates.key !== undefined && updates.key !== currentRow?.key;
 
   if (contentChanged || keyChanged) {
@@ -447,6 +483,7 @@ export async function listMemories(filters: {
   apiKeyId?: string;
   type?: MemoryType;
   sessionId?: string;
+  category?: string;
   query?: string;
   limit?: number;
   offset?: number;
@@ -471,6 +508,13 @@ export async function listMemories(filters: {
   if (filters.sessionId) {
     whereClauses.push("session_id = ?");
     whereParams.push(filters.sessionId);
+  }
+
+  if (typeof filters.category === "string" && filters.category.trim().length > 0) {
+    whereClauses.push(
+      "json_extract(CASE WHEN json_valid(metadata) THEN metadata ELSE '{}' END, '$.category') = ?"
+    );
+    whereParams.push(filters.category.trim());
   }
 
   if (typeof filters.query === "string" && filters.query.trim().length > 0) {
@@ -542,4 +586,65 @@ export function getMemoryTokensUsed(apiKeyId?: string): number {
   );
   const row = stmt.get(...(apiKeyId ? [apiKeyId] : [])) as { tokensUsed: number } | undefined;
   return row?.tokensUsed ?? 0;
+}
+
+/**
+ * TV6: record that the given memories were injected into a prompt. Increments
+ * `access_count` and stamps `last_accessed_at` so the decay clock re-bases and access
+ * immunity can accrue. Best-effort and non-blocking by contract — callers fire-and-forget;
+ * any error (DB closed in test teardown, missing columns pre-migration) is swallowed so
+ * retrieval is never impacted.
+ */
+export function recordMemoryAccess(ids: string[]): void {
+  if (!Array.isArray(ids) || ids.length === 0) return;
+  const unique = Array.from(new Set(ids.filter((id) => typeof id === "string" && id)));
+  if (unique.length === 0) return;
+  try {
+    const db = getDbInstance();
+    const placeholders = unique.map(() => "?").join(", ");
+    const stmt = db.prepare(
+      `UPDATE memories SET access_count = access_count + 1, last_accessed_at = ? ` +
+        `WHERE id IN (${placeholders})`
+    );
+    stmt.run(new Date().toISOString(), ...unique);
+    for (const id of unique) invalidateMemoryCache(id);
+  } catch {
+    // intentional swallow — access tracking is opportunistic telemetry, never load-bearing
+  }
+}
+
+/**
+ * TV6: lightweight candidate rows for the decay sweep. Returns only the fields the decay
+ * predicates read (no content/metadata), ordered oldest-first and bounded by `limit`, so a
+ * sweep never materializes whole memories or scans unboundedly.
+ */
+export function listMemoriesForDecay(filters: { apiKeyId?: string; limit: number }): {
+  id: string;
+  type: MemoryType;
+  accessCount: number;
+  createdAt: Date;
+  lastAccessedAt: Date | null;
+}[] {
+  const db = getDbInstance();
+  const where = filters.apiKeyId ? " WHERE api_key_id = ?" : "";
+  const params: unknown[] = filters.apiKeyId ? [filters.apiKeyId] : [];
+  params.push(Math.max(1, Math.floor(filters.limit)));
+  const stmt = db.prepare(
+    `SELECT id, type, access_count, created_at, last_accessed_at FROM memories${where} ` +
+      `ORDER BY created_at ASC LIMIT ?`
+  );
+  const rows = stmt.all(...params) as {
+    id: string;
+    type: string;
+    access_count: number | null;
+    created_at: string;
+    last_accessed_at: string | null;
+  }[];
+  return rows.map((r) => ({
+    id: String(r.id),
+    type: r.type as MemoryType,
+    accessCount: typeof r.access_count === "number" ? r.access_count : 0,
+    createdAt: new Date(String(r.created_at)),
+    lastAccessedAt: r.last_accessed_at ? new Date(String(r.last_accessed_at)) : null,
+  }));
 }

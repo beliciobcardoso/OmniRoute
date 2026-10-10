@@ -3,17 +3,22 @@
  *
  * Inspired by ClawRouter commit 14c83c258 "refactor: extract routing into pluggable RouterStrategy system".
  * Provides a RouterStrategy interface and built-in implementations:
- *   - RulesStrategy (default): wraps the existing 6-factor scoring engine
+ *   - RulesStrategy (default): wraps the existing 16-factor scoring engine
+ *   - ScoreStrategy: highest configured weighted score, with explicit exploration
  *   - CostStrategy: always picks cheapest available model
  *   - LatencyStrategy: prioritizes low p95 latency with reliability weighting
  *   - SLAStrategy: prefers candidates that satisfy latency/error/cost SLOs
  *   - LKGPStrategy: tries last known good provider first
+ *   - NadirStrategy: asks Nadir's decision API which model the prompt needs (nadirStrategy.ts)
  */
 
-import type { ProviderCandidate, ScoredProvider } from "./scoring.ts";
+import type { ProviderCandidate, ScoredProvider, ScoringWeights } from "./scoring.ts";
 import { scorePool } from "./scoring.ts";
 import { getTaskFitness } from "./taskFitness.ts";
 import { clamp01 } from "../../utils/number.ts";
+import { rankBySpeed } from "./speedRanking.ts";
+import type { SpeedCandidate } from "./speedRanking.ts";
+import { NadirStrategyImpl, type NadirRoutingConfig } from "./nadirStrategy.ts";
 
 export interface SlaRoutingPolicy {
   targetP95Ms?: number;
@@ -30,6 +35,12 @@ export interface RoutingContext {
   lastKnownGoodProvider?: string;
   lkgpEnabled?: boolean;
   sla?: SlaRoutingPolicy;
+  weights?: ScoringWeights;
+  explorationRate?: number;
+  /** Raw request `messages`, for request-aware strategies (`nadir`). Untouched by the others. */
+  messages?: unknown;
+  /** The combo's `config.nadir` block; see nadirStrategy.ts. */
+  nadir?: NadirRoutingConfig;
 }
 
 export interface RoutingDecision {
@@ -39,27 +50,63 @@ export interface RoutingDecision {
   reason: string;
   candidatesConsidered: number;
   finalScore: number;
+  connectionId?: string;
 }
 
 export interface RouterStrategy {
   readonly name: string;
   readonly description: string;
   select(pool: ProviderCandidate[], context: RoutingContext): RoutingDecision;
+  /**
+   * Optional async twin of `select` for strategies whose decision needs I/O.
+   * `selectWithStrategyAsync` prefers it; `select` must still return a valid
+   * (typically fallback) decision for sync callers.
+   */
+  selectAsync?(pool: ProviderCandidate[], context: RoutingContext): Promise<RoutingDecision>;
 }
 
-// ── RulesStrategy: wraps 6-factor scoring engine ────────────────────────────
+// ── RulesStrategy: wraps 16-factor scoring engine ───────────────────────────
+
+function toSpeedCandidate(c: ProviderCandidate): SpeedCandidate {
+  return {
+    // Identity
+    provider: c.provider,
+    model: c.model,
+    // Resource state
+    quotaRemaining: c.quotaRemaining,
+    quotaTotal: c.quotaTotal,
+    circuitBreakerState: c.circuitBreakerState,
+    // Costs
+    costPer1MTokens: c.costPer1MTokens,
+    // Latency metrics
+    p95LatencyMs: c.p95LatencyMs,
+    avgTtftMs: c.avgTtftMs,
+    avgE2ELatencyMs: c.avgE2ELatencyMs,
+    avgTokensPerSecond: c.avgTokensPerSecond,
+    latencyStdDev: c.latencyStdDev,
+    // Reliability
+    errorRate: c.errorRate,
+    failureRate: c.failureRate,
+    // Tier signals (forwarded so weights stay available for downstream tuning)
+    accountTier: c.accountTier,
+    quotaResetIntervalSecs: c.quotaResetIntervalSecs,
+    contextAffinity: c.contextAffinity,
+    resetWindowAffinity: c.resetWindowAffinity,
+    connectionPoolSize: c.connectionPoolSize,
+    connectionId: c.connectionId,
+  };
+}
 
 class RulesStrategyImpl implements RouterStrategy {
   readonly name = "rules";
-  readonly description =
-    "6-factor weighted scoring: quota, health, cost, latency, taskFit, stability";
+  readonly description = "16-factor weighted scoring (see DEFAULT_WEIGHTS)";
 
   select(pool: ProviderCandidate[], context: RoutingContext): RoutingDecision {
     const eligible = pool.filter((c) => c.circuitBreakerState !== "OPEN");
     const ranked: ScoredProvider[] = scorePool(
       eligible.length > 0 ? eligible : pool,
       context.taskType,
-      undefined,
+      context.weights,
       getTaskFitness
     );
     const best = ranked[0];
@@ -71,6 +118,39 @@ class RulesStrategyImpl implements RouterStrategy {
       reason: `RulesStrategy: score=${best.score.toFixed(3)} (quota=${best.factors.quota.toFixed(2)}, health=${best.factors.health.toFixed(2)}, cost=${best.factors.costInv.toFixed(2)}, taskFit=${best.factors.taskFit.toFixed(2)})`,
       candidatesConsidered: ranked.length,
       finalScore: best.score,
+      connectionId: best.connectionId,
+    };
+  }
+}
+
+// ── ScoreStrategy: configured score wins, with explicit exploration ──────────
+
+class ScoreStrategyImpl implements RouterStrategy {
+  readonly name = "score";
+  readonly description = "Selects the highest configured weighted score, with explicit exploration";
+
+  select(pool: ProviderCandidate[], context: RoutingContext): RoutingDecision {
+    const eligible = pool.filter((candidate) => candidate.circuitBreakerState !== "OPEN");
+    const ranked = scorePool(
+      eligible.length > 0 ? eligible : pool,
+      context.taskType,
+      context.weights,
+      getTaskFitness
+    );
+    if (ranked.length === 0) throw new Error("[ScoreStrategy] No candidates to score");
+
+    const explorationRate = Math.min(1, Math.max(0, context.explorationRate ?? 0));
+    const isExploration = Math.random() < explorationRate && ranked.length > 1;
+    const selected = isExploration ? ranked[Math.floor(Math.random() * ranked.length)] : ranked[0];
+
+    return {
+      provider: selected.provider,
+      model: selected.model,
+      strategy: this.name,
+      reason: `ScoreStrategy: score=${selected.score.toFixed(3)}${isExploration ? " (exploration)" : ""}`,
+      candidatesConsidered: ranked.length,
+      finalScore: selected.score,
+      connectionId: selected.connectionId,
     };
   }
 }
@@ -81,7 +161,7 @@ class CostStrategyImpl implements RouterStrategy {
   readonly name = "cost";
   readonly description = "Always selects cheapest available provider (by costPer1MTokens)";
 
-  select(pool: ProviderCandidate[], context: RoutingContext): RoutingDecision {
+  select(pool: ProviderCandidate[], _context: RoutingContext): RoutingDecision {
     const healthy = pool.filter((c) => c.circuitBreakerState !== "OPEN");
     const candidates = healthy.length > 0 ? healthy : pool;
     const sorted = [...candidates].sort((a, b) => a.costPer1MTokens - b.costPer1MTokens);
@@ -94,6 +174,7 @@ class CostStrategyImpl implements RouterStrategy {
       reason: `CostStrategy: cheapest at $${best.costPer1MTokens.toFixed(3)}/1M tokens`,
       candidatesConsidered: candidates.length,
       finalScore: best.costPer1MTokens === 0 ? 1.0 : 1 / best.costPer1MTokens,
+      connectionId: best.connectionId,
     };
   }
 }
@@ -102,32 +183,45 @@ class CostStrategyImpl implements RouterStrategy {
 
 class LatencyStrategyImpl implements RouterStrategy {
   readonly name = "latency";
-  readonly description = "Prioritizes lowest p95 latency with reliability weighting";
+  readonly description =
+    "Prioritizes the fastest reliable provider-model pair using TTFT, TPS, E2E latency, health, fail rate, and stability";
 
-  select(pool: ProviderCandidate[], context: RoutingContext): RoutingDecision {
-    const healthy = pool.filter((c) => c.circuitBreakerState !== "OPEN");
-    const candidates = healthy.length > 0 ? healthy : pool;
-    const sorted = [...candidates].sort((a, b) => {
-      const aPenalty = a.errorRate * 1000;
-      const bPenalty = b.errorRate * 1000;
-      return a.p95LatencyMs + aPenalty - (b.p95LatencyMs + bPenalty);
-    });
-    const best = sorted[0];
-    if (!best) throw new Error("[LatencyStrategy] No candidates available");
-
-    const latencyScore = best.p95LatencyMs > 0 ? Math.max(0.001, 10_000 / best.p95LatencyMs) : 1;
-    const reliability = Math.max(0, 1 - best.errorRate);
-    const finalScore = latencyScore * 0.7 + reliability * 0.3;
+  select(pool: ProviderCandidate[], _context: RoutingContext): RoutingDecision {
+    const ranked = rankBySpeed(pool.map(toSpeedCandidate));
+    const winner = ranked[0];
+    if (!winner) {
+      throw new Error("[LatencyStrategy] No candidates available after speed ranking");
+    }
 
     return {
-      provider: best.provider,
-      model: best.model,
+      provider: winner.provider,
+      model: winner.model,
       strategy: this.name,
-      reason: `LatencyStrategy: p95=${best.p95LatencyMs}ms, errorRate=${(best.errorRate * 100).toFixed(2)}%`,
-      candidatesConsidered: candidates.length,
-      finalScore,
+      reason: latencyDecisionReason(winner),
+      candidatesConsidered: ranked.length,
+      finalScore: winner.score,
+      connectionId: winner.connectionId,
     };
   }
+}
+
+function metricString(value: number | null | undefined, digits = 0): string {
+  return value == null ? "n/a" : value.toFixed(digits);
+}
+
+function latencyDecisionReason(winner: ReturnType<typeof rankBySpeed>[number]): string {
+  const metrics = winner.metrics;
+  const e2e = metrics.avgE2ELatencyMs ?? metrics.p95LatencyMs;
+  return (
+    `LatencyStrategy(score=${winner.score.toFixed(3)}): ` +
+    `ttft=${metricString(metrics.avgTtftMs)}ms ` +
+    `tps=${metricString(metrics.avgTokensPerSecond, 1)} ` +
+    `e2e=${metricString(e2e)}ms ` +
+    `p95=${metricString(metrics.p95LatencyMs)}ms ` +
+    `failRate=${((metrics.failureRate ?? 0) * 100).toFixed(2)}% ` +
+    `stability=${metricString(metrics.latencyStdDev)}ms ` +
+    `cb=${metrics.circuitBreakerState ?? "n/a"}`
+  );
 }
 
 // ── SLAStrategy: favor targets that meet latency/error/cost SLOs ───────────
@@ -246,6 +340,7 @@ class SLAStrategyImpl implements RouterStrategy {
       reason: `SLAStrategy: p95=${best.candidate.p95LatencyMs}ms/${policy.targetP95Ms}ms, errorRate=${(best.candidate.errorRate * 100).toFixed(2)}%/${(policy.maxErrorRate * 100).toFixed(2)}%, cost=$${best.candidate.costPer1MTokens.toFixed(3)}/1M${fallbackNote}`,
       candidatesConsidered: candidates.length,
       finalScore: best.score,
+      connectionId: best.candidate.connectionId,
     };
   }
 }
@@ -274,6 +369,7 @@ class LKGPStrategyImpl implements RouterStrategy {
           reason: `LKGP: using last known good provider ${best.provider}`,
           candidatesConsidered: 1,
           finalScore: 1.0,
+          connectionId: best.connectionId,
         };
       }
     }
@@ -288,12 +384,14 @@ class LKGPStrategyImpl implements RouterStrategy {
 const strategyRegistry = new Map<string, RouterStrategy>();
 
 const rulesStrategy = new RulesStrategyImpl();
+const scoreStrategy = new ScoreStrategyImpl();
 const costStrategy = new CostStrategyImpl();
 const latencyStrategy = new LatencyStrategyImpl();
 const slaStrategy = new SLAStrategyImpl();
 const lkgpStrategy = new LKGPStrategyImpl();
 
 strategyRegistry.set("rules", rulesStrategy);
+strategyRegistry.set("score", scoreStrategy);
 strategyRegistry.set("cost", costStrategy);
 strategyRegistry.set("eco", costStrategy); // alias
 strategyRegistry.set("latency", latencyStrategy);
@@ -301,6 +399,7 @@ strategyRegistry.set("fast", latencyStrategy); // alias
 strategyRegistry.set("sla-aware", slaStrategy);
 strategyRegistry.set("sla", slaStrategy); // alias
 strategyRegistry.set("lkgp", lkgpStrategy);
+strategyRegistry.set("nadir", new NadirStrategyImpl({ fallback: rulesStrategy }));
 
 export function getStrategy(name: string): RouterStrategy {
   const strategy = strategyRegistry.get(name);
@@ -328,4 +427,19 @@ export function selectWithStrategy(
   strategyName = "rules"
 ): RoutingDecision {
   return getStrategy(strategyName).select(pool, context);
+}
+
+/**
+ * Async twin of `selectWithStrategy`: strategies that implement `selectAsync`
+ * (I/O-backed, e.g. `nadir`) get it; every other strategy runs its sync `select`.
+ */
+export async function selectWithStrategyAsync(
+  pool: ProviderCandidate[],
+  context: RoutingContext,
+  strategyName = "rules"
+): Promise<RoutingDecision> {
+  const strategy = getStrategy(strategyName);
+  return strategy.selectAsync
+    ? strategy.selectAsync(pool, context)
+    : strategy.select(pool, context);
 }

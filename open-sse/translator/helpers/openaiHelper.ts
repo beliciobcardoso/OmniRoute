@@ -31,7 +31,30 @@ const CLAUDE_TOOL_CHOICE_REQUIRED = "an" + "y";
 // Filter messages to OpenAI standard format
 // Remove: redacted_thinking, and other non-OpenAI blocks
 // Convert: thinking blocks → reasoning_content on the message
-export function filterToOpenAIFormat(body) {
+export interface FilterToOpenAIFormatOptions {
+  /** Keep `cache_control` on content blocks (providers that honor OpenAI-format breakpoints). */
+  preserveCacheControl?: boolean;
+  /** Keep Moonshot's non-standard `video_url` content block. */
+  preserveVideoUrl?: boolean;
+  /** Keep `reasoning_content` on tool-call assistant turns (reasoning-replay providers). */
+  preserveReasoningContent?: boolean;
+}
+
+export function filterToOpenAIFormat(body, opts: FilterToOpenAIFormatOptions = {}) {
+  // #2069 — when the routed provider honors OpenAI-format cache_control
+  // breakpoints (DashScope/alibaba, Xiaomi MiMo, etc.) and preservation was
+  // requested upstream, keep the `cache_control` field on each content block
+  // instead of destructuring it away. `signature` is always stripped.
+  const preserveCacheControl = opts?.preserveCacheControl === true;
+  // Moonshot's native Chat API extends OpenAI content blocks with `video_url`.
+  // Keep that extension opt-in so generic OpenAI-compatible providers still
+  // receive only the standard allowlist below.
+  const preserveVideoUrl = opts?.preserveVideoUrl === true;
+  // #4849 strips reasoning_content from tool-call assistant turns to stop O(n^2)
+  // context growth — but reasoning-replay providers (DeepSeek V4, Kimi K2, etc.)
+  // REQUIRE the client's reasoning_content to be passed back, so keep it for them
+  // (the caller sets this when the routed model needs reasoning replay).
+  const preserveReasoningContent = opts?.preserveReasoningContent === true;
   if (!body.messages || !Array.isArray(body.messages)) return body;
 
   body.messages = body.messages.map((msg) => {
@@ -43,8 +66,17 @@ export function filterToOpenAIFormat(body) {
     // Keep tool messages as-is (OpenAI format)
     if (msg.role === "tool") return msg;
 
-    // Keep assistant messages with tool_calls as-is
-    if (msg.role === "assistant" && msg.tool_calls) return msg;
+    // Keep assistant messages with tool_calls, but strip reasoning_content —
+    // reasoning blobs inflate context on every subsequent agentic turn (O(n^2)).
+    // Exception: reasoning-replay providers must keep client-provided
+    // reasoning_content (they 400 without it), so preserve it when requested.
+    if (msg.role === "assistant" && msg.tool_calls) {
+      if (!preserveReasoningContent && msg.reasoning_content !== undefined) {
+        const { reasoning_content, ...cleanMsg } = msg;
+        return cleanMsg;
+      }
+      return msg;
+    }
 
     // Handle string content
     if (typeof msg.content === "string") return msg;
@@ -64,9 +96,17 @@ export function filterToOpenAIFormat(body) {
         if (block.type === "redacted_thinking") continue;
 
         // Only keep valid OpenAI content types
-        if (VALID_OPENAI_CONTENT_TYPES.includes(block.type)) {
-          // Remove signature and cache_control fields
-          const { signature, cache_control, ...cleanBlock } = block;
+        if (
+          VALID_OPENAI_CONTENT_TYPES.includes(block.type) ||
+          (preserveVideoUrl && block.type === "video_url")
+        ) {
+          // Strip `signature` always; strip `cache_control` unless the provider
+          // honors OpenAI-format cache breakpoints and preservation was requested (#2069).
+          const { signature, cache_control, ...rest } = block;
+          const cleanBlock =
+            preserveCacheControl && cache_control !== undefined
+              ? { ...rest, cache_control }
+              : rest;
           if (
             cleanBlock.type === "text" &&
             typeof cleanBlock.text === "string" &&
@@ -137,6 +177,9 @@ export function filterToOpenAIFormat(body) {
     if (msg.role === "tool") return true;
     // Always keep assistant messages with tool_calls
     if (msg.role === "assistant" && msg.tool_calls) return true;
+    // Moonshot partial assistant messages are output prefixes, and an empty
+    // prefix is valid when `name` supplies the constrained value.
+    if (msg.role === "assistant" && msg.partial === true) return true;
 
     if (typeof msg.content === "string") return msg.content.trim() !== "";
     if (Array.isArray(msg.content)) {
@@ -178,7 +221,9 @@ export function filterToOpenAIFormat(body) {
             type: "function",
             function: {
               name: tool.name,
-              description: tool.description || "",
+              // Coerce: strict upstream validators (NVIDIA NIM, Codex) reject
+              // non-string descriptions. Ports decolua/9router#397.
+              description: String(tool.description ?? ""),
               parameters: tool.input_schema || { type: "object", properties: {} },
             },
           };
@@ -190,7 +235,7 @@ export function filterToOpenAIFormat(body) {
             type: "function",
             function: {
               name: fn.name,
-              description: fn.description || "",
+              description: String(fn.description ?? ""),
               parameters: fn.parameters || { type: "object", properties: {} },
             },
           }));

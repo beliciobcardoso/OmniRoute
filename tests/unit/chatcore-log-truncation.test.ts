@@ -134,7 +134,7 @@ test("truncateForLog summarizes oversized payloads instead of cloning", () => {
     provider: "openai",
     stream: true,
     // distinct object references so estimateSizeFast (WeakSet-dedup) counts each one
-    messages: Array.from({ length: 50000 }, () => ({ role: "user", content: "x".repeat(64) })),
+    messages: Array.from({ length: 50000 }, () => ({ role: "user", content: "x".repeat(500) })),
     contents: [{ a: 1 }],
   };
   const summary = truncateForLog(huge) as Record<string, unknown>;
@@ -148,4 +148,139 @@ test("truncateForLog summarizes oversized payloads instead of cloning", () => {
   assert.equal(summary.stream, true);
   // the original (huge) is NOT returned — it is a fresh summary object
   assert.notEqual(summary, huge);
+});
+
+test("truncateForLog captures a message count for Responses API bodies too (input[], not messages[])", () => {
+  // Live bug: a large /v1/responses request got summarized with NO count at
+  // all (messages/contents are OpenAI-chat/Gemini-only field names), so the
+  // "Full Conversation" dashboard panel had nothing to base its "N messages
+  // not shown" placeholder on for any Responses-API conversation, even
+  // though the exact same 8KB summarization applies to it.
+  const huge = {
+    model: "gpt-5",
+    stream: true,
+    input: Array.from({ length: 50000 }, () => ({ role: "user", content: "x".repeat(500) })),
+  };
+  const summary = truncateForLog(huge) as Record<string, unknown>;
+  assert.equal(summary._truncated, true);
+  assert.equal(summary.messageCount, 50000);
+});
+
+test("truncateForLog keeps a bounded `tools` field alive when the request is summarized", () => {
+  // A request whose message history alone blows well past the 8KB summary
+  // threshold, but which also carries `tools` — a field that used to be
+  // silently dropped once the payload got summarized.
+  const tools = [
+    {
+      type: "function",
+      function: {
+        name: "get_weather",
+        description: "Get the current weather for a location",
+        parameters: {
+          type: "object",
+          properties: { location: { type: "string" } },
+          required: ["location"],
+        },
+      },
+    },
+    {
+      type: "function",
+      function: {
+        name: "search_web",
+        description: "Search the web for a query",
+        parameters: {
+          type: "object",
+          properties: { query: { type: "string" } },
+          required: ["query"],
+        },
+      },
+    },
+  ];
+  const huge = {
+    model: "gpt-4o",
+    provider: "openai",
+    stream: true,
+    messages: Array.from({ length: 50000 }, () => ({ role: "user", content: "x".repeat(500) })),
+    tools,
+  };
+
+  const summary = truncateForLog(huge) as Record<string, unknown>;
+
+  // it is still truncated/summarized — the fix must not change this
+  assert.equal(summary._truncated, true);
+  assert.equal(summary.messageCount, 50000);
+
+  // ...but `tools` now survives, bounded via cloneBoundedChatLogPayload
+  assert.ok(summary.tools, "expected the summary to retain a `tools` field");
+  const clonedTools = summary.tools as Array<Record<string, unknown>>;
+  assert.equal(clonedTools.length, tools.length);
+  assert.equal((clonedTools[0].function as Record<string, unknown>).name, "get_weather");
+  assert.equal((clonedTools[1].function as Record<string, unknown>).name, "search_web");
+});
+
+test("truncateForLog bounds an oversized `tools` array to the configured tail-item cap", () => {
+  const maxTailItems = getChatLogArrayTailItems();
+  const manyTools = Array.from({ length: maxTailItems + 50 }, (_, i) => ({
+    type: "function",
+    function: { name: `tool_${i}`, description: "d", parameters: {} },
+  }));
+  const huge = {
+    model: "gpt-4o",
+    messages: Array.from({ length: 50000 }, () => ({ role: "user", content: "x".repeat(500) })),
+    tools: manyTools,
+  };
+
+  const summary = truncateForLog(huge) as Record<string, unknown>;
+  assert.equal(summary._truncated, true);
+
+  const clonedTools = summary.tools as unknown[];
+  // marker entry + retained tail items — never the full (unbounded) list
+  assert.equal(clonedTools.length, maxTailItems + 1);
+  const marker = clonedTools[0] as Record<string, unknown>;
+  assert.equal(marker._omniroute_truncated_array, true);
+  assert.equal(marker.originalLength, manyTools.length);
+  assert.equal(marker.retainedTailItems, maxTailItems);
+});
+
+test("truncateForLog leaves small requests with `tools` unchanged (no regression)", () => {
+  const small = {
+    model: "gpt-4o",
+    messages: [{ role: "user", content: "hi" }],
+    tools: [{ type: "function", function: { name: "get_weather", parameters: {} } }],
+  };
+  const result = truncateForLog(small);
+  // untouched — same reference, not a summary or a clone
+  assert.equal(result, small);
+});
+
+/**
+ * Real bug: the 8KB cap on logged request/response bodies was hardcoded,
+ * trivially exceeded by any real multi-turn agentic conversation — the
+ * dashboard's "Full Conversation" panel could only ever show a placeholder
+ * instead of the actual messages for nearly every logged row of any
+ * conversation with real substance. CHAT_LOG_MAX_BODY_KB makes this
+ * configurable; this pins that truncateForLog() actually reads it (not a
+ * baked-in literal) by proving a payload just over the OLD 8KB default
+ * survives untouched under a raised limit, then gets summarized again once
+ * the limit is lowered below it.
+ */
+test("truncateForLog honors a configured CHAT_LOG_MAX_BODY_KB instead of a hardcoded cap", () => {
+  const saved = process.env.CHAT_LOG_MAX_BODY_KB;
+  const payload = {
+    model: "gpt-4o",
+    // ~12KB of content — comfortably over the old hardcoded 8KB cap.
+    messages: [{ role: "user", content: "x".repeat(12 * 1024) }],
+  };
+  try {
+    process.env.CHAT_LOG_MAX_BODY_KB = "1"; // 1KB — payload must be summarized
+    const summarized = truncateForLog(payload) as Record<string, unknown>;
+    assert.equal(summarized._truncated, true, "expected summarization under a 1KB limit");
+
+    process.env.CHAT_LOG_MAX_BODY_KB = "64"; // 64KB — payload must pass through untouched
+    const untouched = truncateForLog(payload);
+    assert.equal(untouched, payload, "expected the payload untouched under a 64KB limit");
+  } finally {
+    if (saved === undefined) delete process.env.CHAT_LOG_MAX_BODY_KB;
+    else process.env.CHAT_LOG_MAX_BODY_KB = saved;
+  }
 });

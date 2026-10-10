@@ -13,14 +13,14 @@ delete process.env.OMNIROUTE_API_KEY;
 
 const core = await import("../../src/lib/db/core.ts");
 const freeProxiesDb = await import("../../src/lib/db/freeProxies.ts");
-const addToPoolRoute = await import(
-  "../../src/app/api/settings/free-proxies/[id]/add-to-pool/route.ts"
-);
+const addToPoolRoute =
+  await import("../../src/app/api/settings/free-proxies/[id]/add-to-pool/route.ts");
+const syncRoute = await import("../../src/app/api/settings/free-proxies/sync/route.ts");
 const rateLimiter = await import("../../src/shared/utils/rateLimiter.ts");
 
 function reset() {
   core.resetDbInstance();
-  fs.rmSync(TEST_DATA_DIR, { recursive: true, force: true });
+  fs.rmSync(TEST_DATA_DIR, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
   fs.mkdirSync(TEST_DATA_DIR, { recursive: true });
 }
 
@@ -35,7 +35,7 @@ test.beforeEach(() => {
 
 test.after(() => {
   core.resetDbInstance();
-  fs.rmSync(TEST_DATA_DIR, { recursive: true, force: true });
+  fs.rmSync(TEST_DATA_DIR, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
   if (ORIGINAL_DATA_DIR === undefined) {
     delete process.env.DATA_DIR;
   } else {
@@ -122,6 +122,46 @@ test("#4878 recordFreeProxySync advances lastSyncAt on a subsequent sync", async
 
   const stats = await freeProxiesDb.getFreeProxyStats();
   assert.equal(stats.lastSyncAt, "2030-06-25T12:00:00.000Z");
+});
+
+// ── #5595: a throwing source must not abort the whole sync ───────────────────
+
+test("#5595 sync route isolates a throwing provider — others still sync, error surfaced", async () => {
+  const makeProvider = (id: string, sync: () => Promise<unknown>) =>
+    ({ id, name: id, isEnabled: () => true, sync, list: async () => [] }) as unknown as Parameters<
+      typeof syncRoute._setProvidersForTests
+    >[0][number];
+
+  const good = makeProvider("1proxy", async () => ({
+    fetched: 3,
+    added: 3,
+    updated: 0,
+    errors: [],
+  }));
+  const bad = makeProvider("proxifly", async () => {
+    throw new Error("TLS handshake failed");
+  });
+
+  syncRoute._setProvidersForTests([bad, good]);
+  try {
+    const res = await syncRoute.POST(
+      new Request("http://localhost/api/settings/free-proxies/sync", { method: "POST" })
+    );
+    // RED before the fix: the throwing provider escaped to the outer catch → 500,
+    // and the working provider never ran.
+    assert.equal(res.status, 200, `expected 200 (partial success), got ${res.status}`);
+    const body = (await res.json()) as { success: boolean; results: Record<string, any> };
+    assert.equal(body.success, true);
+    // Working source still produced its result.
+    assert.deepEqual(body.results["1proxy"], { fetched: 3, added: 3, updated: 0, errors: [] });
+    // Failing source surfaced its error instead of aborting everything.
+    assert.ok(
+      body.results["proxifly"].errors.some((e: string) => e.includes("TLS handshake failed")),
+      `expected the proxifly error surfaced, got: ${JSON.stringify(body.results["proxifly"])}`
+    );
+  } finally {
+    syncRoute._setProvidersForTests(null);
+  }
 });
 
 // ── SUB-FIX 3: Redis error-log throttle is state-change-gated ─────────────────

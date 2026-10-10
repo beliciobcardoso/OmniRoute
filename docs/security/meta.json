@@ -2,14 +2,16 @@
   "title": "Security",
   "pages": [
     "GUARDRAILS",
-    "PUBLIC_CREDS",
     "ERROR_SANITIZATION",
+    "INFERENCE_AUTH_POSTURE",
     "ROUTE_GUARD_TIERS",
-    "STEALTH_GUIDE",
+    "BAN_DETECTION",
+    "AGENTROUTER_WAF",
+    "CORS",
     "EGRESS_POLICY",
+    "SUPPLY_CHAIN",
+    "LTS_SECURITY_BASELINE",
     "COMPLIANCE",
-    "SOCKET_DEV_FINDINGS",
-    "CLI_TOKEN",
-    "CLI_TOKEN_AUTH"
+    "CLI_TOKEN"
   ]
 }

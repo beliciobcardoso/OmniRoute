@@ -15,6 +15,7 @@
  */
 import { withBodyTimeout as defaultWithBodyTimeout } from "../../utils/stream.ts";
 import { synthesizeOpenAiSseFromJson as defaultSynthesize } from "../../utils/jsonToSse.ts";
+import { prependBufferedChunks } from "../../utils/streamReadiness.ts";
 
 type LoggerLike = { debug?: (...args: unknown[]) => void } | null | undefined;
 
@@ -27,6 +28,78 @@ const DEFAULT_DEPS: JsonBodyToSseDeps = {
   withBodyTimeout: defaultWithBodyTimeout,
   synthesizeOpenAiSseFromJson: defaultSynthesize,
 };
+
+function classifyBodyPrefix(text: string): "sse" | "non-sse" | "unknown" {
+  const trimmed = text.replace(/^\uFEFF/, "").trimStart();
+  if (!trimmed) return "unknown";
+  if (trimmed.startsWith(":")) return "sse";
+  if (/^(?:data|event|id|retry)\s*:/i.test(trimmed)) return "sse";
+
+  const lower = trimmed.toLowerCase();
+  for (const field of ["data", "event", "id", "retry"]) {
+    if (field.startsWith(lower)) return "unknown";
+    if (lower.startsWith(field)) {
+      const rest = lower.slice(field.length);
+      if (/^\s*$/.test(rest)) return "unknown";
+      if (/^\s*:/.test(rest)) return "sse";
+    }
+  }
+
+  return "non-sse";
+}
+
+async function sniffJsonBodyForSse(
+  providerResponse: Response,
+  ctx: { log?: LoggerLike; provider: string | null | undefined; model: string | null | undefined },
+  deps: JsonBodyToSseDeps
+): Promise<{ sseResponse?: Response; jsonBody: Response }> {
+  const reader = providerResponse.body!.getReader();
+  const bufferedChunks: Uint8Array[] = [];
+  const decoder = new TextDecoder();
+  let sniffed = "";
+  let sniffedBytes = 0;
+  const maxSniffBytes = 4096;
+  // The two success paths below hand this still-open reader to
+  // prependBufferedChunks(), so the reader must NOT be cancelled on the happy
+  // path. Any other unwind (notably a withBodyTimeout rejection on a stalled
+  // upstream) would otherwise abandon the body with no cancellation, pinning
+  // the connection for the lifetime of the socket.
+  let handedOff = false;
+  try {
+    while (sniffedBytes < maxSniffBytes) {
+      const chunk = await deps.withBodyTimeout<ReadableStreamReadResult<Uint8Array>>(reader.read());
+      if (chunk.done || !chunk.value) break;
+      bufferedChunks.push(chunk.value);
+      sniffedBytes += chunk.value.byteLength;
+      sniffed += decoder.decode(chunk.value, { stream: true });
+
+      if (classifyBodyPrefix(sniffed) === "sse") {
+        const rebuiltHeaders = new Headers(providerResponse.headers);
+        rebuiltHeaders.delete("content-length");
+        rebuiltHeaders.set("content-type", "text/event-stream");
+        ctx.log?.debug?.(
+          "STREAM",
+          `Upstream returned SSE bytes with application/json content-type — preserving streaming body (${ctx.provider}/${ctx.model})`
+        );
+        handedOff = true;
+        return {
+          sseResponse: new Response(prependBufferedChunks(bufferedChunks, reader), {
+            status: providerResponse.status,
+            statusText: providerResponse.statusText,
+            headers: rebuiltHeaders,
+          }),
+          jsonBody: new Response(null),
+        };
+      }
+    }
+
+    handedOff = true;
+    return { jsonBody: new Response(prependBufferedChunks(bufferedChunks, reader)) };
+  } finally {
+    // Cancellation is best-effort: the body may already be errored or closed.
+    if (!handedOff) void reader.cancel().catch(() => {});
+  }
+}
 
 export async function maybeConvertJsonBodyToSse(
   providerResponse: Response,
@@ -42,7 +115,11 @@ export async function maybeConvertJsonBodyToSse(
   if (!isNonSseJsonBody) {
     return providerResponse;
   }
-  const jsonText = await deps.withBodyTimeout<string>(providerResponse.text());
+
+  const { sseResponse, jsonBody } = await sniffJsonBodyForSse(providerResponse, ctx, deps);
+  if (sseResponse) return sseResponse;
+
+  const jsonText = await deps.withBodyTimeout<string>(jsonBody.text());
   const synthesizedSse = deps.synthesizeOpenAiSseFromJson(jsonText);
   const rebuiltHeaders = new Headers(providerResponse.headers);
   rebuiltHeaders.delete("content-length");

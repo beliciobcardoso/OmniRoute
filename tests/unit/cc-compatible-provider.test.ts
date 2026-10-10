@@ -30,10 +30,11 @@ const providerModelsRoute = await import("../../src/app/api/providers/[id]/model
 const originalFetch = globalThis.fetch;
 const originalFlag = process.env.ENABLE_CC_COMPATIBLE_PROVIDER;
 const originalAllowPrivateProviderUrls = process.env.OMNIROUTE_ALLOW_PRIVATE_PROVIDER_URLS;
+const originalAllowLocalProviderUrls = process.env.OMNIROUTE_ALLOW_LOCAL_PROVIDER_URLS;
 
 async function resetStorage() {
   core.resetDbInstance();
-  fs.rmSync(TEST_DATA_DIR, { recursive: true, force: true });
+  fs.rmSync(TEST_DATA_DIR, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
   fs.mkdirSync(TEST_DATA_DIR, { recursive: true });
 }
 
@@ -48,6 +49,11 @@ test.afterEach(async () => {
     delete process.env.OMNIROUTE_ALLOW_PRIVATE_PROVIDER_URLS;
   } else {
     process.env.OMNIROUTE_ALLOW_PRIVATE_PROVIDER_URLS = originalAllowPrivateProviderUrls;
+  }
+  if (originalAllowLocalProviderUrls === undefined) {
+    delete process.env.OMNIROUTE_ALLOW_LOCAL_PROVIDER_URLS;
+  } else {
+    process.env.OMNIROUTE_ALLOW_LOCAL_PROVIDER_URLS = originalAllowLocalProviderUrls;
   }
   await resetStorage();
 });
@@ -64,8 +70,13 @@ test.after(() => {
   } else {
     process.env.OMNIROUTE_ALLOW_PRIVATE_PROVIDER_URLS = originalAllowPrivateProviderUrls;
   }
+  if (originalAllowLocalProviderUrls === undefined) {
+    delete process.env.OMNIROUTE_ALLOW_LOCAL_PROVIDER_URLS;
+  } else {
+    process.env.OMNIROUTE_ALLOW_LOCAL_PROVIDER_URLS = originalAllowLocalProviderUrls;
+  }
   core.resetDbInstance();
-  fs.rmSync(TEST_DATA_DIR, { recursive: true, force: true });
+  fs.rmSync(TEST_DATA_DIR, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
 });
 
 test("buildClaudeCodeCompatibleRequest keeps prior role history while dropping trailing assistant prefill", () => {
@@ -441,7 +452,7 @@ test("DefaultExecutor uses CC-compatible path and headers", () => {
   assert.equal(headers.Authorization, "Bearer sk-test");
   assert.equal(headers["x-api-key"], undefined);
   assert.equal(headers["X-Claude-Code-Session-Id"], "session-3");
-  assert.equal(headers.Accept, "application/json");
+  assert.equal(headers.Accept, "text/event-stream");
 });
 
 test("validateProviderApiKey uses CC skeleton request after /models fallback", async () => {
@@ -482,7 +493,7 @@ test("validateProviderApiKey uses CC skeleton request after /models fallback", a
   assert.equal(calls[1].body.stream, true);
   assert.equal(calls[1].headers.Authorization, "Bearer sk-test");
   assert.equal(calls[1].headers["x-api-key"], undefined);
-  assert.equal(calls[1].headers.Accept, "application/json");
+  assert.equal(calls[1].headers.Accept, "text/event-stream");
 });
 
 test("handleChatCore forces SSE upstream for CC compatible providers while returning JSON to non-stream clients", async () => {
@@ -760,24 +771,32 @@ test("handleChatCore preserves client cache markers for Claude Code requests to 
 
   assert.equal(result.success, true);
   assert.equal(calls.length, 1);
-  assert.match(calls[0].body.system[0].text, /Claude Agent SDK/);
-  assert.equal(calls[0].body.system[0].cache_control, undefined);
-  assert.deepEqual(calls[0].body.system[1].cache_control, {
+  const agentSdkSystemIndex = calls[0].body.system.findIndex((block) =>
+    /Claude Agent SDK/.test(block.text)
+  );
+  assert.notEqual(agentSdkSystemIndex, -1);
+  assert.equal(calls[0].body.system[agentSdkSystemIndex].cache_control, undefined);
+  assert.deepEqual(calls[0].body.system[agentSdkSystemIndex + 1].cache_control, {
     type: "ephemeral",
     ttl: "5m",
   });
+  // The system block above carries an explicit 5m cache_control, which trips the
+  // 5m breakpoint in normalizeCacheControlTtl (#10684: "defaults missing ttl to
+  // 5m after a 5m breakpoint", sections are processed tools -> system ->
+  // messages). So this user message's client marker, sent with no ttl, defaults
+  // to 5m rather than 1h. #10684 updated claude-code-parity.test.ts /
+  // chatcore-translation-paths.test.ts for this but missed this assertion,
+  // leaving it a base-red on release/v3.8.50.
   assert.deepEqual(calls[0].body.messages[0].content[0].cache_control, {
     type: "ephemeral",
+    ttl: "5m",
   });
   assert.deepEqual(calls[0].body.messages[1].content[0].cache_control, {
     type: "ephemeral",
     ttl: "10m",
   });
   assert.equal(calls[0].body.messages[2].content[0].cache_control, undefined);
-  assert.deepEqual(calls[0].body.tools[0].cache_control, {
-    type: "ephemeral",
-    ttl: "30m",
-  });
+  assert.equal(calls[0].body.tools[0].cache_control, undefined);
 });
 
 test("provider-nodes create route rejects CC mode when feature flag is disabled", async () => {
@@ -789,7 +808,7 @@ test("provider-nodes create route rejects CC mode when feature flag is disabled"
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
         name: "Hidden CC",
-        prefix: "cc",
+        prefix: "ccproxy",
         baseUrl: "https://proxy.example.com/v1",
         type: "anthropic-compatible",
         compatMode: "cc",
@@ -809,7 +828,7 @@ test("provider-nodes create route creates CC node with dedicated prefix when ena
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
         name: "Hidden CC",
-        prefix: "cc",
+        prefix: "ccproxy",
         baseUrl: "https://proxy.example.com/v1/messages?beta=true",
         type: "anthropic-compatible",
         compatMode: "cc",
@@ -880,8 +899,9 @@ test("provider-nodes validate route rejects invalid JSON and schema errors", asy
   assert.equal(invalidBodyPayload.error.details.length >= 1, true);
 });
 
-test("provider-nodes validate route blocks private provider hosts before fetch", async () => {
+test("provider-nodes validate route allows local provider hosts by default", async () => {
   delete process.env.OMNIROUTE_ALLOW_PRIVATE_PROVIDER_URLS;
+  delete process.env.OMNIROUTE_ALLOW_LOCAL_PROVIDER_URLS;
 
   let called = false;
   globalThis.fetch = async () => {
@@ -900,9 +920,35 @@ test("provider-nodes validate route blocks private provider hosts before fetch",
     })
   );
 
+  assert.equal(response.status, 200);
+  assert.deepEqual(await response.json(), { valid: true, error: null });
+  assert.equal(called, true);
+});
+
+test("provider-nodes validate route blocks cloud metadata provider hosts before fetch", async () => {
+  delete process.env.OMNIROUTE_ALLOW_PRIVATE_PROVIDER_URLS;
+  delete process.env.OMNIROUTE_ALLOW_LOCAL_PROVIDER_URLS;
+
+  let called = false;
+  globalThis.fetch = async () => {
+    called = true;
+    return Response.json({ data: [] });
+  };
+
+  const response = await providerNodesValidateRoute.POST(
+    new Request("http://localhost/api/provider-nodes/validate", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        baseUrl: "http://169.254.169.254/latest/meta-data",
+        apiKey: "sk-metadata-test",
+      }),
+    })
+  );
+
   assert.equal(response.status, 503);
   assert.deepEqual(await response.json(), {
-    error: "Blocked private or local provider URL",
+    error: "Blocked cloud-metadata endpoint",
   });
   assert.equal(called, false);
   const auditEntries = compliance.getAuditLog({
@@ -914,8 +960,8 @@ test("provider-nodes validate route blocks private provider hosts before fetch",
   assert.equal(auditEntries[0].status, "blocked");
   assert.deepEqual(auditEntries[0].metadata, {
     route: "/api/provider-nodes/validate",
-    reason: "Blocked private or local provider URL",
-    baseUrl: "http://127.0.0.1:11434/v1",
+    reason: "Blocked cloud-metadata endpoint",
+    baseUrl: "http://169.254.169.254/latest/meta-data",
   });
 });
 

@@ -76,8 +76,11 @@ test("responses ws proxy prepares and forwards OpenAI Responses websocket events
             upstreamUrl: "wss://chatgpt.com/backend-api/codex/responses",
             headers: { Authorization: "Bearer upstream-token" },
             connectionId: "conn_1",
+            leaseId: "lease_1",
             provider: "codex",
             account: "codex@example.com",
+            // #5611: prepare resolves the configured proxy and threads it through.
+            proxy: "http://test-proxy:8888",
             model: "gpt-5.5",
             response: {
               ...body.response,
@@ -133,6 +136,11 @@ test("responses ws proxy prepares and forwards OpenAI Responses websocket events
     wsFactory: async (url, options) => {
       assert.equal(url, "wss://chatgpt.com/backend-api/codex/responses");
       assert.equal(options.headers.Authorization, "Bearer upstream-token");
+      // #5591: prepare omits `browser`, so the fallback must be the supported
+      // chrome_142 (not the non-existent chrome_149).
+      assert.equal(options.browser, "chrome_142");
+      // #5611: the configured proxy from prepare must reach the upstream connect.
+      assert.equal(options.proxy, "http://test-proxy:8888");
       return fakeUpstream;
     },
   });
@@ -407,5 +415,174 @@ test("responses ws proxy closes oversized client messages with 1009", async () =
   const event = await closed;
   assert.equal(event.code, 1009);
 
+  await close(server);
+});
+
+test("responses ws proxy releases the prepared per-account lease on session close", async () => {
+  const internalRequests = [];
+
+  const server = http.createServer(async (req, res) => {
+    const url = new URL(req.url || "/", `http://${req.headers.host}`);
+    if (url.pathname === "/api/internal/codex-responses-ws") {
+      const body = JSON.parse((await readRequestBody(req)) || "{}");
+      internalRequests.push(body);
+
+      if (body.action === "authenticate") {
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(JSON.stringify({ ok: true, authenticated: true, authType: "api_key" }));
+        return;
+      }
+
+      if (body.action === "prepare") {
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(
+          JSON.stringify({
+            ok: true,
+            upstreamUrl: "wss://chatgpt.com/backend-api/codex/responses",
+            headers: { Authorization: "Bearer upstream-token" },
+            connectionId: "conn_lease",
+            leaseId: "lease_1",
+            response: { ...body.response, model: "gpt-5.5", stream: undefined },
+          })
+        );
+        return;
+      }
+
+      if (body.action === "release") {
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(JSON.stringify({ ok: true, released: true }));
+        return;
+      }
+    }
+
+    res.writeHead(404, { "content-type": "application/json" });
+    res.end(JSON.stringify({ error: "not_found" }));
+  });
+
+  const fakeUpstream = {
+    send() {},
+    close() {},
+    onmessage: null,
+    onerror: null,
+    onclose: null,
+  };
+
+  const port = await listen(server);
+  const proxy = createResponsesWsProxy({
+    baseUrl: `http://127.0.0.1:${port}`,
+    bridgeSecret: "bridge-secret",
+    pingIntervalMs: 1000,
+    idleTimeoutMs: 10000,
+    wsFactory: async () => fakeUpstream,
+  });
+
+  server.on("upgrade", async (req, socket, head) => {
+    const handled = await proxy.handleUpgrade(req, socket, head);
+    if (!handled && !socket.destroyed) {
+      socket.destroy();
+    }
+  });
+
+  const ws = new WebSocket(`ws://127.0.0.1:${port}/api/v1/responses?api_key=local-token`);
+  await new Promise((resolve) => ws.addEventListener("open", resolve, { once: true }));
+
+  ws.send(
+    JSON.stringify({
+      type: "response.create",
+      model: "gpt-5.5",
+      input: [{ role: "user", content: "hello" }],
+    })
+  );
+
+  await waitFor(() => internalRequests.find((entry) => entry.action === "prepare"));
+  ws.close();
+
+  const releaseRequest = await waitFor(() =>
+    internalRequests.find((entry) => entry.action === "release")
+  );
+  assert.equal(releaseRequest.leaseId, "lease_1");
+
+  await close(server);
+});
+
+test("responses ws proxy releases a replaced lease before adopting a reused-turn lease", async () => {
+  const internalRequests = [];
+  let prepareCount = 0;
+
+  const server = http.createServer(async (req, res) => {
+    const url = new URL(req.url || "/", `http://${req.headers.host}`);
+    if (url.pathname === "/api/internal/codex-responses-ws") {
+      const body = JSON.parse((await readRequestBody(req)) || "{}");
+      internalRequests.push(body);
+      if (body.action === "authenticate") {
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(JSON.stringify({ ok: true, authenticated: true, authType: "api_key" }));
+        return;
+      }
+      if (body.action === "prepare") {
+        prepareCount += 1;
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(
+          JSON.stringify({
+            ok: true,
+            upstreamUrl: "wss://chatgpt.com/backend-api/codex/responses",
+            headers: { Authorization: "Bearer upstream-token" },
+            connectionId: "conn_lease",
+            leaseId: `lease_${prepareCount}`,
+            response: { ...body.response, model: "gpt-5.5", stream: undefined },
+          })
+        );
+        return;
+      }
+      if (body.action === "release") {
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(JSON.stringify({ ok: true, released: true }));
+        return;
+      }
+    }
+    res.writeHead(404, { "content-type": "application/json" });
+    res.end(JSON.stringify({ error: "not_found" }));
+  });
+
+  const fakeUpstream = { send() {}, close() {}, onmessage: null, onerror: null, onclose: null };
+  const port = await listen(server);
+  const proxy = createResponsesWsProxy({
+    baseUrl: `http://127.0.0.1:${port}`,
+    bridgeSecret: "bridge-secret",
+    pingIntervalMs: 1000,
+    idleTimeoutMs: 10000,
+    wsFactory: async () => fakeUpstream,
+  });
+  server.on("upgrade", async (req, socket, head) => {
+    const handled = await proxy.handleUpgrade(req, socket, head);
+    if (!handled && !socket.destroyed) socket.destroy();
+  });
+
+  const ws = new WebSocket(`ws://127.0.0.1:${port}/api/v1/responses?api_key=local-token`);
+  await new Promise((resolve) => ws.addEventListener("open", resolve, { once: true }));
+  ws.send(
+    JSON.stringify({
+      type: "response.create",
+      model: "gpt-5.5",
+      input: [{ role: "user", content: "first" }],
+    })
+  );
+  await waitFor(() => internalRequests.filter((entry) => entry.action === "prepare").length === 1);
+  ws.send(
+    JSON.stringify({
+      type: "response.create",
+      model: "gpt-5.5",
+      input: [{ role: "user", content: "second" }],
+    })
+  );
+  await waitFor(() => internalRequests.filter((entry) => entry.action === "prepare").length === 2);
+  await waitFor(() =>
+    internalRequests.some((entry) => entry.action === "release" && entry.leaseId === "lease_1")
+  );
+
+  ws.close();
+  await waitFor(() =>
+    internalRequests.some((entry) => entry.action === "release" && entry.leaseId === "lease_2")
+  );
   await close(server);
 });

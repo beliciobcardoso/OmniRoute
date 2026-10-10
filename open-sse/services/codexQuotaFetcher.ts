@@ -24,6 +24,9 @@ import {
 } from "../config/codexQuotaScopes.ts";
 import { registerQuotaFetcher, registerQuotaWindows, type QuotaInfo } from "./quotaPreflight.ts";
 import { registerMonitorFetcher } from "./quotaMonitor.ts";
+import { throttleQuotaFetch } from "./quotaFetchThrottle.ts";
+import { getCodexBackendIdentityHeaders } from "../config/codexClient.ts";
+import { parseCodexPaidCredits } from "@/lib/providers/codexPaidCredits";
 
 /**
  * Stable identifiers for Codex's quota windows. These match the quota keys
@@ -49,6 +52,13 @@ export interface CodexDualWindowQuota extends QuotaInfo {
   limitReached: boolean;
   /** All known Codex quota windows, including Spark when the upstream exposes it. */
   allWindows?: Record<string, { percentUsed: number; resetAt: string | null }>;
+  /**
+   * Banked reset credits available on the account (display-only, issue #5199).
+   * Eligibility-gated: absent for most accounts. Never throws when missing.
+   */
+  bankedResetCredits?: number;
+  /** Which window is currently reported as blocking, when the upstream exposes it. */
+  rateLimitReachedType?: string;
 }
 
 interface CacheEntry {
@@ -214,11 +224,21 @@ export async function fetchCodexQuota(
       Authorization: `Bearer ${meta.accessToken}`,
       "Content-Type": "application/json",
       Accept: "application/json",
+      // Canonical Codex backend identity (UA + originator + version), same
+      // chain as inference — see getCodexUsage.
+      ...getCodexBackendIdentityHeaders(),
     };
 
     if (meta.workspaceId) {
       headers["chatgpt-account-id"] = meta.workspaceId;
     }
+
+    // #6009: space concurrent upstream quota fetches so N accounts on one IP do
+    // not all hit the provider in the same second (anti-fingerprint / avoids the
+    // Codex OAuth revocation reported in router-for-me/CLIProxyAPI#2385). Cache
+    // hits above never reach here; this only paces genuine network calls and is
+    // configurable (OMNIROUTE_QUOTA_FETCH_MIN_INTERVAL_MS, 0 = disabled).
+    await throttleQuotaFetch();
 
     const response = await fetch(CODEX_USAGE_URL, {
       method: "GET",
@@ -293,6 +313,26 @@ function parseCodexWindow(
   if (!window || Object.keys(window).length === 0) return null;
   const percentUsed = toNumber(window["used_percent"] ?? window["usedPercent"], 0) / 100;
   return { percentUsed, resetAt: parseWindowReset(window) };
+}
+
+/**
+ * Codex "banked reset credits" — same eligibility-gated field parsed in
+ * codexUsageQuotas.ts (kept in sync manually; the two parsers read the same
+ * /wham/usage payload independently). DISPLAY ONLY, never throws.
+ */
+function parseBankedResetCredits(data: Record<string, unknown>): number | undefined {
+  const resetCredits = toRecord(data["rate_limit_reset_credits"] ?? data["rateLimitResetCredits"]);
+  const availableCount = resetCredits["available_count"] ?? resetCredits["availableCount"];
+  const count = toNumber(availableCount, NaN);
+  return Number.isFinite(count) ? count : undefined;
+}
+
+function parseRateLimitReachedType(data: Record<string, unknown>): string | undefined {
+  const reachedType = data["rate_limit_reached_type"] ?? data["rateLimitReachedType"];
+  if (typeof reachedType === "string" && reachedType.trim().length > 0) return reachedType.trim();
+  const reachedTypeObj = toRecord(reachedType);
+  const type = reachedTypeObj["type"];
+  return typeof type === "string" && type.trim().length > 0 ? type.trim() : undefined;
 }
 
 function findSparkRateLimit(data: Record<string, unknown>): Record<string, unknown> | null {
@@ -403,6 +443,10 @@ function parseCodexUsageResponse(
     secondary: CODEX_WINDOW_WEEKLY,
   });
 
+  const bankedResetCredits = parseBankedResetCredits(obj);
+  const paidCredits = parseCodexPaidCredits(obj.credits);
+  const rateLimitReachedType = parseRateLimitReachedType(obj);
+
   return {
     used: Math.round(worstPercentUsed * 100),
     total: 100,
@@ -419,6 +463,10 @@ function parseCodexUsageResponse(
     window5h,
     window7d,
     limitReached,
+    // Banked reset credits (display-only, eligibility-gated — issue #5199).
+    ...(bankedResetCredits !== undefined ? { bankedResetCredits } : {}),
+    ...(paidCredits ? { paidCredits } : {}),
+    ...(rateLimitReachedType !== undefined ? { rateLimitReachedType } : {}),
   };
 }
 

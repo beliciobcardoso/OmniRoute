@@ -25,7 +25,7 @@
 
 import fs from "node:fs";
 import path from "node:path";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { execSync } from "node:child_process";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -51,13 +51,31 @@ const IGNORE_FROM_CODE = new Set([
   "CI",
   "GITHUB_ACTIONS",
   "RUNNER_OS",
+  // Quality-gate harness knobs (optional cache/report paths for CI scripts — not product config).
+  "ESLINT_RESULTS_JSON",
+  "COMPLEXITY_ESLINT_REPORT",
   // Agent environment / system execution paths.
   "PROJECT_ROOT",
   "ARTIFACTS_DIR",
   // OS / Node internals frequently surfaced by indirect dependencies.
   "APPDATA",
   "LOCALAPPDATA",
+  "PROGRAMFILES",
   "XDG_CONFIG_HOME",
+  // Codex-owned task/runtime locations and child-process markers. OmniRoute reads
+  // them as external execution context, not as product configuration.
+  "CODEX_HOME",
+  "CODEX_CHATGPT_WEB_BROWSER_HELPER_PROCESS",
+  // Claude Code's own config-root variable: the CLI only SETS it for the child `claude`
+  // process (bin/cli/commands/launch.mjs, setup-claude hint, #12161) — never product config.
+  "CLAUDE_CONFIG_DIR",
+  // systemd-injected notify socket path (sd_notify protocol, see
+  // scripts/dev/systemd-notify.mjs) — set by systemd only when running under
+  // a unit, never user config.
+  "NOTIFY_SOCKET",
+  // XDG Base Directory cache root — read (never defined by OmniRoute) so the
+  // Android/Termux serve path can honor an operator-set cache location (#8519).
+  "XDG_CACHE_HOME",
   "USERPROFILE",
   "PREFIX",
   // X11 display server — set by the OS/session manager, not OmniRoute config.
@@ -85,14 +103,65 @@ const IGNORE_FROM_CODE = new Set([
   // CI providers (set by the runner).
   "GITHUB_BASE_REF",
   "GITHUB_BASE_SHA",
+  // Actions-owned output file used by scripts/ci/release-green-result.mjs.
+  // A runner protocol path, not user-configurable OmniRoute environment.
+  "GITHUB_OUTPUT",
+  // check-ai-attribution.mjs reads the PR of the Actions event payload when run without args (#14436)
+  "GITHUB_EVENT_PATH",
+  // Actions-owned output file used by scripts/ci/release-green-result.mjs.
+  // A runner protocol path, not user-configurable OmniRoute environment.
+  "GITHUB_OUTPUT",
+  // Runner-owned identity/event context and same-run job results consumed by
+  // scripts/quality/admission-verdict.mjs; never application .env settings.
+  "GITHUB_EVENT_NAME",
+  "GITHUB_RUN_ATTEMPT",
+  "GITHUB_RUN_ID",
+  "GITHUB_SHA",
+  "NEEDS_JSON",
+  // Set by the Actions runner; the ts7 ratchet appends its job summary there
+  // (scripts/check/check-ts7-diagnostics-ratchet.mjs) — never OmniRoute runtime config (#9985).
+  "GITHUB_STEP_SUMMARY",
+  // Same class as BASE_REF: CI passes the PR base ref to the ts7 diagnostics ratchet
+  // (scripts/check/check-ts7-diagnostics-ratchet.mjs) — a check signal, not runtime config (#9985).
+  "TS7_BASE_REF",
   // CI passes BASE_REF=${{ github.base_ref }} to the OpenAPI breaking-change gate
   // (scripts/check/check-openapi-breaking.mjs) — a build/check signal, not OmniRoute runtime config.
   "BASE_REF",
+  // Same class as BASE_REF above: the `changes` job passes these four to the
+  // self-targeting-PR guard (scripts/check/check-pr-self-target.mjs) so it can compare a PR's
+  // head against its base. CI-only signals from github.head_ref / github.base_ref /
+  // pull_request.{head,base}.sha — never OmniRoute runtime config, and meaningless in a .env.
+  "HEAD_REF",
+  "HEAD_SHA",
+  "BASE_SHA",
+  // Escape hatch for the test-masking gate's release-scale skip
+  // (scripts/check/check-test-masking.mjs): above ~300 changed test files the per-file diff
+  // subchecks are skipped, and this raises that cap for anyone who wants the full pass anyway.
+  // A gate tuning knob, not application configuration.
+  "TEST_MASKING_MAX_CHANGED_TESTS",
   // PR body injected by GitHub Actions into the pr-evidence gate (github.event.pull_request.body);
   // a CI-only signal, never an OmniRoute runtime config (Phase 7.10).
   "PR_BODY",
   // CLI machine-id token opt-out (server-side flag; not user-configurable via .env).
   "OMNIROUTE_DISABLE_CLI_TOKEN",
+  // Gated combo live-smoke harness (scripts/test/_vpsClient.mjs) — override the VPS HTTP
+  // smoke target host/key. Test/CI-only signals with safe defaults
+  // ("http://192.168.0.15:20128" / null), never OmniRoute runtime config (#5151).
+  "COMBO_LIVE_BASE_URL",
+  "COMBO_LIVE_API_KEY",
+  // Ad-hoc mesh/coverage scripts under scripts/ad-hoc/*.mjs (mesh-send, mesh-run,
+  // verify-coverage). Operator-supplied script secrets, not OmniRoute runtime config.
+  "BOT_TOKEN",
+  "BOT_URL",
+  // Homologation E2E suite (npm run homolog) vars — configured via the dedicated
+  // .env.homolog file (template: .env.homolog.example), never in the runtime .env.
+  // Test/ops-only signals against the homologation VPS, same class as COMBO_LIVE_*.
+  // See docs/ops/HOMOLOGATION.md.
+  "HOMOLOG_BASE_URL",
+  "HOMOLOG_ADMIN_PASSWORD",
+  "HOMOLOG_API_KEY",
+  "HOMOLOG_CRITICAL_PROVIDERS",
+  "HOMOLOG_EXPECT_VERSION",
   // update-notifier opt-out for the CLI binary.
   "OMNIROUTE_NO_UPDATE_NOTIFIER",
   // Headless CLI execution flag for Electron.
@@ -110,8 +179,11 @@ const IGNORE_FROM_CODE = new Set([
   // X11/Wayland display server vars used by tray heuristic (isTraySupported).
   "DISPLAY",
   "WAYLAND_DISPLAY",
-  // Build-time override for OpenAPI spec path used by generate-api-commands.mjs.
+  // Build-time overrides for generate-api-commands.mjs (spec input / commands output dir).
+  // OPENAPI_OUT_DIR exists so tests/unit/cli-api-generator-ref-params.test.ts can regenerate
+  // into a scratch dir instead of the real bin/cli/api-commands/ tree.
   "OPENAPI_SPEC",
+  "OPENAPI_OUT_DIR",
   // Aliases for documented vars handled via fallback ordering.
   "API_KEY",
   "APP_URL",
@@ -124,6 +196,12 @@ const IGNORE_FROM_CODE = new Set([
   "QA_LOCALES",
   "QA_REPORT_SUFFIX",
   "QA_ROUTES",
+  // Post-publish verifier (scripts/release/verify-published.mjs): env passed INTO the
+  // clean Docker container script (Hard Rule #13 env-option pattern) — release tooling
+  // internals, never OmniRoute runtime config.
+  "VERIFY_DEADLINE_S",
+  "VERIFY_PORT",
+  "VERIFY_VERSION",
   // Doctor diagnostic flags (no runtime behavior yet — placeholders).
   "OMNIROUTE_DOCTOR_HOST",
   "OMNIROUTE_DOCTOR_LIVENESS_URL",
@@ -140,6 +218,13 @@ const IGNORE_FROM_CODE = new Set([
   // write-build-sha.mjs to stamp dist/BUILD_SHA — injected by the build, never
   // configured by users in .env.
   "OMNIROUTE_BUILD_SHA",
+  // Listener-owned self-fetch transport signal. The HTTP/HTTPS launchers set
+  // this before application imports; it is not user-configurable product env.
+  "OMNIROUTE_INTERNAL_SCHEME",
+  // Runner-owned bind-host signal. scripts/dev/run-next.mjs publishes the
+  // interface it actually binds so the in-process startup guard can name it
+  // (#13695); operators configure HOST / HOSTNAME, never this.
+  "OMNIROUTE_BOUND_HOST",
   // Source typo / placeholder.
   "OMNIROUT",
   // Static config alias path (the canonical var is OMNIROUTE_PAYLOAD_RULES_PATH).
@@ -150,12 +235,32 @@ const IGNORE_FROM_CODE = new Set([
   // NVIDIA diagnostic/test helpers used only by ad-hoc scripts.
   "NVIDIA_BASE_URL",
   "NVIDIA_MODEL",
+  // Live smoke check for the claude-mem memory backend (scripts/ad-hoc/claude-mem-live-check.ts,
+  // #15425) — port of the operator's local claude-mem worker. The backend itself is configured
+  // through settings.backendConfigs["claude-mem"].port, never this env var.
+  "CLAUDE_MEM_PORT",
+  // Lemonade embedding-provider integration test (tests/integration/semantic-cache-lemonade.test.ts)
+  // — points the gated live test at an operator's local Lemonade server; the test skips itself
+  // when the endpoint is unreachable, never OmniRoute runtime config.
+  "LEMONADE_URL",
+  "LEMONADE_KEY",
+  "LEMONADE_MODEL",
+  // Discord integration ad-hoc script (scripts/ad-hoc/mesh-send.mjs) —
+  // operator-supplied bot credentials, not user-facing OmniRoute config.
+  "BOT_TOKEN",
+  "BOT_URL",
   // XDG standard data directory — set by OS/desktop session, not OmniRoute config.
   // Read by setup-open-code.mjs to locate platform-specific OpenCode data dir.
   "XDG_DATA_HOME",
   // Test-only override: points setup-open-code.mjs at a fixture plugin dir without
   // requiring the real bundled plugin to be built.
   "OMNIROUTE_OPENCODE_PLUGIN_DIR",
+  // Test-only escape hatch: makes getMachineIdRaw() skip the macOS ioreg strategy so
+  // machineId tests reach the fallback strategies on darwin (#13539). Not user config.
+  "DISABLE_IOREG_STRATEGY",
+  // Next.js-internal switch, not OmniRoute config: scripts/dev/standalone-server-ws.mjs sets it
+  // so Next skips its own SIGINT/SIGTERM handlers and the wrapper owns shutdown.
+  "NEXT_MANUAL_SIG_HANDLE",
 ]);
 
 // Vars documented in ENVIRONMENT.md but intentionally absent from .env.example.
@@ -202,6 +307,10 @@ const DOC_ONLY_ALLOWLIST = new Set([
   // SQL keyword mentioned in the new VACUUM scheduler docs (#4437).
   // The check's regex picks up the bare word in description text.
   "VACUUM",
+  // Source-code constant (open-sse/services/combo/comboPredicates.ts:35 —
+  // `export const COMBO_LOOP_SAFETY_TIMEOUT_MS = 10 * 60 * 1000`), cited in the
+  // comboTimeoutMs narrative added by #13857. Not operator-configurable.
+  "COMBO_LOOP_SAFETY_TIMEOUT_MS",
 ]);
 
 // Vars present in .env.example but intentionally absent from ENVIRONMENT.md.
@@ -216,6 +325,9 @@ const ENV_ONLY_ALLOWLIST = new Set([
   "PII_WINDOW_SIZE",
   "TRAE_STREAM_TIMEOUT_MS",
   "TRAE_TOKEN",
+  // #12190: Trae host/Origin override. ENVIRONMENT.md documents no Trae variable at
+  // all; this joins its two siblings above under the same .env.example-only tier.
+  "TRAE_WEB_ORIGIN",
 ]);
 
 // ─── Parsing helpers ───────────────────────────────────────────────────────
@@ -367,6 +479,24 @@ function main() {
   process.exit(1);
 }
 
-if (import.meta.url === `file://${process.argv[1]}`) {
+/**
+ * True when this module was launched directly as the Node entry point.
+ *
+ * `process.argv[1]` is an absolute filesystem path while `import.meta.url` is a
+ * file URL, so the two only match when encoded through `pathToFileURL`. A raw
+ * `file://${argv[1]}` comparison silently never matches when the checkout path
+ * contains characters the URL form percent-encodes (e.g. a space), which made
+ * the CLI exit 0 without running anything.
+ */
+export function isMainEntry(argv1, moduleUrl) {
+  if (!argv1) return false;
+  try {
+    return pathToFileURL(argv1).href === moduleUrl;
+  } catch {
+    return false;
+  }
+}
+
+if (isMainEntry(process.argv[1], import.meta.url)) {
   main();
 }

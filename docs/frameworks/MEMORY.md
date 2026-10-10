@@ -1,13 +1,13 @@
 ---
 title: "Memory System"
-version: 3.8.31
-lastUpdated: 2026-06-20
+version: 3.8.40
+lastUpdated: 2026-06-28
 ---
 
 # Memory System
 
 > **Source of truth:** `src/lib/memory/` and `src/app/api/memory/`
-> **Last updated:** 2026-06-20 — v3.8.31 (off-by-default + int8 quantization catch-up)
+> **Last updated:** 2026-06-28 — v3.8.40 (off-by-default + int8 quantization catch-up)
 
 OmniRoute provides persistent conversational memory keyed by API key (and
 optionally session id). Memories are extracted automatically from LLM responses
@@ -59,8 +59,11 @@ infrastructure and settings. Three tiers exist, applied in priority order:
 ```
   ┌─────────────────────────────────────────────────────────────┐
   │  TIER 0 — Keyword (FTS5)                                     │
-  │  Always available. SQLite FTS5 full-text search over         │
-  │  content + key. Used when strategy = "exact" or as fallback. │
+  │  Probe-driven availability: FTS5 when the SQLite build       │
+  │  supports it (better-sqlite3 / node:sqlite / bun:sqlite);    │
+  │  unavailable on FTS5-less builds (e.g. sql.js/WASM —         │
+  │  "no such module: fts5"). Used when strategy = "exact" or    │
+  │  as fallback; engine-status keyword reflects the probe.      │
   └──────────────────────────────────┬──────────────────────────┘
                                      │ strategy = semantic|hybrid?
                                      ▼
@@ -83,6 +86,7 @@ infrastructure and settings. Three tiers exist, applied in priority order:
 ```
 
 Degradation is automatic and transparent:
+
 - If sqlite-vec fails to load, tier 1 is unavailable → falls back to tier 0.
 - If embedding source returns an error, tier 1 falls back to tier 0.
 - If Qdrant is unhealthy, tier 2 falls back to tier 1 (or tier 0 if tier 1
@@ -93,14 +97,15 @@ Degradation is automatic and transparent:
 The embedding layer (`src/lib/memory/embedding/`) resolves which source to use
 based on `MemorySettingsExtended.embeddingSource`:
 
-| Source         | Description                                                                     | Key required | Cold start |
-| -------------- | ------------------------------------------------------------------------------- | ------------ | ---------- |
-| `remote`       | Uses a configured provider's embedding API (OpenAI, Cohere, etc.)               | Yes          | None       |
-| `static`       | Local lookup-table embedding via `potion-base-8M` (WordPiece + mean pooling)    | No           | ~200ms     |
-| `transformers` | Local ONNX inference via `@huggingface/transformers` v4, `all-MiniLM-L6-v2`     | No           | ~3s + ~400MB RAM |
-| `auto`         | Runtime resolution: remote (if key exists) → static → transformers → null       | Depends      | Depends    |
+| Source         | Description                                                                  | Key required | Cold start       |
+| -------------- | ---------------------------------------------------------------------------- | ------------ | ---------------- |
+| `remote`       | Uses a configured provider's embedding API (OpenAI, Cohere, etc.)            | Yes          | None             |
+| `static`       | Local lookup-table embedding via `potion-base-8M` (WordPiece + mean pooling) | No           | ~200ms           |
+| `transformers` | Local ONNX inference via `@huggingface/transformers` v4, `all-MiniLM-L6-v2`  | No           | ~3s + ~400MB RAM |
+| `auto`         | Runtime resolution: remote (if key exists) → static → transformers → null    | Depends      | Depends          |
 
 **Resolution order for `auto`:**
+
 1. Find first provider in `listEmbeddingProviders()` with `hasKey === true` → `remote`.
 2. If `settings.staticEnabled === true` → `static`.
 3. If `settings.transformersEnabled === true` → `transformers`.
@@ -123,6 +128,7 @@ RRF(d) = Σ  1 / (k + rank_i(d))      where k = 60 (configurable via MEMORY_RRF_
 ```
 
 Concretely:
+
 1. Run FTS5 search → ranked list `R_fts` (position 1..N).
 2. Run KNN vector search → ranked list `R_vec` (position 1..M).
 3. For each unique `memoryId`:  
@@ -149,7 +155,8 @@ amortizes the backfill cost across real requests without blocking startup.
 `limit` pending entries per request. Progress can be polled via
 `GET /api/memory/engine-status` (`vectorStore.needsReindex`).
 
-The `memory_vec_meta` table (migration `073_memory_vec.sql`) stores:
+The `memory_vec_meta` table (migration `083_memory_vec.sql`) stores:
+
 - `active_dim` — current vector dimension (null = not yet calibrated).
 - `embedding_signature` — `${source}:${model}:${dim}` used to detect changes.
 - `last_reset_at` — timestamp of last full reset.
@@ -157,20 +164,32 @@ The `memory_vec_meta` table (migration `073_memory_vec.sql`) stores:
 
 ## Settings extension
 
-Seven new fields were added to `MemorySettingsExtended` (plan 21, D9) in
+Nine embedding and vector fields are available in `MemorySettingsExtended` in
 `src/shared/schemas/memory.ts`, persisted via `src/lib/db/settings.ts`:
 
-| Field                  | Type                                          | Default      | Description                                   |
-| ---------------------- | --------------------------------------------- | ------------ | --------------------------------------------- |
-| `embeddingSource`      | `"remote" \| "static" \| "transformers" \| "auto"` | `"auto"` | Which embedding source to use              |
-| `embeddingProviderModel` | `string \| null`                            | `null`       | Provider/model in `provider/model` format     |
-| `transformersEnabled`  | `boolean`                                     | `false`      | Opt-in for Transformers.js (MiniLM, ~400MB)   |
-| `staticEnabled`        | `boolean`                                     | `false`      | Opt-in for static potion-base-8M local model  |
-| `rerankEnabled`        | `boolean`                                     | `false`      | Enable reranking step (adds +200-500ms/req)   |
-| `rerankProviderModel`  | `string \| null`                              | `null`       | Rerank provider/model in `provider/model` format |
-| `vectorStore`          | `"sqlite-vec" \| "qdrant" \| "auto"`          | `"auto"`     | Which vector backend to use                   |
+| Field                    | Type                                               | Default  | Description                                      |
+| ------------------------ | -------------------------------------------------- | -------- | ------------------------------------------------ |
+| `embeddingSource`        | `"remote" \| "static" \| "transformers" \| "auto"` | `"auto"` | Which embedding source to use                    |
+| `embeddingProviderModel` | `string \| null`                                   | `null`   | Provider/model in `provider/model` format        |
+| `customBaseUrl`          | `string \| null`                                   | `null`   | Memory-only OpenAI-compatible endpoint base URL  |
+| `customModelId`          | `string \| null`                                   | `null`   | Model ID sent to the custom endpoint             |
+| `transformersEnabled`    | `boolean`                                          | `false`  | Opt-in for Transformers.js (MiniLM, ~400MB)      |
+| `staticEnabled`          | `boolean`                                          | `false`  | Opt-in for static potion-base-8M local model     |
+| `rerankEnabled`          | `boolean`                                          | `false`  | Enable reranking step (adds +200-500ms/req)      |
+| `rerankProviderModel`    | `string \| null`                                   | `null`   | Rerank provider/model in `provider/model` format |
+
+`rerankProviderModel` is resolved by `POST /v1/rerank` (called over loopback), so it accepts anything that route accepts: a curated cloud rerank model (`cohere/rerank-v3.5`, `jina-ai/jina-reranker-v3.5`, …) or an OpenAI-compatible provider node as `<node-prefix>/<model>` (e.g. `skilled-mini/bge-reranker-v2-m3` for a TEI/Infinity box). Loopback nodes, and hostnames listed in `OMNIROUTE_LOCAL_PROVIDER_NODE_HOSTS` (e.g. a Docker/Compose service name), are always eligible; a node on another host (LAN, Tailscale) additionally requires the `RERANK_REMOTE_PROVIDER_NODES` feature flag and must pass the provider outbound URL policy — see [Feature Flags](../reference/FEATURE_FLAGS.md). The dashboard selector lists curated providers plus local nodes; any valid `provider/model` string can be set directly via `PUT /api/settings/memory`.
+| `vectorStore` | `"sqlite-vec" \| "qdrant" \| "auto"` | `"auto"` | Which vector backend to use |
 
 These are exposed via `GET /PUT /api/settings/memory` (schema `MemorySettingsExtendedSchema`).
+
+For the `remote` source, Memory also accepts the optional `customBaseUrl` and
+`customModelId` settings. Together they select an OpenAI-compatible `/embeddings`
+endpoint and model without changing the global embedding registry. The endpoint is
+normalized before use and checked by the provider outbound URL policy: HTTP(S) is
+required, embedded credentials and query strings are rejected, and cloud-metadata
+addresses remain blocked. Empty values preserve the selected registry provider. Errors
+returned to the dashboard are sanitized and endpoint credentials are never logged.
 
 > **TODO (D20):** Scope `global` (sharing memories across all API keys) is not
 > implemented in this release. It requires schema changes and a global retrieval
@@ -219,7 +238,13 @@ chronological order if the FTS table is missing or the FTS query throws.
 ### Optional: Qdrant (vector store tier 2)
 
 `src/lib/memory/qdrant.ts` implements an optional Qdrant integration as tier 2
-vector store. Enabled via `qdrantEnabled` in settings / toggle in Engine tab.
+vector store. Retrieval only routes to Qdrant when the engine selector
+`memoryVectorStore === "qdrant"` — the default `"auto"` (and `"sqlite-vec"`)
+**never** select Qdrant. The Engine-tab toggle sets **both** `qdrantEnabled` and
+`memoryVectorStore` together: enabling makes Qdrant the primary store, disabling
+resets to `"auto"` (#5597 — before that fix, enabling was inert because nothing
+wrote the engine selector). If Qdrant is unreachable or returns nothing, retrieval
+falls back to sqlite-vec → FTS5.
 
 - `upsertSemanticMemoryPoint()` — embed `key + content` with the configured
   embedding model, ensure the collection exists (creates cosine-distance
@@ -239,13 +264,33 @@ The settings UI exposes Qdrant config, health check, semantic search test,
 and cleanup in the **Engine tab** of `/dashboard/memory`. The corresponding
 routes under `src/app/api/settings/qdrant/` are all wired as of v3.8.6:
 
-| Route | Method | Description |
-| ----- | ------ | ----------- |
-| `/api/settings/qdrant` | `GET` / `PUT` | Read / update Qdrant settings |
-| `/api/settings/qdrant/health` | `GET` | Liveness probe + latency |
-| `/api/settings/qdrant/search` | `POST` | Semantic search test |
-| `/api/settings/qdrant/cleanup` | `POST` | Remove expired / old points |
-| `/api/settings/qdrant/embedding-models` | `GET` | List available embedding models |
+| Route                                   | Method        | Description                     |
+| --------------------------------------- | ------------- | ------------------------------- |
+| `/api/settings/qdrant`                  | `GET` / `PUT` | Read / update Qdrant settings   |
+| `/api/settings/qdrant/health`           | `GET`         | Liveness probe + latency        |
+| `/api/settings/qdrant/search`           | `POST`        | Semantic search test            |
+| `/api/settings/qdrant/cleanup`          | `POST`        | Remove expired / old points     |
+| `/api/settings/qdrant/embedding-models` | `GET`         | List available embedding models |
+
+**Behavior notes (what to expect):**
+
+- **Engine selection** — enabling Qdrant in the Engine tab makes it the primary
+  store (sets `memoryVectorStore="qdrant"`); disabling resets to `"auto"` (#5597).
+- **No back-fill** — only memories created/updated **after** Qdrant is enabled are
+  written to it (fire-and-forget dual-write). Pre-existing SQLite memories are **not**
+  migrated; "Reindex Now" rebuilds the sqlite-vec index only, not Qdrant.
+- **Vector dimension is auto-detected** from the actual embedding on first use — there
+  is no dimension field to fill in. Changing the embedding model after a collection
+  exists is **not** auto-handled: the existing collection is left untouched, dimension-
+  mismatched writes/searches fail and fall back to sqlite-vec. Recreate the collection
+  (new name, or delete it in Qdrant) to switch embedders.
+- **Distance metric** — always **Cosine** (hardcoded on collection creation; not
+  configurable).
+- **Auth** — API key only (sent as the `api-key` header; optional for unauthenticated
+  local Docker). JWT/RBAC are not used.
+- **Config fields** — the UI exposes `host`, `port`, `collection`, `embeddingModel`,
+  `apiKey`. `vectorSize` / `hnswEfConstruct` are env/DB only and `vectorSize` is not
+  used for collection creation (dimension comes from the embedding).
 
 ### Vector quantization (int8 — opt-in, both backends)
 
@@ -254,10 +299,10 @@ footprint of stored vectors (~4× smaller than Float32) at a small recall cost.
 Default is **off** on both — vectors stay full-precision unless explicitly
 enabled.
 
-| Backend      | Setting                          | Type                          | Default  | Where read                                          |
-| ------------ | -------------------------------- | ----------------------------- | -------- | --------------------------------------------------- |
-| Qdrant       | `qdrantQuantization` (DB key)    | `"none" \| "int8" \| "binary"` | `"none"` | `src/lib/memory/qdrant.ts::normalizeQdrantConfig()` |
-| sqlite-vec   | `MEMORY_VEC_QUANTIZATION` (env)  | `"none" \| "int8"`             | `"none"` | `src/lib/memory/vectorStore.ts::requestedVecQuantization()` |
+| Backend    | Setting                         | Type                           | Default  | Where read                                                  |
+| ---------- | ------------------------------- | ------------------------------ | -------- | ----------------------------------------------------------- |
+| Qdrant     | `qdrantQuantization` (DB key)   | `"none" \| "int8" \| "binary"` | `"none"` | `src/lib/memory/qdrant.ts::normalizeQdrantConfig()`         |
+| sqlite-vec | `MEMORY_VEC_QUANTIZATION` (env) | `"none" \| "int8"`             | `"none"` | `src/lib/memory/vectorStore.ts::requestedVecQuantization()` |
 
 - **Qdrant** is configured per-instance via the `qdrantQuantization` setting
   key (exposed as the `quantization` field on `PUT /api/settings/qdrant`). When
@@ -381,15 +426,15 @@ strategy via `toMemoryRetrievalConfig()` (chronological order).
 
 See also the "Settings extension" section above for field descriptions.
 
-| DB key                    | API field              | Default       |
-| ------------------------- | ---------------------- | ------------- |
-| `memoryEmbeddingSource`   | `embeddingSource`      | `"auto"`      |
-| `memoryEmbeddingModel`    | `embeddingProviderModel` | `null`      |
-| `memoryTransformersEnabled` | `transformersEnabled` | `false`      |
-| `memoryStaticEnabled`     | `staticEnabled`        | `false`       |
-| `memoryRerankEnabled`     | `rerankEnabled`        | `false`       |
-| `memoryRerankModel`       | `rerankProviderModel`  | `null`        |
-| `memoryVectorStore`       | `vectorStore`          | `"auto"`      |
+| DB key                      | API field                | Default  |
+| --------------------------- | ------------------------ | -------- |
+| `memoryEmbeddingSource`     | `embeddingSource`        | `"auto"` |
+| `memoryEmbeddingModel`      | `embeddingProviderModel` | `null`   |
+| `memoryTransformersEnabled` | `transformersEnabled`    | `false`  |
+| `memoryStaticEnabled`       | `staticEnabled`          | `false`  |
+| `memoryRerankEnabled`       | `rerankEnabled`          | `false`  |
+| `memoryRerankModel`         | `rerankProviderModel`    | `null`   |
+| `memoryVectorStore`         | `vectorStore`            | `"auto"` |
 
 Qdrant-related DB keys (`qdrantEnabled`, `qdrantHost`, `qdrantPort`,
 `qdrantApiKey`, `qdrantCollection` default `"omniroute_memory"`,
@@ -400,16 +445,16 @@ Qdrant-related DB keys (`qdrantEnabled`, `qdrantHost`, `qdrantPort`,
 
 Six optional env vars tune the engine's runtime behaviour (documented in `.env.example`):
 
-| Variable                        | Default | Description                                        |
-| ------------------------------- | ------- | -------------------------------------------------- |
-| `MEMORY_EMBEDDING_CACHE_TTL_MS` | `300000` | Embedding cache TTL (5 min)                       |
-| `MEMORY_EMBEDDING_CACHE_MAX`    | `1000`  | Max entries in embedding LRU cache                 |
-| `MEMORY_TRANSFORMERS_MODEL`     | `Xenova/all-MiniLM-L6-v2` | HF repo for Transformers.js model    |
-| `MEMORY_STATIC_MODEL`           | `minishlab/potion-base-8M` | HF repo for static potion model      |
-| `MEMORY_STATIC_CACHE_DIR`       | `<DATA_DIR>/embeddings` | Where to store downloaded models     |
-| `MEMORY_VEC_TOP_K`              | `20`    | Default top-K for vector search                    |
-| `MEMORY_RRF_K`                  | `60`    | RRF k constant for hybrid search                   |
-| `MEMORY_VEC_QUANTIZATION`       | `none`  | Set to `int8` to store local sqlite-vec vectors quantized (~4× smaller; opt-in). Mode change forces a reindex. |
+| Variable                        | Default                    | Description                                                                                                    |
+| ------------------------------- | -------------------------- | -------------------------------------------------------------------------------------------------------------- |
+| `MEMORY_EMBEDDING_CACHE_TTL_MS` | `300000`                   | Embedding cache TTL (5 min)                                                                                    |
+| `MEMORY_EMBEDDING_CACHE_MAX`    | `1000`                     | Max entries in embedding LRU cache                                                                             |
+| `MEMORY_TRANSFORMERS_MODEL`     | `Xenova/all-MiniLM-L6-v2`  | HF repo for Transformers.js model                                                                              |
+| `MEMORY_STATIC_MODEL`           | `minishlab/potion-base-8M` | HF repo for static potion model                                                                                |
+| `MEMORY_STATIC_CACHE_DIR`       | `<DATA_DIR>/embeddings`    | Where to store downloaded models                                                                               |
+| `MEMORY_VEC_TOP_K`              | `20`                       | Default top-K for vector search                                                                                |
+| `MEMORY_RRF_K`                  | `60`                       | RRF k constant for hybrid search                                                                               |
+| `MEMORY_VEC_QUANTIZATION`       | `none`                     | Set to `int8` to store local sqlite-vec vectors quantized (~4× smaller; opt-in). Mode change forces a reindex. |
 
 ## Summarisation (`summarization.ts`)
 
@@ -431,37 +476,37 @@ All endpoints require management auth (`requireManagementAuth`).
 
 ### Core memory endpoints (existing + updated)
 
-| Method     | Path                              | Description                                                                                                                                                                  |
-| ---------- | --------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `GET`      | `/api/memory`                     | Paginated list with filters: `apiKeyId`, `type`, `sessionId`, `q`, `limit`, `page`, `offset`. Response includes `stats.total`, `stats.tokensUsed`, `stats.hitRate`, `cacheStats` |
-| `POST`     | `/api/memory`                     | Create entry (Zod-validated: `content`, `key`, optional `type`, `sessionId`, `apiKeyId`, `metadata`, `expiresAt`). Calls `createMemory()` which upserts on `(apiKeyId, key)` |
-| `GET`      | `/api/memory/[id]`                | Fetch a single entry by UUID                                                                                                                                                 |
-| `PUT`      | `/api/memory/[id]`                | Update entry fields (`type`, `key`, `content`, `metadata`). Body: `MemoryUpdatePutSchema`. Also syncs vector if embedding source available. |
-| `DELETE`   | `/api/memory/[id]`                | Delete an entry; also deletes from `vec_memories` (D15) and Qdrant best-effort. Returns 404 when missing. |
-| `GET`      | `/api/memory/health`              | Runs `verifyExtractionPipeline("health-check")` — round-trip create→list→delete. Returns `{working, latencyMs, error?}` |
+| Method   | Path                 | Description                                                                                                                                                                      |
+| -------- | -------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `GET`    | `/api/memory`        | Paginated list with filters: `apiKeyId`, `type`, `sessionId`, `q`, `limit`, `page`, `offset`. Response includes `stats.total`, `stats.tokensUsed`, `stats.hitRate`, `cacheStats` |
+| `POST`   | `/api/memory`        | Create entry (Zod-validated: `content`, `key`, optional `type`, `sessionId`, `apiKeyId`, `metadata`, `expiresAt`). Calls `createMemory()` which upserts on `(apiKeyId, key)`     |
+| `GET`    | `/api/memory/[id]`   | Fetch a single entry by UUID                                                                                                                                                     |
+| `PUT`    | `/api/memory/[id]`   | Update entry fields (`type`, `key`, `content`, `metadata`). Body: `MemoryUpdatePutSchema`. Also syncs vector if embedding source available.                                      |
+| `DELETE` | `/api/memory/[id]`   | Delete an entry; also deletes from `vec_memories` (D15) and Qdrant best-effort. Returns 404 when missing.                                                                        |
+| `GET`    | `/api/memory/health` | Runs `verifyExtractionPipeline("health-check")` — round-trip create→list→delete. Returns `{working, latencyMs, error?}`                                                          |
 
 ### New memory engine endpoints (plan 21)
 
-| Method   | Path                               | Description                                                                             |
-| -------- | ---------------------------------- | --------------------------------------------------------------------------------------- |
-| `POST`   | `/api/memory/retrieve-preview`     | Dry-run of `retrieveMemories` — returns ranked results with score, tier, tokens. Body: `RetrievePreviewSchema`. Does NOT inject or modify memories. |
-| `GET`    | `/api/memory/embedding-providers`  | Lists providers with embedding models, indicating which have a configured API key.       |
-| `GET`    | `/api/memory/engine-status`        | Returns full engine status: keyword tier, embedding resolution, vector store stats, Qdrant health, rerank config. Shape: `MemoryEngineStatusSchema`. |
-| `POST`   | `/api/memory/summarize`            | Manually trigger memory compaction. Body: `MemorySummarizeSchema` (`olderThanDays`, `apiKeyId?`, `dryRun`). Returns `{candidates, tokensSaved}`. |
-| `POST`   | `/api/memory/reindex`              | Trigger vector reindex for memories with `needs_reindex=1`. Body: `MemoryReindexSchema` (`force`). Returns `{started, pending}`. |
+| Method | Path                              | Description                                                                                                                                          |
+| ------ | --------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `POST` | `/api/memory/retrieve-preview`    | Dry-run of `retrieveMemories` — returns ranked results with score, tier, tokens. Body: `RetrievePreviewSchema`. Does NOT inject or modify memories.  |
+| `GET`  | `/api/memory/embedding-providers` | Lists providers with embedding models, indicating which have a configured API key.                                                                   |
+| `GET`  | `/api/memory/engine-status`       | Returns full engine status: keyword tier, embedding resolution, vector store stats, Qdrant health, rerank config. Shape: `MemoryEngineStatusSchema`. |
+| `POST` | `/api/memory/summarize`           | Manually trigger memory compaction. Body: `MemorySummarizeSchema` (`olderThanDays`, `apiKeyId?`, `dryRun`). Returns `{candidates, tokensSaved}`.     |
+| `POST` | `/api/memory/reindex`             | Trigger vector reindex for memories with `needs_reindex=1`. Body: `MemoryReindexSchema` (`force`). Returns `{started, pending}`.                     |
 
 ### Settings endpoints
 
-| Method   | Path                               | Description                                                              |
-| -------- | ---------------------------------- | ------------------------------------------------------------------------ |
-| `GET`    | `/api/settings/memory`             | Current normalised `MemorySettingsExtended` (7 new fields + legacy)      |
-| `PUT`    | `/api/settings/memory`             | Update any field from `MemorySettingsExtendedSchema` (12 total fields)   |
-| `GET`    | `/api/settings/qdrant`             | Current Qdrant settings (`QdrantSettingsSchema`)                          |
-| `PUT`    | `/api/settings/qdrant`             | Update Qdrant settings. Body: `QdrantSettingsUpdateSchema`. `apiKey` = empty string removes key. |
-| `GET`    | `/api/settings/qdrant/health`      | Liveness probe against configured Qdrant instance. Returns `QdrantHealthResultSchema`. |
-| `POST`   | `/api/settings/qdrant/search`      | Semantic search test against Qdrant. Body: `QdrantSearchSchema` (`query`, `topK`). |
-| `POST`   | `/api/settings/qdrant/cleanup`     | Remove Qdrant points for expired / old memories.                          |
-| `GET`    | `/api/settings/qdrant/embedding-models` | List embedding models available for Qdrant.                          |
+| Method | Path                                    | Description                                                                                      |
+| ------ | --------------------------------------- | ------------------------------------------------------------------------------------------------ |
+| `GET`  | `/api/settings/memory`                  | Current normalised `MemorySettingsExtended` (7 new fields + legacy)                              |
+| `PUT`  | `/api/settings/memory`                  | Update any field from `MemorySettingsExtendedSchema` (12 total fields)                           |
+| `GET`  | `/api/settings/qdrant`                  | Current Qdrant settings (`QdrantSettingsSchema`)                                                 |
+| `PUT`  | `/api/settings/qdrant`                  | Update Qdrant settings. Body: `QdrantSettingsUpdateSchema`. `apiKey` = empty string removes key. |
+| `GET`  | `/api/settings/qdrant/health`           | Liveness probe against configured Qdrant instance. Returns `QdrantHealthResultSchema`.           |
+| `POST` | `/api/settings/qdrant/search`           | Semantic search test against Qdrant. Body: `QdrantSearchSchema` (`query`, `topK`).               |
+| `POST` | `/api/settings/qdrant/cleanup`          | Remove Qdrant points for expired / old memories.                                                 |
+| `GET`  | `/api/settings/qdrant/embedding-models` | List embedding models available for Qdrant.                                                      |
 
 The `/api/memory` list query supports either `page`-based pagination
 (`parsePaginationParams`) **or** raw `offset` — when `offset` is present it
@@ -489,7 +534,8 @@ See [MCP-SERVER.md](./MCP-SERVER.md) for transport and scope details.
 
 `src/app/(dashboard)/dashboard/memory/page.tsx` is now a **3-tab Studio**:
 
-### Tab: Memórias / Memories
+### Tab: Memories
+
 - Concept card (collapsible "How it works" explainer).
 - Real-time list, search, and pagination (debounced 300 ms).
 - Type filter (`factual` / `episodic` / `procedural` / `semantic` / all).
@@ -503,6 +549,7 @@ See [MCP-SERVER.md](./MCP-SERVER.md) for transport and scope details.
 - A green/red health dot driven by `GET /api/memory/health`.
 
 ### Tab: Playground
+
 - Query input + strategy selector (Exact / Semantic / Hybrid) + token budget.
 - "Simulate" → `POST /api/memory/retrieve-preview` — shows ranked results with
   `score`, `tier`, `tokens`, `vecScore`, `ftsScore`.
@@ -510,6 +557,7 @@ See [MCP-SERVER.md](./MCP-SERVER.md) for transport and scope details.
   whether a fallback occurred.
 
 ### Tab: Engine
+
 - Engine status panel (keyword FTS5 chip, embedding chip, vector store chip,
   Qdrant health chip, rerank chip).
 - "Reindex Now" button → `POST /api/memory/reindex`.
@@ -525,7 +573,7 @@ the legacy/global settings surface.
 ## Caching
 
 `src/lib/memory/store.ts` keeps an in-process LRU-ish cache
-(`MEMORY_CACHE_TTL = 5 min`, `MEMORY_MAX_CACHE_SIZE = 10 000`, with 20 %
+(`MEMORY_CACHE_TTL = 1 min`, `MEMORY_MAX_CACHE_SIZE = 500`, with 20 %
 oldest eviction) for `getMemory(id)` reads, plus a generic key/value
 `memoryCache` layer (`src/lib/memory/cache.ts`) with `get`/`set`/`invalidate`
 methods used by callers that want their own scoped cache (1 000-entry LRU,
@@ -565,7 +613,7 @@ default TTL 5 min).
   - `src/lib/db/memoryVec.ts` — CRUD for `memory_vec_meta`
   - `src/lib/db/migrations/015_create_memories.sql`,
     `022_add_memory_fts5.sql`, `023_fix_memory_fts_uuid.sql`,
-    `073_memory_vec.sql`
+    `083_memory_vec.sql`
   - `src/app/api/memory/route.ts`, `[id]/route.ts`, `health/route.ts`
   - `src/app/api/memory/retrieve-preview/route.ts`
   - `src/app/api/memory/engine-status/route.ts`
@@ -574,10 +622,10 @@ default TTL 5 min).
   - `src/app/api/memory/reindex/route.ts`
   - `src/app/api/settings/memory/route.ts`
   - `src/app/api/settings/qdrant/route.ts` + sub-routes
-   - `src/app/(dashboard)/dashboard/memory/` — Studio UI (page + components +
-     tabs + hooks)
-   - `open-sse/handlers/chatCore.ts` (injection / extraction wiring)
-   - `open-sse/mcp-server/tools/memoryTools.ts`
+  - `src/app/(dashboard)/dashboard/memory/` — Studio UI (page + components +
+    tabs + hooks)
+  - `open-sse/handlers/chatCore.ts` (injection / extraction wiring)
+  - `open-sse/mcp-server/tools/memoryTools.ts`
 
 ---
 
@@ -585,14 +633,15 @@ default TTL 5 min).
 
 OmniRoute's memory engine supports **four embedding sources** (`src/lib/memory/embedding/`). Each has different trade-offs in **latency, cost, model quality, and setup complexity**.
 
-### The Four Providers
+### The Embedding Sources
 
-| Provider | Source | Latency | Cost | Quality | Setup |
-|----------|--------|---------|------|---------|-------|
-| `transformers` | Local ONNX model (Xenova/all-MiniLM-L6-v2) | ~50-150ms (CPU) | Free | Good | `npm install` only |
-| `static` | Pre-computed vectors (cached) | <1ms | Free | N/A (depends on cache hit) | None |
-| `remote` | OpenAI / Cohere / Voyage API | ~100-300ms | $0.02-0.10/1M tokens | Excellent | API key |
-| `cache` | In-memory LRU layer over any source | <1ms (hit), full latency (miss) | Free | Same as underlying | None |
+| Provider       | Source                                     | Latency                         | Cost                 | Quality                    | Setup                               |
+| -------------- | ------------------------------------------ | ------------------------------- | -------------------- | -------------------------- | ----------------------------------- |
+| `transformers` | Local ONNX model (Xenova/all-MiniLM-L6-v2) | ~50-150ms (CPU)                 | Free                 | Good                       | `npm install` only                  |
+| `static`       | Pre-computed vectors (cached)              | <1ms                            | Free                 | N/A (depends on cache hit) | None                                |
+| `remote`       | OpenAI / Cohere / Voyage API               | ~100-300ms                      | $0.02-0.10/1M tokens | Excellent                  | API key                             |
+| `auto`         | Picks the best available source at runtime | Same as chosen source           | Free                 | Same as chosen source      | None                                |
+| _(cache)_      | In-memory LRU layer over any source        | <1ms (hit), full latency (miss) | Free                 | Same as underlying         | Always on (not a selectable source) |
 
 ### Decision Tree
 
@@ -643,16 +692,17 @@ The cache is always on by default and configured via env vars:
 MEMORY_EMBEDDING_CACHE_MAX=1000                    # Max cached items
 MEMORY_EMBEDDING_CACHE_TTL_MS=300000               # TTL (5 min)
 ```
+
 ### Performance Numbers
 
 Benchmark on a typical 4-core x86 server (texts ~100 tokens each):
 
-| Provider | p50 | p95 | p99 | Cost / 1M embeddings |
-|----------|-----|-----|-----|-----------------------|
-| `transformers` (CPU) | 80ms | 180ms | 350ms | Free |
-| `remote` (OpenAI) | 120ms | 220ms | 400ms | ~$0.02 (ada-002) / $0.13 (3-large) |
-| `static` (Qdrant) | 15ms | 30ms | 60ms | Depends on Qdrant hosting |
-| `cache` (hit) | <1ms | <1ms | 2ms | Free |
+| Provider             | p50   | p95   | p99   | Cost / 1M embeddings               |
+| -------------------- | ----- | ----- | ----- | ---------------------------------- |
+| `transformers` (CPU) | 80ms  | 180ms | 350ms | Free                               |
+| `remote` (OpenAI)    | 120ms | 220ms | 400ms | ~$0.02 (ada-002) / $0.13 (3-large) |
+| `static` (Qdrant)    | 15ms  | 30ms  | 60ms  | Depends on Qdrant hosting          |
+| `cache` (hit)        | <1ms  | <1ms  | 2ms   | Free                               |
 
 ---
 
@@ -662,43 +712,44 @@ The `extraction.ts` module (`src/lib/memory/extraction.ts`) uses **regex pattern
 
 ### Default Pattern Categories
 
-| Category | Example pattern | Captures |
-|----------|-----------------|----------|
-| PREFERENCE_PATTERNS | `"I prefer <X>"`, `"I like <X>"`, `"I hate <X>"` | User preferences |
-| DECISION_PATTERNS | `"I'll use <X>"`, `"I decided to <X>"`, `"I went with <X>"` | User decisions (episodic) |
-| PATTERN_PATTERNS | `"I usually <X>"`, `"I always <X>"`, `"I never <X>"` | Persistent behavioral patterns |
+| Category            | Example pattern                                             | Captures                       |
+| ------------------- | ----------------------------------------------------------- | ------------------------------ |
+| PREFERENCE_PATTERNS | `"I prefer <X>"`, `"I like <X>"`, `"I hate <X>"`            | User preferences               |
+| DECISION_PATTERNS   | `"I'll use <X>"`, `"I decided to <X>"`, `"I went with <X>"` | User decisions (episodic)      |
+| PATTERN_PATTERNS    | `"I usually <X>"`, `"I always <X>"`, `"I never <X>"`        | Persistent behavioral patterns |
 
 ### Example Patterns (Simplified)
+
 ```ts
 // From src/lib/memory/extraction.ts
 const PREFERENCE_PATTERNS = [
   /\bI\s+(?:really\s+)?prefer\s+([^.,\n]+)/gi,
   /\bI\s+(?:really\s+)?like\s+([^.,\n]+)/gi,
-  /\bI\s+(?:hate|dislike|avoid)\s+([^.,\n]+)/gi
+  /\bI\s+(?:hate|dislike|avoid)\s+([^.,\n]+)/gi,
 ];
 const DECISION_PATTERNS = [
   /\bI'?(?:ll|will)\s+use\s+([^.,\n]+)/gi,
-  /\bI\s+(?:have\s+)?decided\s+(?:to\s+)?([^.,\n]+)/gi
+  /\bI\s+(?:have\s+)?decided\s+(?:to\s+)?([^.,\n]+)/gi,
 ];
-const PATTERN_PATTERNS = [
-  /\bI\s+usually\s+([^.,\n]+)/gi,
-  /\bI\s+always\s+([^.,\n]+)/gi
-];
+const PATTERN_PATTERNS = [/\bI\s+usually\s+([^.,\n]+)/gi, /\bI\s+always\s+([^.,\n]+)/gi];
 ```
 
 ### What Gets Extracted
 
 When a user says:
+
 > "I prefer TypeScript. I'll use Postgres for this project. I always commit before pushing. I don't like Python."
-Extraction produces 4 memories:
-| Key | Category | Type | Content |
-|-----|----------|------|---------|
-| `preference:typescript` | preference | factual | "TypeScript" |
-| `decision:postgres_for_this_project` | decision | episodic | "Postgres for this project" |
-| `pattern:commit_before_pushing` | pattern | factual | "commit before pushing" |
-| `preference:python` | preference | factual | "Python" |
+> Extraction produces 4 memories:
+>
+> | Key                                  | Category   | Type     | Content                     |
+> | ------------------------------------ | ---------- | -------- | --------------------------- |
+> | `preference:typescript`              | preference | factual  | "TypeScript"                |
+> | `decision:postgres_for_this_project` | decision   | episodic | "Postgres for this project" |
+> | `pattern:commit_before_pushing`      | pattern    | factual  | "commit before pushing"     |
+> | `preference:python`                  | preference | factual  | "Python"                    |
 
 ### Extraction Limits
+
 To prevent runaway extraction, the following limits apply:
 
 | Min content length | 3 chars |
@@ -709,6 +760,7 @@ To prevent runaway extraction, the following limits apply:
 Extraction runs automatically whenever memory is enabled; there is no separate
 extraction-only toggle. To turn it off, disable memory entirely (`enabled: false`
 via `PUT /api/settings/memory`). Consider doing so when:
+
 - You have high message volume and the extraction cost is non-trivial
 - Your conversations are mostly transient (chat, debugging) with no long-term value
 - You're already capturing context via custom plugins
@@ -728,18 +780,19 @@ RRF(d) = Σ  1 / (k + rank_i(d))
 ```
 
 Where:
+
 - `k` is the constant (default 60)
 - `rank_i(d)` is the rank of document `d` in the i-th retrieval system (FTS, vector)
 - The sum runs over all retrieval systems
 
 ### How `k` Affects Results
 
-| `k` value | Effect | Best for |
-|-----------|--------|----------|
-| `k=0` | Pure rank fusion (no smoothing) | Theoretical baseline |
-| `k=10-30` | Heavily weights top results, low-rank barely contributes | When top-3 results are usually correct |
-| **`k=60`** (default) | Balanced — top-10 results all contribute meaningfully | General-purpose retrieval |
-| `k=100+` | Flatter — even low-rank results can dominate if they appear in multiple systems | When recall > precision is critical |
+| `k` value            | Effect                                                                          | Best for                               |
+| -------------------- | ------------------------------------------------------------------------------- | -------------------------------------- |
+| `k=0`                | Pure rank fusion (no smoothing)                                                 | Theoretical baseline                   |
+| `k=10-30`            | Heavily weights top results, low-rank barely contributes                        | When top-3 results are usually correct |
+| **`k=60`** (default) | Balanced — top-10 results all contribute meaningfully                           | General-purpose retrieval              |
+| `k=100+`             | Flatter — even low-rank results can dominate if they appear in multiple systems | When recall > precision is critical    |
 
 ### Tuning `k` in Practice
 
@@ -755,12 +808,14 @@ MEMORY_RRF_K=120
 ```
 
 **Example with `k=20`:**
+
 - FTS rank 1 → contribution `1/21 = 0.048`
 - FTS rank 10 → contribution `1/30 = 0.033`
 - Vector rank 1 → contribution `0.048`
 - Combined max: `0.096`
 
 **Example with `k=60`:**
+
 - FTS rank 1 → contribution `1/61 = 0.016`
 - FTS rank 10 → contribution `1/70 = 0.014`
 - Vector rank 1 → contribution `0.016`
@@ -770,12 +825,12 @@ With higher `k`, the **relative difference** between top-1 and rank-10 is smalle
 
 ### When to Change `k`
 
-| Symptom | Try |
-|---------|-----|
-| Top result always wins, but it's wrong | **Lower** k (e.g., 20) — top-rank confidence matters more |
+| Symptom                                | Try                                                          |
+| -------------------------------------- | ------------------------------------------------------------ |
+| Top result always wins, but it's wrong | **Lower** k (e.g., 20) — top-rank confidence matters more    |
 | Right answer is in top-5 but not top-1 | **Higher** k (e.g., 100) — flatter scoring rewards consensus |
-| Recall is high but precision is low | **Lower** k — sharpen the ranking |
-| Recall is low (missing relevant docs) | **Higher** k — give lower-ranked docs a chance |
+| Recall is high but precision is low    | **Lower** k — sharpen the ranking                            |
+| Recall is low (missing relevant docs)  | **Higher** k — give lower-ranked docs a chance               |
 
 ### RRF Weighting
 
@@ -795,9 +850,9 @@ The `summarization.ts` module (`src/lib/memory/summarization.ts`) compresses old
 
 ### When Summarization Triggers
 
-| Trigger | Threshold (default) |
-|---------|---------------------|
-| Manual trigger via API | n/a |
+| Trigger                | Threshold (default) |
+| ---------------------- | ------------------- |
+| Manual trigger via API | n/a                 |
 
 ### What Gets Summarized
 
@@ -839,3 +894,288 @@ To leave it off, simply keep `autoSummarize` at its default (`false`).
 0 3 * * * curl -X POST http://localhost:20128/api/memory/summarize \
   -H "Authorization: Bearer $OMNIROUTE_KEY"
 ```
+
+---
+
+## MemoryBackend Provider Pattern
+
+> **Source of truth:** `src/lib/memory/backend.ts`, `src/lib/memory/genericBackend.ts`, `src/lib/memory/manager.ts`
+> **Tests:** `src/lib/memory/__tests__/generic-backend.test.ts`
+
+The MemoryBackend provider pattern introduces a **pluggable backend abstraction layer** over the existing memory engine. Instead of being tied to a single storage implementation, the memory system now supports multiple backends (SQLite, Obsidian, Notion, custom HTTP backends) with configurable primary/fallback routing.
+
+### Architecture
+
+```
+┌──────────────────────────────────────────────────────────┐
+│                    API Routes                             │
+│            (src/app/api/memory/route.ts)                  │
+└──────────────────────┬───────────────────────────────────┘
+                       │
+┌──────────────────────▼───────────────────────────────────┐
+│                   MemoryManager                           │
+│           Singleton orchestrator (manager.ts)             │
+│                                                          │
+│  Primary ──► Backend A  (e.g. SQLite)                    │
+│  Fallback ─► Backend B  (e.g. Obsidian)                  │
+│             Backend C  (e.g. Notion via GenericBackend)   │
+└──────────────────────┬───────────────────────────────────┘
+                       │
+        ┌──────────────┼──────────────┐
+        ▼              ▼              ▼
+┌────────────┐ ┌────────────┐ ┌──────────────────┐
+│ SQLite     │ │ Obsidian   │ │ GenericMemory    │
+│ Backend    │ │ Backend    │ │ Backend (HTTP)   │
+└────────────┘ └────────────┘ └──────────────────┘
+```
+
+#### Core Interface (`backend.ts`)
+
+Every backend must implement the `MemoryBackend` interface:
+
+```typescript
+interface MemoryBackend {
+  readonly id: string;
+  readonly displayName: string;
+
+  // CRUD
+  create(input: CreateMemoryInput): Promise<Memory>;
+  get(id: string): Promise<Memory | null>;
+  update(id: string, updates: Partial<...>): Promise<boolean>;
+  delete(id: string): Promise<boolean>;
+  list(filter: MemoryFilter): Promise<{ data: Memory[]; total: number; byType: Record<string, number> }>;
+
+  // Search
+  search(config: SearchConfig): Promise<Memory[]>;
+
+  // Health
+  health(): Promise<HealthCheckResult>;
+
+  // Lifecycle (optional)
+  initialize?(): Promise<void>;
+  shutdown?(): Promise<void>;
+}
+```
+
+#### MemoryManager (`manager.ts`)
+
+Singleton orchestrator that:
+
+- **Registers** backends via `register(backend)` — called at boot from `index.ts`
+- **Configures** primary + fallback via `configure(primary, fallbacks)`
+- **Routes** CRUD/search to the primary, with fallback chain on failure
+- **Health checks** all backends periodically
+
+**Fallback behavior:**
+
+| Operation | Primary              | Fallbacks               |
+| --------- | -------------------- | ----------------------- |
+| `create`  | ✅ Primary only      | ❌                      |
+| `get`     | ✅ Try primary first | ✅ Fallback if null     |
+| `update`  | ✅ Primary only      | ✅ Fire-and-forget sync |
+| `delete`  | ✅ Primary only      | ✅ Fire-and-forget sync |
+| `list`    | ✅ Primary only      | ❌                      |
+| `search`  | ✅ Primary first     | ✅ Fallback on error    |
+
+#### GenericMemoryBackend (`genericBackend.ts`)
+
+A generic HTTP connector that adapts any REST API into a MemoryBackend. Useful for:
+
+- **Notion** — connect via Notion API
+- **Obsidian** — connect via Obsidian Local REST API
+- **Custom backends** — any service that exposes a RESTful memory API
+
+**Configuration:**
+
+```typescript
+interface GenericBackendConfig {
+  baseUrl: string;           // Base URL of the backend API
+  apiKey?: string;           // Bearer token for auth
+  headers?: Record<string, string>;  // Custom HTTP headers
+  timeout?: number;          // Request timeout (default: 30000ms)
+  backendType?: string;      // For logging
+
+  // Endpoint overrides (defaults use REST conventions)
+  endpoints?: {
+    search?: string;   // default: "/memories/search"
+    create?: string;   // default: "/memories"
+    list?: string;     // default: "/memories"
+    get?: string;      // default: "/memories/{id}"
+    update?: string;   // default: "/memories/{id}"
+    delete?: string;   // default: "/memories/{id}"
+    health?: string;   // default: "/health"
+  };
+
+  // Query parameter name mappings
+  queryParams?: {
+    query?/apiKeyId?/limit?/offset?/strategy?/maxTokens?/type?/sessionId?/orderBy?/orderDir?/options?
+  };
+
+  // Path parameter name mappings
+  pathParams?: {
+    id?/memoryId?
+  };
+}
+```
+
+**Known backends** are pre-configured in `KNOWN_BACKENDS`:
+
+```typescript
+createKnownBackend("obsidian"); // → GenericMemoryBackend pointed at localhost:27123
+createKnownBackend("notion"); // → GenericMemoryBackend pointed at api.notion.com/v1
+```
+
+#### Built-in Backends
+
+##### SQLiteBackend (`sqliteBackend.ts`)
+
+The default primary backend. Wraps the existing SQLite-based memory store using `src/lib/memory/store.ts`. Automatically registered at boot.
+
+```typescript
+import { sqliteBackend } from "./sqliteBackend";
+memoryManager.register(sqliteBackend);
+```
+
+##### ObsidianBackend (`obsidianBackend.ts`)
+
+Wraps the existing Obsidian integration (`src/lib/memory/obsidianBackend.ts`). Connects to an Obsidian vault via the Obsidian Local REST API.
+
+##### ClaudeMemBackend (`claudeMemBackend.ts`)
+
+Adapter for a local [claude-mem](https://github.com/thedotmack/claude-mem) worker — the
+Claude Code / Codex / Cursor memory plugin that captures coding sessions as "observations".
+With it registered, the `/api/memory` REST routes and A2A memory search can read and write
+the same store that claude-mem's hooks fill.
+
+The worker binds loopback only, which `GenericMemoryBackend`'s SSRF guard rejects on purpose.
+This adapter does not loosen that guard: the host is hard-coded to `127.0.0.1` and the config
+schema (`ClaudeMemBackendConfigSchema`, `.strict()`) accepts only:
+
+| Key         | Type   | Default | Notes                                                                                                  |
+| ----------- | ------ | ------- | ------------------------------------------------------------------------------------------------------ |
+| `port`      | number | —       | Required, 1024–65535. the claude-mem worker port from its settings file (default `37700 + uid % 100`). |
+| `project`   | string | —       | claude-mem project to use. Unset → each OmniRoute API key maps to its own project (the `apiKeyId`).    |
+| `timeoutMs` | number | `5000`  | Per-request timeout, 100–30000.                                                                        |
+
+Enable it through `PUT /api/settings/memory` and restart OmniRoute (backends are registered
+once, in `initMemoryBackends()`):
+
+```json
+{
+  "backendConfigs": { "claude-mem": { "port": 37701, "project": "OmniRoute" } },
+  "fallbackBackends": ["claude-mem"]
+}
+```
+
+Use `"primaryBackend": "claude-mem"` instead to make it the store for the REST API. An invalid
+config is logged (`claude-mem.backend.invalid_config`) and skipped, so SQLite stays primary.
+
+Mapping and limits:
+
+- IDs are `claude-mem:<observationId>`; `get`/`delete` ignore other backends' IDs without a
+  network call.
+- `create` → `POST /api/memory/save`; the OmniRoute fields (`apiKeyId`, `sessionId`, `type`,
+  `key`, `metadata`) ride in claude-mem's `metadata.omniroute` and round-trip on read.
+- `search` → `GET /api/search?format=json&type=observations`, trimmed to `maxTokens`
+  (chars / 4). `list` → the worker's paginated observations endpoint (`total` is a lower bound — the worker
+  returns `hasMore`, not a count).
+- Hook-captured observations map `discovery` → `factual`, `decision` → `procedural`, and
+  `bugfix`/`feature`/`refactor`/`change` → `episodic`.
+- **No updates** (`update()` returns `false`; observations are immutable) and **no TTL**
+  (`expiresAt` is ignored). claude-mem dedups identical saves instead of upserting by `key`.
+- Prompt injection (`retrieval.ts`) and the `omniroute_memory_*` MCP tools still read SQLite
+  directly — they do not go through `memoryManager`, so this backend does not feed them.
+
+**Routing claude-mem's own LLM calls through OmniRoute.** claude-mem compresses observations
+with an LLM (default: the Claude Agent SDK). Its `openai-compatible` provider can point at
+OmniRoute instead, picking up combo fallback and cost tracking. In `~/.claude-mem/settings.json`:
+
+```json
+{
+  "CLAUDE_MEM_PROVIDER": "openai-compatible",
+  "CLAUDE_MEM_OPENAI_COMPAT_BASE_URL": "http://localhost:20128/v1",
+  "CLAUDE_MEM_OPENAI_COMPAT_API_KEY": "<OmniRoute API key>",
+  "CLAUDE_MEM_OPENAI_COMPAT_MODEL": "<OmniRoute model or combo>"
+}
+```
+
+### Settings
+
+Memory backend settings are stored in the app settings table and managed via `src/lib/memory/settings.ts`:
+
+| Setting           | Env/Config Key           | Default    | Description                  |
+| ----------------- | ------------------------ | ---------- | ---------------------------- |
+| Primary backend   | `memoryPrimaryBackend`   | `"sqlite"` | ID of the primary backend    |
+| Fallback backends | `memoryFallbackBackends` | `[]`       | Ordered fallback backend IDs |
+| Backend configs   | `memoryBackendConfigs`   | `{}`       | Per-backend config overrides |
+
+Settings are normalized via `normalizeMemorySettings()` and cached at `getMemorySettings()`.
+
+### Initialization Flow
+
+```
+App bootstrap
+  → index.ts imports (side-effect): registers SQLiteBackend
+  → initMemoryBackends() called from app lifecycle:
+      1. Load settings (getMemorySettings)
+      1b. Register opt-in backends present in backendConfigs (claude-mem)
+      2. Configure primary + fallback
+      3. Initialize all backends (health check)
+      4. Ready for requests
+```
+
+### Adding a New Backend
+
+1. **Implement `MemoryBackend`** interface in `src/lib/memory/<name>Backend.ts`
+2. **Export** from `src/lib/memory/index.ts`
+3. **Register** with `memoryManager.register(yourBackend)` at boot
+4. **Configure** via settings: set `memoryPrimaryBackend` to your backend ID
+5. **Test** with `src/lib/memory/__tests__/generic-backend.test.ts` as reference
+
+#### Example: Brain Backend
+
+```typescript
+import { createGenericMemoryBackend } from "./genericBackend";
+
+const brainBackend = createGenericMemoryBackend("brain", "BK-Brain", {
+  baseUrl: process.env.BRAIN_API_URL || "http://localhost:9099",
+  apiKey: process.env.BRAIN_API_KEY,
+  endpoints: {
+    search: "/api/memory/search",
+    create: "/api/memory",
+    health: "/api/health",
+  },
+});
+
+memoryManager.register(brainBackend);
+```
+
+### Verification
+
+#### Unit tests
+
+```bash
+npx vitest run src/lib/memory/__tests__/generic-backend.test.ts --reporter=verbose
+```
+
+Expected output: **35 tests, all passing** covering:
+
+- Constructor (2)
+- Health check (4) — success, failure 500, network error, latency
+- Initialize (2) — success, failure
+- Create (2) — default endpoint, custom endpoint
+- Get (4) — success, 404 → null, non-404 throw, custom path params
+- Update (2) — success, 404 → false
+- Delete (2) — success, 404 → false
+- List (2) — query params, custom param names
+- Search (3) — query params, custom endpoint, options serialization
+- Auth headers (2) — Bearer token, custom headers
+- Factory (1)
+
+#### Type check
+
+```bash
+npm run typecheck:core
+```
+
+Expected: **0 errors**.

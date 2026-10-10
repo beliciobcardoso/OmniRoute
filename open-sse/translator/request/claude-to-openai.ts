@@ -6,6 +6,19 @@ type JsonRecord = Record<string, unknown>;
 const TOOL_CHOICE_ANY = ["a", "n", "y"].join("");
 
 /**
+ * Port of decolua/9router commit 0aaa5ab3 (closes prompt-cache instability):
+ * Anthropic injects a dynamic `x-anthropic-billing-header: <value>` line at
+ * the top of some system prompts. When we translate Claude → OpenAI and
+ * forward to a non-Anthropic upstream, that line both leaks into the
+ * assistant prompt and rotates per request, destroying prompt-cache hits.
+ * Strip it from each system entry before assembling the OpenAI request.
+ */
+function stripAnthropicBillingHeader(text: unknown): string {
+  if (typeof text !== "string") return "";
+  return text.replace(/^x-anthropic-billing-header:[^\n]*(?:\r?\n)?/i, "");
+}
+
+/**
  * Normalize tool input schema for OpenAI compatibility.
  * OpenAI strict mode requires `properties: {}` on object-type schemas,
  * even for zero-argument tools. Anthropic/MCP tools may omit it (#1898).
@@ -23,7 +36,6 @@ function normalizeToolSchema(schema: unknown): Record<string, unknown> {
 function normalizeOpenAIReasoningEffort(effort: unknown): string | undefined {
   if (typeof effort !== "string") return undefined;
   const normalized = effort.toLowerCase();
-  if (normalized === "max") return "xhigh";
   return normalized || undefined;
 }
 
@@ -78,6 +90,16 @@ function shouldUseNativeResponsesWebSearch(credentials: unknown): boolean {
 
 // Convert Claude request to OpenAI format
 export function claudeToOpenAIRequest(model, body, stream, credentials: unknown = null) {
+  // #2069 — when the routed provider honors OpenAI-format cache_control breakpoints
+  // (DashScope/alibaba, etc.) and the upstream caller requested preservation, keep
+  // the client's cache_control markers on system + message text blocks instead of
+  // collapsing them away during the Claude→OpenAI conversion.
+  const preserveCacheControl =
+    credentials !== null &&
+    typeof credentials === "object" &&
+    !Array.isArray(credentials) &&
+    (credentials as JsonRecord)._preserveCacheControl === true;
+
   const result: {
     model: string;
     messages: JsonRecord[];
@@ -107,11 +129,35 @@ export function claudeToOpenAIRequest(model, body, stream, credentials: unknown 
 
   // System message
   if (body.system) {
-    const systemContent = Array.isArray(body.system)
-      ? body.system.map((s) => s.text || "").join("\n")
-      : body.system;
+    // When preserving cache_control for a caching-capable provider, and the client
+    // tagged any system block, keep the array-of-blocks shape so the breakpoint
+    // survives (DashScope reads cache_control off content blocks). Otherwise fall
+    // back to the joined-string form expected by generic OpenAI providers (#2069).
+    const systemHasCacheControl =
+      preserveCacheControl &&
+      Array.isArray(body.system) &&
+      body.system.some((s) => s && typeof s === "object" && s.cache_control !== undefined);
 
-    if (systemContent) {
+    const systemContent = systemHasCacheControl
+      ? body.system.map((s) => {
+          // body.system may be a mixed array — handle string elements (and
+          // null/non-object) defensively so we never drop text or throw.
+          if (typeof s === "string") return { type: "text", text: stripAnthropicBillingHeader(s) };
+          const rawText = s && typeof s === "object" ? (s as JsonRecord).text || "" : "";
+          const block: JsonRecord = { type: "text", text: stripAnthropicBillingHeader(rawText) };
+          if (s && typeof s === "object" && (s as JsonRecord).cache_control !== undefined) {
+            block.cache_control = (s as JsonRecord).cache_control;
+          }
+          return block;
+        })
+      : Array.isArray(body.system)
+        ? body.system
+            .map((s) => stripAnthropicBillingHeader(s.text || ""))
+            .filter(Boolean)
+            .join("\n")
+        : stripAnthropicBillingHeader(body.system);
+
+    if (systemHasCacheControl || systemContent) {
       result.messages.push({
         role: "system",
         content: systemContent,
@@ -119,16 +165,54 @@ export function claudeToOpenAIRequest(model, body, stream, credentials: unknown 
     }
   }
 
+  // #reasoning-bilingual: DeepSeek-V4 and similar models emit user-facing text in the
+  // user's language (e.g. Korean) then continue with English planning/chain-of-thought
+  // in the same content field instead of using reasoning_content. Same mitigation as
+  // translator/response/openai-to-claude.ts's directivePreambleStripper.ts: when the
+  // operator configured OMNIROUTE_SYSTEM_INSTRUCTION_APPEND, append it here to the
+  // (system) message so the directive reaches the model on the /v1/messages (Claude
+  // Messages -> OpenAI Chat Completions) path too.
+  const systemAppend = process.env.OMNIROUTE_SYSTEM_INSTRUCTION_APPEND?.trim();
+  if (systemAppend) {
+    const sysIndex = result.messages.findIndex((m) => m.role === "system");
+    if (sysIndex >= 0) {
+      const sys = result.messages[sysIndex];
+      if (typeof sys.content === "string") {
+        sys.content = sys.content + "\n\n" + systemAppend;
+      } else if (Array.isArray(sys.content)) {
+        (sys.content as JsonRecord[]).push({ type: "text", text: systemAppend });
+      } else {
+        sys.content = systemAppend;
+      }
+    } else {
+      result.messages.unshift({ role: "system", content: systemAppend });
+    }
+  }
+
   // Convert messages
   if (body.messages && Array.isArray(body.messages)) {
     for (let i = 0; i < body.messages.length; i++) {
       const msg = body.messages[i];
-      const converted = convertClaudeMessage(msg);
+      const converted = convertClaudeMessage(msg, preserveCacheControl);
       if (converted) {
-        // Handle array of messages (multiple tool results)
+        // Claude Code hook contexts (SessionStart/PreToolUse) arrive as
+        // role:"system" mid-array — strictly valid for the Anthropic Messages
+        // API, but OpenAI-compatible upstreams reject a system turn after the
+        // first message (HCP-Vision-Latest vLLM: 400 "System message must be
+        // at the beginning."). Demote every system at index > 0 to "user",
+        // keeping the content byte-identical; the index-0 system (the
+        // translator-made one above, or one the client put first) stays.
+        const demoteMidSystem = (out: JsonRecord) => {
+          if (out.role === "system" && result.messages.length > 0) out.role = "user";
+        };
+        // Array return is tool/user elements only (never role:"system") — a
+        // second system here would skip demotion while result.messages is
+        // still empty and survive as a mid-array system.
         if (Array.isArray(converted)) {
+          converted.forEach(demoteMidSystem);
           result.messages.push(...converted);
         } else {
+          demoteMidSystem(converted);
           result.messages.push(converted);
         }
       }
@@ -144,6 +228,24 @@ export function claudeToOpenAIRequest(model, body, stream, credentials: unknown 
   // Runs after regrouping so real results are already adjacent and only a truly
   // unanswered tool_call receives a "[No response received]" placeholder.
   fixMissingToolResponses(result.messages);
+
+  // GLM-family gateways (Z.AI / Zhipu — fronted by opencode-go / opencode-zen /
+  // glm-* targets) reject any payload whose messages array has NO role:"user"
+  // turn with `400 [1214] The messages parameter is illegal`. Claude Code agent
+  // loops legitimately produce such payloads: every inbound user turn carries
+  // only tool_result blocks (translated to role:"tool") and context compression
+  // can evict the original prompt. When the caller flags a GLM-family upstream
+  // (_ensureUserTurn), append a minimal synthetic user turn so the request
+  // satisfies the validator. Appending at the end keeps every earlier byte
+  // identical for upstream prompt caches.
+  const ensureUserTurn =
+    credentials !== null &&
+    typeof credentials === "object" &&
+    !Array.isArray(credentials) &&
+    (credentials as JsonRecord)._ensureUserTurn === true;
+  if (ensureUserTurn && !result.messages.some((m) => m && m.role === "user")) {
+    result.messages.push({ role: "user", content: "(continue)" });
+  }
 
   const useNativeResponsesWebSearch = shouldUseNativeResponsesWebSearch(credentials);
 
@@ -185,7 +287,7 @@ export function claudeToOpenAIRequest(model, body, stream, credentials: unknown 
   }
 
   // Reasoning effort: map Claude-side thinking controls to OpenAI reasoning_effort.
-  // Priority: output_config.effort (Claude Code) > thinking.budget_tokens (Claude native).
+  // Priority: output_config.effort > enabled thinking budget > explicit opt-out fallback.
   // Budget buckets match the reverse mapping in thinkingBudget.ts::setCustomBudget.
   const outputEffort = normalizeOpenAIReasoningEffort(body.output_config?.effort) || "";
   if (outputEffort) {
@@ -203,6 +305,11 @@ export function claudeToOpenAIRequest(model, body, stream, credentials: unknown 
     } else {
       result.reasoning_effort = "xhigh";
     }
+  } else if (
+    body.thinking?.type === "disabled" ||
+    normalizeOpenAIReasoningEffort(body.reasoning_effort) === "none"
+  ) {
+    result.reasoning_effort = "none";
   }
 
   return result;
@@ -301,8 +408,16 @@ function fixMissingToolResponses(messages) {
 }
 
 // Convert single Claude message - returns single message or array of messages
-function convertClaudeMessage(msg) {
-  const role = msg.role === "user" || msg.role === "tool" ? "user" : "assistant";
+function convertClaudeMessage(msg, preserveCacheControl = false) {
+  // Preserve system role for mid-conversation system turns (#6954).
+  // Previously any role that wasn't "user" or "tool" was mapped to "assistant",
+  // which misattributed system messages as assistant output.
+  const role =
+    msg.role === "user" || msg.role === "tool"
+      ? "user"
+      : msg.role === "system"
+        ? "system"
+        : "assistant";
 
   // Simple string content
   if (typeof msg.content === "string") {
@@ -318,9 +433,16 @@ function convertClaudeMessage(msg) {
 
     for (const block of msg.content) {
       switch (block.type) {
-        case "text":
-          parts.push({ type: "text", text: block.text });
+        case "text": {
+          const textPart: JsonRecord = { type: "text", text: block.text };
+          // #2069 — carry the client's cache_control breakpoint through to
+          // caching-capable OpenAI-format providers (DashScope/alibaba, etc.).
+          if (preserveCacheControl && block.cache_control !== undefined) {
+            textPart.cache_control = block.cache_control;
+          }
+          parts.push(textPart);
           break;
+        }
 
         case "image":
           if (block.source?.type === "base64") {
@@ -356,7 +478,8 @@ function convertClaudeMessage(msg) {
             type: "function",
             function: {
               name: block.name,
-              arguments: JSON.stringify(block.input || {}),
+              arguments:
+                typeof block.input === "string" ? block.input : JSON.stringify(block.input || {}),
             },
           });
           break;
@@ -366,11 +489,35 @@ function convertClaudeMessage(msg) {
           if (typeof block.content === "string") {
             resultContent = block.content;
           } else if (Array.isArray(block.content)) {
+            // Keep text in the tool message; lift any images out as a following user
+            // turn (OpenAI `tool` messages can't carry images). Without this, an
+            // image-only tool_result is JSON.stringify'd → base64 as text, which
+            // causes "input exceeds the context window" errors in OpenAI-protocol
+            // upstreams (port of decolua/9router#2123 by alican532).
+            const textParts: string[] = [];
+            let hasImage = false;
+            for (const c of block.content) {
+              if (c.type === "text") {
+                textParts.push(c.text);
+              } else if (c.type === "image" && c.source?.type === "base64") {
+                parts.push({
+                  type: "image_url",
+                  image_url: {
+                    url: `data:${c.source.media_type};base64,${c.source.data}`,
+                  },
+                });
+                hasImage = true;
+              } else if (c.type === "image" && c.source?.type === "url" && c.source.url) {
+                // Same lift for a URL source, which the `image` case above already accepts.
+                // No scheme test here, unlike the Gemini side: OpenAI's image_url takes a
+                // `data:` URI too, which is exactly what the base64 branch above emits.
+                parts.push({ type: "image_url", image_url: { url: c.source.url } });
+                hasImage = true;
+              }
+            }
             resultContent =
-              block.content
-                .filter((c) => c.type === "text")
-                .map((c) => c.text)
-                .join("\n") || JSON.stringify(block.content);
+              textParts.join("\n") ||
+              (hasImage ? "[tool returned an image; see attached]" : JSON.stringify(block.content));
           } else if (block.content) {
             resultContent = JSON.stringify(block.content);
           }
@@ -443,6 +590,8 @@ function convertToolChoice(choice, hasServerWebSearch = false) {
   switch (choice.type) {
     case "auto":
       return "auto";
+    case "none":
+      return "none";
     case TOOL_CHOICE_ANY:
       return "required";
     case "tool":

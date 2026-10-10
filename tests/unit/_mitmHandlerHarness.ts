@@ -19,10 +19,13 @@ export interface HarnessResult {
   responseChunks: string[];
 }
 
-function fakeReq(headers: Record<string, string> = {}): IncomingMessage {
+function fakeReq(
+  headers: Record<string, string> = {},
+  url = "/v1/chat/completions"
+): IncomingMessage {
   return {
     method: "POST",
-    url: "/v1/chat/completions",
+    url,
     headers: {
       host: "api.example.com",
       "user-agent": "ut",
@@ -41,9 +44,28 @@ function fakeRes(): { res: ServerResponse; out: HarnessResult } {
     responseChunks: [],
   };
   let headersSent = false;
+  const listeners = new Map<string, Set<(...args: unknown[]) => void>>();
   const res = {
     get headersSent() {
       return headersSent;
+    },
+    closed: false,
+    destroyed: false,
+    once(event: string, fn: (...args: unknown[]) => void) {
+      let set = listeners.get(event);
+      if (!set) {
+        set = new Set();
+        listeners.set(event, set);
+      }
+      set.add(fn);
+      return res;
+    },
+    off(event: string, fn: (...args: unknown[]) => void) {
+      listeners.get(event)?.delete(fn);
+      return res;
+    },
+    emitClose() {
+      for (const fn of [...(listeners.get("close") ?? [])]) fn();
     },
     writeHead(s: number) {
       out.status = s;
@@ -56,7 +78,7 @@ function fakeRes(): { res: ServerResponse; out: HarnessResult } {
     end(c?: Buffer | string) {
       if (c) out.responseChunks.push(typeof c === "string" ? c : c.toString());
     },
-  } as unknown as ServerResponse;
+  } as unknown as ServerResponse & { emitClose: () => void };
   return { res, out };
 }
 
@@ -68,10 +90,11 @@ export async function runHandler(
     upstreamStatus?: number;
     upstreamBody?: string;
     headers?: Record<string, string>;
+    url?: string;
   } = {}
 ): Promise<HarnessResult> {
   const { res, out } = fakeRes();
-  const req = fakeReq(opts.headers);
+  const req = fakeReq(opts.headers, opts.url);
   const buf = Buffer.from(typeof body === "string" ? body : JSON.stringify(body));
 
   const originalFetch = globalThis.fetch;

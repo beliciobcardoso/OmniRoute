@@ -1,7 +1,7 @@
 import { NextResponse } from "next/server";
 import {
   SEARCH_PROVIDERS,
-  SEARCH_CREDENTIAL_FALLBACKS,
+  getSearchCredentialFallbacks,
 } from "@omniroute/open-sse/config/searchRegistry.ts";
 import { isAuthenticated } from "@/shared/utils/apiAuth";
 import { getProviderCredentials } from "@/sse/services/auth";
@@ -14,7 +14,7 @@ import {
 import * as log from "@/sse/utils/logger";
 
 // ---------------------------------------------------------------------------
-// Fetch provider metadata (hardcoded — no registry for these 3)
+// Fetch provider metadata (hardcoded — no registry for these 4)
 // ---------------------------------------------------------------------------
 
 interface FetchProviderDef {
@@ -30,12 +30,12 @@ const FETCH_PROVIDERS: FetchProviderDef[] = [
     id: "firecrawl",
     name: "Firecrawl",
     costPerQuery: 0.002,
-    freeMonthlyQuota: 500,
+    freeMonthlyQuota: 1000,
     fetchFormats: ["markdown", "html", "links", "screenshot"],
   },
   {
     id: "jina-reader",
-    name: "Jina Reader",
+    name: "Jina Reader (r.jina.ai)",
     costPerQuery: 0.0005,
     freeMonthlyQuota: 1000,
     fetchFormats: ["markdown", "text"],
@@ -46,6 +46,27 @@ const FETCH_PROVIDERS: FetchProviderDef[] = [
     costPerQuery: 0.001,
     freeMonthlyQuota: 1000,
     fetchFormats: ["markdown", "text"],
+  },
+  {
+    id: "tinyfish",
+    name: "TinyFish Fetch",
+    costPerQuery: 0,
+    freeMonthlyQuota: 0,
+    fetchFormats: ["markdown", "html"],
+  },
+  {
+    id: "nimble-search",
+    name: "Nimble Extract",
+    costPerQuery: 0.005,
+    freeMonthlyQuota: 0,
+    fetchFormats: ["markdown", "html", "links", "screenshot"],
+  },
+  {
+    id: "anysearch-search",
+    name: "AnySearch",
+    costPerQuery: 0,
+    freeMonthlyQuota: 0,
+    fetchFormats: ["markdown"],
   },
 ];
 
@@ -78,8 +99,7 @@ async function resolveProviderStatus(
     // All rate limited — check fallback before returning rate_limited
     if (isAllRateLimitedCredentials(credentials)) {
       if (useCredentialFallback) {
-        const fallbackId = SEARCH_CREDENTIAL_FALLBACKS[providerId];
-        if (fallbackId) {
+        for (const fallbackId of getSearchCredentialFallbacks(providerId)) {
           const fallbackCreds = await getProviderCredentials(fallbackId).catch(() => null);
           if (fallbackCreds && !isAllRateLimitedCredentials(fallbackCreds)) {
             return "configured";
@@ -91,16 +111,17 @@ async function resolveProviderStatus(
 
     // null → no credentials; try fallback
     if (useCredentialFallback) {
-      const fallbackId = SEARCH_CREDENTIAL_FALLBACKS[providerId];
-      if (fallbackId) {
+      let fallbackRateLimited = false;
+      for (const fallbackId of getSearchCredentialFallbacks(providerId)) {
         const fallbackCreds = await getProviderCredentials(fallbackId).catch(() => null);
         if (fallbackCreds && !isAllRateLimitedCredentials(fallbackCreds)) {
           return "configured";
         }
         if (isAllRateLimitedCredentials(fallbackCreds)) {
-          return "rate_limited";
+          fallbackRateLimited = true;
         }
       }
+      if (fallbackRateLimited) return "rate_limited";
     }
 
     return "missing";
@@ -115,10 +136,7 @@ async function resolveProviderStatus(
 
 export async function GET(request: Request) {
   if (!(await isAuthenticated(request))) {
-    return NextResponse.json(
-      buildErrorBody(401, "Unauthorized"),
-      { status: 401 }
-    );
+    return NextResponse.json(buildErrorBody(401, "Unauthorized"), { status: 401 });
   }
 
   try {
@@ -133,19 +151,21 @@ export async function GET(request: Request) {
       )
     );
 
-    const searchItems: SearchProviderCatalogItem[] = searchProviderStatuses.map(({ p, status }) => ({
-      id: p.id,
-      name: p.name,
-      kind: "search" as const,
-      costPerQuery: p.costPerQuery,
-      freeMonthlyQuota: p.freeMonthlyQuota,
-      searchTypes: p.searchTypes,
-      status,
-      configureHref: "/dashboard/providers",
-    }));
+    const searchItems: SearchProviderCatalogItem[] = searchProviderStatuses.map(
+      ({ p, status }) => ({
+        id: p.id,
+        name: p.name,
+        kind: "search" as const,
+        costPerQuery: p.costPerQuery,
+        freeMonthlyQuota: p.freeMonthlyQuota,
+        searchTypes: p.searchTypes,
+        status,
+        configureHref: "/dashboard/providers",
+      })
+    );
 
     // -----------------------------------------------------------------------
-    // 2. Build fetch providers (3 hardcoded)
+    // 2. Build fetch providers (4 hardcoded)
     // -----------------------------------------------------------------------
     const fetchProviderStatuses = await Promise.all(
       FETCH_PROVIDERS.map((fp) =>

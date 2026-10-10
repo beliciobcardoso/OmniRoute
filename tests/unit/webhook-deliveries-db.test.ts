@@ -13,7 +13,7 @@ const deliveriesDb = await import("../../src/lib/db/webhookDeliveries.ts");
 
 async function resetStorage() {
   coreDb.resetDbInstance();
-  fs.rmSync(TEST_DIR, { recursive: true, force: true });
+  fs.rmSync(TEST_DIR, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
   fs.mkdirSync(TEST_DIR, { recursive: true });
 }
 
@@ -23,7 +23,7 @@ test.beforeEach(async () => {
 
 test.after(() => {
   coreDb.resetDbInstance();
-  fs.rmSync(TEST_DIR, { recursive: true, force: true });
+  fs.rmSync(TEST_DIR, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
 });
 
 test("insertDelivery stores a row and getDeliveries returns it", () => {
@@ -42,6 +42,7 @@ test("insertDelivery stores a row and getDeliveries returns it", () => {
   assert.equal(rows[0].http_status, 200);
   assert.equal(rows[0].latency_ms, 142);
   assert.equal(rows[0].status, "delivered");
+  assert.equal("payload_snapshot" in rows[0], false);
 });
 
 test("rotation keeps only last 100 deliveries per webhook", () => {

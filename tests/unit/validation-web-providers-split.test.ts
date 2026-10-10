@@ -12,12 +12,11 @@ const B = await import("../../src/lib/providers/validation/webProvidersB.ts");
 const meta = await import("../../src/lib/providers/validation/metaAi.ts");
 const HOST = await import("../../src/lib/providers/validation.ts");
 
-test("webProvidersA exposes its six validators (deepseek/qwen/grok/chatgpt/perplexity/blackbox)", () => {
+test("webProvidersA exposes its five validators (kimi/deepseek/grok/perplexity/blackbox)", () => {
   for (const name of [
+    "validateKimiWebProvider",
     "validateDeepSeekWebProvider",
-    "validateQwenWebProvider",
     "validateGrokWebProvider",
-    "validateChatGptWebProvider",
     "validatePerplexityWebProvider",
     "validateBlackboxWebProvider",
   ]) {
@@ -25,7 +24,7 @@ test("webProvidersA exposes its six validators (deepseek/qwen/grok/chatgpt/perpl
   }
 });
 
-test("webProvidersB exposes its eight validators (muse-spark/adapta/claude/gemini/copilot/t3/jules/inner-ai)", () => {
+test("webProvidersB exposes its nine validators (muse-spark/adapta/claude/gemini/copilot/t3/jules/devin/inner-ai)", () => {
   for (const name of [
     "validateMuseSparkWebProvider",
     "validateAdaptaWebProvider",
@@ -34,6 +33,7 @@ test("webProvidersB exposes its eight validators (muse-spark/adapta/claude/gemin
     "validateCopilotWebProvider",
     "validateT3WebProvider",
     "validateJulesProvider",
+    "validateDevinCloudAgentProvider",
     "validateInnerAiProvider",
   ]) {
     assert.equal(typeof (B as Record<string, unknown>)[name], "function", `B missing ${name}`);

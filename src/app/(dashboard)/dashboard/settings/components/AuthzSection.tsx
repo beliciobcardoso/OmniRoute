@@ -13,11 +13,17 @@ interface TierEntry {
   bypassable: boolean;
 }
 
+interface CorsStatus {
+  allowAll: boolean;
+  allowedOrigins: string[];
+}
+
 interface InventoryPayload {
   tiers: TierEntry[];
   bypassEnabled: boolean;
   bypassPrefixes: string[];
   spawnCapablePrefixes: string[];
+  cors?: CorsStatus;
 }
 
 interface StatusMessage {
@@ -87,6 +93,25 @@ function parseErrorCode(payload: unknown): ErrorCode {
 
 // ─── component ────────────────────────────────────────────────────────────
 
+type InventoryFetchResult =
+  | { kind: "ok"; data: InventoryPayload }
+  | { kind: "http-error"; code: ErrorCode }
+  | { kind: "failed" };
+
+async function fetchInventory(): Promise<InventoryFetchResult> {
+  try {
+    const res = await fetch("/api/settings/authz-inventory", {
+      credentials: "include",
+    });
+    if (!res.ok) {
+      return { kind: "http-error", code: parseErrorCode(await res.json().catch(() => null)) };
+    }
+    return { kind: "ok", data: (await res.json()) as InventoryPayload };
+  } catch {
+    return { kind: "failed" };
+  }
+}
+
 export default function AuthzSection() {
   const t = useTranslations("settings");
   const [inventory, setInventory] = useState<InventoryPayload | null>(null);
@@ -104,32 +129,38 @@ export default function AuthzSection() {
   const [submitting, setSubmitting] = useState(false);
   const [status, setStatus] = useState<StatusMessage | null>(null);
 
+  const applyInventoryResult = useCallback(
+    (result: InventoryFetchResult) => {
+      if (result.kind === "ok") {
+        setInventory(result.data);
+        setDraftEnabled(result.data.bypassEnabled);
+        setDraftPrefixes([...result.data.bypassPrefixes]);
+      } else if (result.kind === "http-error") {
+        setLoadError(t(`authz.error.${result.code}`));
+      } else {
+        setLoadError(t("authz.loadError"));
+      }
+      setLoading(false);
+    },
+    [t]
+  );
+
   const loadInventory = useCallback(async () => {
     setLoading(true);
     setLoadError(null);
-    try {
-      const res = await fetch("/api/settings/authz-inventory", {
-        credentials: "include",
-      });
-      if (!res.ok) {
-        const code = parseErrorCode(await res.json().catch(() => null));
-        setLoadError(t(`authz.error.${code}`));
-        return;
-      }
-      const data = (await res.json()) as InventoryPayload;
-      setInventory(data);
-      setDraftEnabled(data.bypassEnabled);
-      setDraftPrefixes([...data.bypassPrefixes]);
-    } catch {
-      setLoadError(t("authz.loadError"));
-    } finally {
-      setLoading(false);
-    }
-  }, [t]);
+    applyInventoryResult(await fetchInventory());
+  }, [applyInventoryResult]);
 
   useEffect(() => {
-    void loadInventory();
-  }, [loadInventory]);
+    let cancelled = false;
+    void (async () => {
+      const result = await fetchInventory();
+      if (!cancelled) applyInventoryResult(result);
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [applyInventoryResult]);
 
   const dirty = useMemo(() => {
     if (!inventory) return false;
@@ -241,6 +272,24 @@ export default function AuthzSection() {
 
   return (
     <>
+      {/* #5602: persistent wildcard-CORS warning — only visible while
+          CORS_ALLOW_ALL=true is live. See docs/security/CORS.md. */}
+      {inventory.cors?.allowAll && (
+        <div
+          data-testid="cors-wildcard-banner"
+          role="alert"
+          className="flex items-start gap-3 rounded-lg border border-amber-500/40 bg-amber-500/10 px-4 py-3 text-amber-700 dark:text-amber-300"
+        >
+          <span className="material-symbols-outlined text-[20px] mt-0.5" aria-hidden="true">
+            warning
+          </span>
+          <div className="flex flex-col gap-1">
+            <p className="font-semibold">{t("authz.cors.wildcard.title")}</p>
+            <p className="text-sm">{t("authz.cors.wildcard.desc")}</p>
+          </div>
+        </div>
+      )}
+
       {/* Bypass policy editor */}
       <Card>
         <div className="flex items-center gap-3 mb-4">
@@ -296,7 +345,7 @@ export default function AuthzSection() {
                     onClick={() => handleRemovePrefix(prefix)}
                     disabled={locked || submitting}
                   >
-                    Remove
+                    {t("authz.remove")}
                   </Button>
                 </li>
               );

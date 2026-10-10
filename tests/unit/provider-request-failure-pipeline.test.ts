@@ -21,9 +21,12 @@ const { clearInflight } = await import("../../open-sse/services/requestDedup.ts"
 const { resetAll: resetAccountSemaphores } =
   await import("../../open-sse/services/accountSemaphore.ts");
 const { clearModelLock } = await import("../../open-sse/services/accountFallback.ts");
-const { getCallLogs, getCallLogById } = await import("../../src/lib/usage/callLogs.ts");
+const { getCallLogs, getCallLogById, waitForCallLogSaves } =
+  await import("../../src/lib/usage/callLogs.ts");
 const { handleChatCore } = await import("../../open-sse/handlers/chatCore.ts");
 const { resetPayloadRulesConfigForTests } = await import("../../open-sse/services/payloadRules.ts");
+const { CLAUDE_CODE_COMPATIBLE_REDACT_THINKING_BETA, CONTEXT_1M_BETA_HEADER } =
+  await import("../../open-sse/services/claudeCodeCompatible.ts");
 
 const originalFetch = globalThis.fetch;
 
@@ -59,6 +62,11 @@ async function resetStorage() {
   clearIdempotency();
   clearInflight();
   clearModelLock();
+  // Call-log persistence is fire-and-forget and the first cold artifact-worker
+  // spawn can take ~2.4s, so this test's saves may still be in flight when the
+  // next test resets the DB. Drain so a late row cannot land in the next test's
+  // fresh database and get picked up by its waitFor(getLatestCallLog()) (#12780).
+  await waitForCallLogSaves(10_000);
   core.resetDbInstance();
   // A full reset must also drop the settings read-cache. Otherwise the cached
   // value (e.g. call_log_pipeline_enabled=true seeded earlier) survives the DB
@@ -66,7 +74,7 @@ async function resetStorage() {
   // under load this cache is evicted at unpredictable times, so tests that rely
   // on the stale cache flake. Make the reset honest and deterministic here.
   invalidateDbCache("settings");
-  fs.rmSync(TEST_DATA_DIR, { recursive: true, force: true });
+  fs.rmSync(TEST_DATA_DIR, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
   fs.mkdirSync(TEST_DATA_DIR, { recursive: true });
 }
 
@@ -83,7 +91,6 @@ test.afterEach(async () => {
   globalThis.fetch = originalFetch;
   clearPendingRequests();
   resetAccountSemaphores();
-  await waitForAsyncSideEffects();
   await resetStorage();
 });
 
@@ -92,7 +99,7 @@ test.after(async () => {
   clearPendingRequests();
   resetAccountSemaphores();
   await resetStorage();
-  fs.rmSync(TEST_DATA_DIR, { recursive: true, force: true });
+  fs.rmSync(TEST_DATA_DIR, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
 });
 
 test("network failure persisted call log includes providerRequest in pipeline payloads", async () => {
@@ -122,8 +129,8 @@ test("network failure persisted call log includes providerRequest in pipeline pa
   assert.equal(result.success, false);
   assert.equal(result.status, 502);
 
-  await waitForAsyncSideEffects();
-
+  // waitFor below polls for the exact DB state with 25ms intervals — no
+  // unreliable fixed-delay timer needed, even under CI load contention.
   const detail = await waitFor(getLatestCallLog);
   assert.ok(detail, "expected a call log to be persisted");
 
@@ -157,7 +164,7 @@ test("network failure persisted call log includes providerRequest in pipeline pa
 
 test("network timeout persisted call log includes providerRequest in pipeline payloads", async () => {
   const { getExecutor } = await import("../../open-sse/executors/index.ts");
-  const executor = getExecutor("openai");
+  const executor = await getExecutor("openai");
   const originalGetTimeoutMs = executor.getTimeoutMs?.bind(executor);
   executor.getTimeoutMs = () => 200;
 
@@ -186,7 +193,6 @@ test("network timeout persisted call log includes providerRequest in pipeline pa
     } as any);
 
     const result = await invocation;
-    await waitForAsyncSideEffects();
 
     assert.equal(result.success, false);
     assert.ok(result.status === 504, `expected 504 timeout, got ${result.status}`);
@@ -242,8 +248,6 @@ test("provider error response (HTTP 502) includes both providerRequest and provi
   assert.equal(result.success, false);
   assert.equal(result.status, 502);
 
-  await waitForAsyncSideEffects();
-
   const detail = await waitFor(getLatestCallLog);
   assert.ok(detail, "expected a call log to be persisted");
 
@@ -286,7 +290,11 @@ test("successful response includes both providerRequest and providerResponse in 
       }),
       {
         status: 200,
-        headers: { "Content-Type": "application/json" },
+        headers: {
+          "Content-Type": "application/json",
+          "cf-ray": "response-ray",
+          server: "cloudflare",
+        },
       }
     );
   };
@@ -306,8 +314,6 @@ test("successful response includes both providerRequest and providerResponse in 
 
   assert.equal(result.success, true);
 
-  await waitForAsyncSideEffects();
-
   const detail = await waitFor(getLatestCallLog);
   assert.ok(detail, "expected a call log to be persisted");
 
@@ -317,4 +323,264 @@ test("successful response includes both providerRequest and providerResponse in 
     detail.pipelinePayloads.providerResponse,
     "providerResponse must be present on success"
   );
+  assert.equal(
+    detail.pipelinePayloads.providerRequest.headers["cf-ray"],
+    undefined,
+    "providerRequest headers must not be overwritten with upstream response headers"
+  );
+  assert.equal(
+    detail.pipelinePayloads.providerRequest.headers.server,
+    undefined,
+    "providerRequest headers must not include upstream response server header"
+  );
+  assert.equal(detail.pipelinePayloads.providerRequest.headers.Accept, "application/json");
+  assert.equal(detail.pipelinePayloads.providerRequest.headers["Content-Type"], "application/json");
+  assert.equal(detail.pipelinePayloads.providerRequest.headers.Authorization, "[REDACTED]");
+});
+
+test("streaming response preserves request headers in providerRequest pipeline payload", async () => {
+  const body = {
+    model: "gpt-4o-mini",
+    stream: true,
+    messages: [{ role: "user", content: "hello" }],
+  };
+
+  const upstreamPayload = [
+    `data: ${JSON.stringify({
+      id: "chatcmpl-stream",
+      object: "chat.completion.chunk",
+      model: "gpt-4o-mini",
+      choices: [{ index: 0, delta: { role: "assistant", content: "world" } }],
+    })}`,
+    "",
+    `data: ${JSON.stringify({
+      id: "chatcmpl-stream",
+      object: "chat.completion.chunk",
+      model: "gpt-4o-mini",
+      choices: [{ index: 0, delta: {}, finish_reason: "stop" }],
+      usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
+    })}`,
+    "",
+    "data: [DONE]",
+    "",
+  ].join("\n");
+
+  globalThis.fetch = async () => {
+    return new Response(upstreamPayload, {
+      status: 200,
+      headers: {
+        "Content-Type": "text/event-stream",
+        "cf-ray": "stream-response-ray",
+        server: "cloudflare",
+      },
+    });
+  };
+
+  const result = await handleChatCore({
+    body: structuredClone(body),
+    modelInfo: { provider: "openai", model: "gpt-4o-mini", extendedContext: false },
+    credentials: { apiKey: "sk-test", providerSpecificData: {} },
+    log: noopLog(),
+    clientRawRequest: {
+      endpoint: "/v1/chat/completions",
+      body: structuredClone(body),
+      headers: new Headers({ accept: "text/event-stream" }),
+    },
+    userAgent: "unit-test",
+  } as any);
+
+  assert.equal(result.success, true);
+  await result.response.text();
+
+  const detail = await waitFor(getLatestCallLog);
+  assert.ok(detail, "expected a call log to be persisted");
+  assert.ok(detail.pipelinePayloads, "expected pipeline payloads");
+
+  const providerRequest = detail.pipelinePayloads.providerRequest;
+  assert.ok(providerRequest, "providerRequest must be present on streaming success");
+  assert.equal(
+    providerRequest.headers["cf-ray"],
+    undefined,
+    "streaming providerRequest headers must not be response headers"
+  );
+  assert.equal(providerRequest.headers.server, undefined);
+  assert.equal(providerRequest.headers.Accept, "text/event-stream");
+  assert.equal(providerRequest.headers["Content-Type"], "application/json");
+  assert.equal(providerRequest.headers.Authorization, "[REDACTED]");
+});
+
+test("CC-compatible providerRequest log keeps request beta headers and summarized thinking body", async () => {
+  const body = {
+    model: "claude-opus-4-6",
+    messages: [{ role: "user", content: "hello" }],
+    stream: false,
+  };
+
+  const upstreamPayload = [
+    "event: message_start",
+    'data: {"type":"message_start","message":{"id":"msg_1","type":"message","role":"assistant","model":"claude-opus-4-6","usage":{"input_tokens":7,"output_tokens":0}}}',
+    "",
+    "event: content_block_start",
+    'data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}',
+    "",
+    "event: content_block_delta",
+    'data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"ok"}}',
+    "",
+    "event: message_delta",
+    'data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":1}}',
+    "",
+    "event: message_stop",
+    'data: {"type":"message_stop"}',
+    "",
+  ].join("\n");
+
+  globalThis.fetch = async () => {
+    return new Response(upstreamPayload, {
+      status: 200,
+      headers: {
+        "Content-Type": "text/event-stream",
+        "cf-ray": "cc-response-ray",
+        server: "cloudflare",
+      },
+    });
+  };
+
+  const result = await handleChatCore({
+    body: structuredClone(body),
+    modelInfo: {
+      provider: "anthropic-compatible-cc-test",
+      model: "claude-opus-4-6",
+      extendedContext: false,
+    },
+    credentials: {
+      apiKey: "sk-test",
+      providerSpecificData: {
+        baseUrl: "https://proxy.example.com",
+        requestDefaults: {
+          context1m: true,
+          redactThinking: true,
+          summarizeThinking: true,
+        },
+      },
+    },
+    log: noopLog(),
+    clientRawRequest: {
+      endpoint: "/v1/chat/completions",
+      body: structuredClone(body),
+      headers: new Headers({ accept: "application/json" }),
+    },
+    userAgent: "unit-test",
+  } as any);
+
+  assert.equal(result.success, true);
+  await result.response.json();
+
+  const detail = await waitFor(getLatestCallLog);
+  assert.ok(detail, "expected a call log to be persisted");
+  assert.ok(detail.pipelinePayloads, "expected pipeline payloads");
+
+  const providerRequest = detail.pipelinePayloads.providerRequest;
+  assert.ok(providerRequest, "providerRequest must be present on CC-compatible success");
+  assert.equal(providerRequest.headers["cf-ray"], undefined);
+  assert.equal(providerRequest.headers.server, undefined);
+  assert.equal(providerRequest.headers.Accept, "text/event-stream");
+  assert.match(providerRequest.headers["anthropic-beta"], new RegExp(CONTEXT_1M_BETA_HEADER));
+  assert.match(
+    providerRequest.headers["anthropic-beta"],
+    new RegExp(CLAUDE_CODE_COMPATIBLE_REDACT_THINKING_BETA)
+  );
+  assert.equal(providerRequest.body.thinking.display, "summarized");
+});
+
+// #3229: Antigravity's 400s are the diagnostic blind spot this projection exists to fill —
+// but Google's error envelope is arbitrary and may echo request content, so the call log must
+// receive the bounded classification INSTEAD of the response, not alongside it. The failure
+// this locks: reqLogger.logProviderResponse() populating providerResponse with the upstream
+// status text, response headers, and body before persistAttemptLogs() runs, which would make
+// any "safe wrapper" passed later silently lose to the raw one already in the pipeline.
+test("antigravity failure logs only the bounded validation diagnostic, never the upstream body", async () => {
+  const {
+    seedAntigravityIdeVersionCache,
+    seedAntigravityCliVersionCache,
+    clearAntigravityVersionCaches,
+  } = await import("../../open-sse/services/antigravityVersion.ts");
+  seedAntigravityIdeVersionCache("2026.04.17-test");
+  seedAntigravityCliVersionCache("2026.04.17-test");
+
+  const body = {
+    model: "gemini-2.5-flash",
+    stream: false,
+    messages: [{ role: "user", content: "hunting-prompt-secret" }],
+  };
+
+  globalThis.fetch = async () =>
+    new Response(
+      JSON.stringify({
+        error: {
+          code: 400,
+          status: "INVALID_ARGUMENT",
+          message:
+            "Invalid JSON payload received. functionDeclarations[0].parameters: unknown name additionalProperties near prompt-secret",
+          details: [{ toolArguments: "tool-secret", authorization: "Bearer credential-secret" }],
+        },
+      }),
+      {
+        status: 400,
+        statusText: "Bad Request account-project-secret",
+        headers: {
+          "Content-Type": "application/json",
+          "x-goog-project-id": "project-secret",
+        },
+      }
+    );
+
+  try {
+    const result = await handleChatCore({
+      body: structuredClone(body),
+      modelInfo: { provider: "antigravity", model: "gemini-2.5-flash", extendedContext: false },
+      credentials: { accessToken: "token", projectId: "project-1" },
+      log: noopLog(),
+      clientRawRequest: {
+        endpoint: "/v1/chat/completions",
+        body: structuredClone(body),
+        headers: new Headers({ accept: "application/json" }),
+      },
+      userAgent: "unit-test",
+    } as unknown as Parameters<typeof handleChatCore>[0]);
+
+    assert.equal(result.success, false);
+    assert.equal(result.status, 400);
+    // The client keeps the generic envelope: no upstream_details, no provider prose.
+    assert.equal(result.body?.upstream_details, undefined);
+    assert.doesNotMatch(
+      JSON.stringify(result.body ?? {}),
+      /prompt-secret|tool-secret|credential-secret|project-secret|additionalProperties/
+    );
+
+    await waitForAsyncSideEffects();
+
+    const detail = await waitFor(getLatestCallLog);
+    assert.ok(detail, "expected a call log to be persisted");
+    assert.ok(detail.pipelinePayloads, "expected pipeline payloads");
+
+    const providerResponse = detail.pipelinePayloads.providerResponse;
+    assert.ok(providerResponse, "providerResponse must carry the diagnostic");
+    assert.deepEqual(Object.keys(providerResponse).sort(), ["diagnostic", "timestamp"]);
+    assert.deepEqual(providerResponse.diagnostic, {
+      antigravityValidation: {
+        httpStatus: 400,
+        providerCode: 400,
+        providerStatus: "INVALID_ARGUMENT",
+        validationCategory: "tool_schema",
+        validationField: "tools",
+        schemaKeyword: "additionalProperties",
+      },
+    });
+    assert.doesNotMatch(
+      JSON.stringify(providerResponse),
+      /prompt-secret|tool-secret|credential-secret|project-secret|Bad Request|x-goog/
+    );
+  } finally {
+    clearAntigravityVersionCaches();
+  }
 });

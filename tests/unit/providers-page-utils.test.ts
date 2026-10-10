@@ -16,7 +16,7 @@ test("merged OAuth providers keep free-tier providers in the OAuth section", () 
   };
 
   const mockOauthProviders = { claude: { name: "Claude" } };
-  const mockFreeProviders = { "gemini-cli": { name: "Gemini CLI" } };
+  const mockFreeProviders = { qoder: { name: "Qoder" } };
 
   const entries = providerPageUtils.buildMergedOAuthProviderEntries(
     mockOauthProviders,
@@ -391,7 +391,7 @@ test("static catalog entries resolve local, search, audio, web-cookie and upstre
   const audioProvider = providerPageUtils.resolveDashboardProviderInfo("assemblyai");
   const awsPollyProvider = providerPageUtils.resolveDashboardProviderInfo("aws-polly");
   const webCookieProvider = providerPageUtils.resolveDashboardProviderInfo("grok-web");
-  const apiKeyProvider = providerPageUtils.resolveDashboardProviderInfo("glhf");
+  const apiKeyProvider = providerPageUtils.resolveDashboardProviderInfo("synthetic");
   const gitlabProvider = providerPageUtils.resolveDashboardProviderInfo("gitlab");
   const gitlabDuoProvider = providerPageUtils.resolveDashboardProviderInfo("gitlab-duo");
   const chutesProvider = providerPageUtils.resolveDashboardProviderInfo("chutes");
@@ -430,14 +430,13 @@ test("static catalog entries resolve local, search, audio, web-cookie and upstre
   assert.equal(searchProvider?.name, providers.SEARCH_PROVIDERS["brave-search"].name);
   assert.equal(youcomSearchProvider?.category, "search");
   assert.equal(youcomSearchProvider?.name, providers.SEARCH_PROVIDERS["youcom-search"].name);
-
   assert.equal(audioProvider?.category, "audio");
   assert.equal(audioProvider?.name, providers.AUDIO_ONLY_PROVIDERS.assemblyai.name);
   assert.equal(awsPollyProvider?.category, "audio");
   assert.equal(awsPollyProvider?.name, providers.AUDIO_ONLY_PROVIDERS["aws-polly"].name);
 
   assert.equal(apiKeyProvider?.category, "apikey");
-  assert.equal(apiKeyProvider?.name, providers.APIKEY_PROVIDERS.glhf.name);
+  assert.equal(apiKeyProvider?.name, providers.APIKEY_PROVIDERS.synthetic.name);
   assert.equal(gitlabProvider?.category, "apikey");
   assert.equal(gitlabProvider?.name, providers.APIKEY_PROVIDERS.gitlab.name);
   assert.equal(gitlabDuoProvider?.category, "oauth");
@@ -500,9 +499,8 @@ test("static catalog entries resolve local, search, audio, web-cookie and upstre
 
 test("managed provider connection ids include supported static categories and exclude upstream proxy", () => {
   assert.equal(providerCatalog.isManagedProviderConnectionId("qoder"), true);
-  assert.equal(providerCatalog.isManagedProviderConnectionId("glhf"), true);
+  assert.equal(providerCatalog.isManagedProviderConnectionId("synthetic"), true);
   assert.equal(providerCatalog.isManagedProviderConnectionId("gitlab"), true);
-  assert.equal(providerCatalog.isManagedProviderConnectionId("cablyai"), true);
   assert.equal(providerCatalog.isManagedProviderConnectionId("thebai"), true);
   assert.equal(providerCatalog.isManagedProviderConnectionId("fenayai"), true);
   assert.equal(providerCatalog.isManagedProviderConnectionId("chutes"), true);
@@ -559,10 +557,9 @@ test("grok-web taxonomy stays web-cookie only and does not leak into api-key ent
   assert.equal("blackbox-web" in providers.WEB_COOKIE_PROVIDERS, true);
   assert.equal("muse-spark-web" in providers.APIKEY_PROVIDERS, false);
   assert.equal("muse-spark-web" in providers.WEB_COOKIE_PROVIDERS, true);
-  assert.equal("glhf" in providers.APIKEY_PROVIDERS, true);
+  assert.equal("synthetic" in providers.APIKEY_PROVIDERS, true);
   assert.equal("gitlab" in providers.APIKEY_PROVIDERS, true);
   assert.equal("gitlab-duo" in providers.OAUTH_PROVIDERS, true);
-  assert.equal("cablyai" in providers.APIKEY_PROVIDERS, true);
   assert.equal("thebai" in providers.APIKEY_PROVIDERS, true);
   assert.equal("fenayai" in providers.APIKEY_PROVIDERS, true);
   assert.equal("chutes" in providers.APIKEY_PROVIDERS, true);
@@ -618,15 +615,11 @@ test("grok-web taxonomy stays web-cookie only and does not leak into api-key ent
     false
   );
   assert.equal(
-    apiKeyEntries.some((entry) => entry.providerId === "glhf"),
+    apiKeyEntries.some((entry) => entry.providerId === "synthetic"),
     true
   );
   assert.equal(
     apiKeyEntries.some((entry) => entry.providerId === "gitlab"),
-    true
-  );
-  assert.equal(
-    apiKeyEntries.some((entry) => entry.providerId === "cablyai"),
     true
   );
   assert.equal(
@@ -748,6 +741,7 @@ test("compatible catalog entries keep dynamic compatible metadata", () => {
         type: "openai-compatible",
         apiType: "responses",
         baseUrl: "https://example.test",
+        iconUrl: "https://cdn.example.com/icons/lab.png",
       },
       compatibleLabels: {
         ccCompatibleName: "CC Compatible",
@@ -762,6 +756,8 @@ test("compatible catalog entries keep dynamic compatible metadata", () => {
   assert.equal(compatibleProvider?.toggleAuthType, "apikey");
   assert.equal(compatibleProvider?.apiType, "responses");
   assert.equal(compatibleProvider?.baseUrl, "https://example.test");
+  // #2166: custom remote icon URL passthrough.
+  assert.equal(compatibleProvider?.iconUrl, "https://cdn.example.com/icons/lab.png");
 });
 
 test("model search filter matches providers by model id", async () => {
@@ -1015,10 +1011,16 @@ test("buildCompatibleProviderGroups partitions nodes by type + claude-code prefi
 
   const groups = providerPageUtils.buildCompatibleProviderGroups(
     [
-      { id: "my-oai", name: "My OAI", type: "openai-compatible", apiType: "responses" },
+      {
+        id: "my-oai",
+        name: "My OAI",
+        type: "openai-compatible",
+        apiType: "responses",
+        iconUrl: "https://cdn.example.com/icons/my-oai.png",
+      },
       { id: "my-anthropic", name: "My Claude", type: "anthropic-compatible" },
       { id: "anthropic-compatible-cc-acme", name: "Acme CC", type: "anthropic-compatible" },
-      { id: "ignored-node", name: "Ignored", type: "gemini-cli" },
+      { id: "ignored-node", name: "Ignored", type: "unsupported-provider" },
       // name omitted → falls back to the provided label
       { id: "anon-oai", type: "openai-compatible" },
     ],
@@ -1037,6 +1039,14 @@ test("buildCompatibleProviderGroups partitions nodes by type + claude-code prefi
     "missing name falls back to the openai-compatible label"
   );
 
+  // #2166: custom remote icon URL passthrough.
+  assert.equal(
+    groups.openai[0].iconUrl,
+    "https://cdn.example.com/icons/my-oai.png",
+    "iconUrl is preserved for nodes that set it"
+  );
+  assert.equal(groups.openai[1].iconUrl, undefined, "iconUrl is undefined when the node has none");
+
   assert.deepEqual(
     groups.anthropic.map((p) => p.id),
     ["my-anthropic"],
@@ -1047,5 +1057,100 @@ test("buildCompatibleProviderGroups partitions nodes by type + claude-code prefi
     groups.claudeCode.map((p) => p.id),
     ["anthropic-compatible-cc-acme"],
     "anthropic-compatible nodes with the cc- prefix land in the claudeCode bucket"
+  );
+});
+
+test("connectionMatchesProviderCard counts a dual-auth provider's PAT (apikey) connection on its OAuth card", () => {
+  const { connectionMatchesProviderCard } = providerPageUtils;
+
+  // qoder is OAuth-categorized but its working auth is a PAT (authType "apikey").
+  // Regression: the OAuth card must count the PAT connection, else the dashboard
+  // shows a connected qoder as "not connected".
+  assert.equal(
+    connectionMatchesProviderCard({ provider: "qoder", authType: "apikey" }, "qoder", "oauth"),
+    true
+  );
+  assert.equal(
+    connectionMatchesProviderCard({ provider: "kiro", authType: "api_key" }, "kiro", "oauth"),
+    true
+  );
+  assert.equal(
+    connectionMatchesProviderCard({ provider: "qoder", authType: "oauth" }, "qoder", "oauth"),
+    true
+  );
+  assert.equal(
+    connectionMatchesProviderCard(
+      { provider: "muse-code", authType: "apikey" },
+      "muse-code",
+      "oauth"
+    ),
+    true
+  );
+  // A normal OAuth-only provider must NOT count an apikey connection on its OAuth card.
+  assert.equal(
+    connectionMatchesProviderCard({ provider: "claude", authType: "apikey" }, "claude", "oauth"),
+    false
+  );
+  assert.equal(
+    connectionMatchesProviderCard({ provider: "claude", authType: "oauth" }, "claude", "oauth"),
+    true
+  );
+
+  // Provider mismatch and the "free" card (counts everything) behave as expected.
+  assert.equal(
+    connectionMatchesProviderCard({ provider: "openai", authType: "apikey" }, "qoder", "oauth"),
+    false
+  );
+  assert.equal(
+    connectionMatchesProviderCard({ provider: "qoder", authType: "apikey" }, "qoder", "free"),
+    true
+  );
+
+  // Defensive: a null/undefined connection must not throw (gemini-code-assist).
+  assert.equal(connectionMatchesProviderCard(null, "qoder", "oauth"), false);
+  assert.equal(connectionMatchesProviderCard(undefined, "qoder", "oauth"), false);
+});
+
+test("unified xAI OAuth card includes canonical and legacy connection provider IDs", () => {
+  const {
+    buildStaticProviderEntries,
+    connectionBelongsToProviderPage,
+    connectionMatchesProviderCard,
+    resolveProviderOAuthBackendId,
+  } = providerPageUtils;
+  const connections = [
+    { provider: "xai", authType: "apikey" },
+    { provider: "xai-oauth", authType: "oauth" },
+    { provider: "xao", authType: "oauth" },
+  ];
+
+  assert.deepEqual(
+    connections
+      .filter((connection) => connectionBelongsToProviderPage(connection.provider, "xai"))
+      .map((connection) => connection.provider),
+    ["xai", "xai-oauth", "xao"]
+  );
+  assert.deepEqual(
+    connections
+      .filter((connection) => connectionMatchesProviderCard(connection, "xai", "oauth"))
+      .map((connection) => connection.provider),
+    ["xai", "xai-oauth", "xao"]
+  );
+  assert.equal(resolveProviderOAuthBackendId("xai", providers.APIKEY_PROVIDERS.xai), "xai-oauth");
+  assert.equal(
+    resolveProviderOAuthBackendId("openai", providers.APIKEY_PROVIDERS.openai),
+    "openai"
+  );
+  assert.equal(providers.OAUTH_PROVIDERS["xai-oauth"].hiddenFromDashboard, true);
+  assert.equal(providers.supportsDualAuthProvider("xai"), true);
+
+  const emptyStats = () => ({ total: 0 });
+  assert.ok(
+    buildStaticProviderEntries("apikey", emptyStats).some((entry) => entry.providerId === "xai")
+  );
+  assert.ok(
+    !buildStaticProviderEntries("oauth", emptyStats).some(
+      (entry) => entry.providerId === "xai-oauth"
+    )
   );
 });

@@ -28,7 +28,19 @@ export async function getOrCreateApiKey(tool: string): Promise<string> {
     // operator-facing signal.
     throw new ServiceApiKeyDecryptError(tool);
   }
-  const key = generateServiceApiKey(tool === "9router" ? "nr" : "cp");
+  // Dario reuses this mechanism to generate+persist its DARIO_ADMIN_TOKEN
+  // (any long random string works — it gates the /admin/* control plane).
+  const prefix =
+    tool === "9router"
+      ? "nr"
+      : tool === "mux"
+        ? "mx"
+        : tool === "dario"
+          ? "da"
+          : tool === "openwa"
+            ? "ow"
+            : "cp";
+  const key = generateServiceApiKey(prefix);
   await updateServiceField(tool, "apiKey", encrypt(key) ?? key);
   return key;
 }

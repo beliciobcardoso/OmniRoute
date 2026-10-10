@@ -27,11 +27,12 @@ import path from "node:path";
 
 process.env.DATA_DIR = fs.mkdtempSync(path.join(os.tmpdir(), "omniroute-codex-quota-"));
 
-const { getExecutor } = await import("../../open-sse/executors/index.ts");
+const { getCredentialRefreshExecutor } =
+  await import("../../open-sse/executors/credential.ts");
 const { refreshAndUpdateCredentials } = await import("../../src/lib/usage/providerLimits.ts");
 
 test("codex: quota-sync must NOT proactively rotate the refresh_token (Auth0 family-revocation cascade guard)", async () => {
-  const exec = getExecutor("codex");
+  const exec = await getCredentialRefreshExecutor("codex");
   const origNeeds = exec.needsRefresh;
   const origRefresh = exec.refreshCredentials;
   let refreshCalls = 0;
@@ -68,12 +69,16 @@ test("codex: quota-sync must NOT proactively rotate the refresh_token (Auth0 fam
 });
 
 test("non-rotating OAuth provider is still refreshed proactively from quota-sync (gate is not over-broad)", async () => {
-  const exec = getExecutor("cursor");
+  const exec = await getCredentialRefreshExecutor("cursor");
   const origNeeds = exec.needsRefresh;
   const origRefresh = exec.refreshCredentials;
   let refreshCalls = 0;
   exec.needsRefresh = () => true;
-  // null -> non-github -> surfaces a 401; proves the refresh was actually attempted.
+  // Refresh returns null with no usable access token left -> surfaces a 401;
+  // proves the refresh was actually attempted (the codex no-rotate gate did not
+  // block this non-rotating provider). Note: since #4786 a *present* accessToken
+  // would gracefully fall back for any OAuth provider, so we leave it empty here
+  // to keep the 401-throw branch reachable and the gate assertion meaningful.
   exec.refreshCredentials = async () => {
     refreshCalls++;
     return null;
@@ -83,7 +88,7 @@ test("non-rotating OAuth provider is still refreshed proactively from quota-sync
       refreshAndUpdateCredentials({
         id: "cursor-1",
         provider: "cursor",
-        accessToken: "a",
+        accessToken: "",
         refreshToken: "r",
         tokenExpiresAt: new Date(2000).toISOString(),
         providerSpecificData: {},

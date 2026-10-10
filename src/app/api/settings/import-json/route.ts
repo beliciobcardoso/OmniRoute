@@ -1,10 +1,13 @@
 import { NextResponse } from "next/server";
 import { getDbInstance } from "@/lib/db/core";
 import { backupDbFile } from "@/lib/db/backup";
+import { clearApiKeyCaches } from "@/lib/db/apiKeys";
+import { invalidateDbCache } from "@/lib/db/readCache";
 import { isAuthRequired, isAuthenticated } from "@/shared/utils/apiAuth";
 import { runJsonMigration, type LegacyJsonData } from "@/lib/db/jsonMigration";
 import { getSettings } from "@/lib/db/settings";
 import { setSystemPromptConfig } from "@omniroute/open-sse/services/systemPrompt.ts";
+import { sanitizeErrorMessage } from "@omniroute/open-sse/utils/error";
 
 /**
  * POST /api/settings/import-json
@@ -66,6 +69,8 @@ export async function POST(request: Request) {
 
     // Delegate the actual migration to the shared helper (avoids duplication with core.ts)
     const counts = runJsonMigration(db, data);
+    clearApiKeyCaches();
+    invalidateDbCache();
 
     // Re-hydrate the in-memory Global System Prompt config — the migration writes it to
     // the DB but the in-memory state would stay stale until a restart otherwise (#2470).
@@ -88,6 +93,9 @@ export async function POST(request: Request) {
     });
   } catch (err) {
     console.error("[API] Error importing JSON backup:", err);
-    return NextResponse.json({ error: (err as Error).message }, { status: 500 });
+    return NextResponse.json(
+      { error: sanitizeErrorMessage(err instanceof Error ? err.message : String(err)) },
+      { status: 500 }
+    );
   }
 }

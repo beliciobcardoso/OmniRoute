@@ -1,3 +1,5 @@
+import { hasUnsafeModelIdSyntax } from "../utils/modelIdSafety.ts";
+
 /**
  * Rerank Provider Registry
  *
@@ -50,11 +52,15 @@ export const RERANK_PROVIDERS = {
     ],
   },
 
+  // Voyage AI is NOT Cohere-compatible: uses `top_k` (not `top_n`), rejects empty-string
+  // documents, and returns `{data:[{relevance_score,index}]}` instead of `{results:[…]}`.
+  // The `voyage` format adapter in open-sse/handlers/rerank.ts handles both directions (#7809).
   "voyage-ai": {
     id: "voyage-ai",
     baseUrl: "https://api.voyageai.com/v1/rerank",
     authType: "apikey",
     authHeader: "bearer",
+    format: "voyage",
     models: [
       { id: "rerank-2.5", name: "Rerank 2.5" },
       { id: "rerank-2.5-lite", name: "Rerank 2.5 Lite" },
@@ -67,8 +73,61 @@ export const RERANK_PROVIDERS = {
     authType: "apikey",
     authHeader: "bearer",
     models: [
+      { id: "jina-reranker-v3.5", name: "Jina Reranker v3.5" },
       { id: "jina-reranker-v3", name: "Jina Reranker v3" },
       { id: "jina-reranker-m0", name: "Jina Reranker m0" },
+      { id: "jina-reranker-v2-base-multilingual", name: "Jina Reranker v2 Base Multilingual" },
+    ],
+  },
+
+  // SiliconFlow rerank is Cohere-compatible (POST /v1/rerank, {model,query,documents}). The
+  // reranker models arrive in /v1/models via live model-sync; without this entry the rerank
+  // router rejected them with "Invalid rerank model" (#5332). Model IDs keep their vendor slash
+  // (e.g. "Qwen/Qwen3-Reranker-8B") — parseRerankModel splits on the FIRST slash, so it's safe.
+  siliconflow: {
+    id: "siliconflow",
+    baseUrl: "https://api.siliconflow.com/v1/rerank",
+    authType: "apikey",
+    authHeader: "bearer",
+    models: [
+      { id: "Qwen/Qwen3-Reranker-8B", name: "Qwen3 Reranker 8B" },
+      { id: "Qwen/Qwen3-Reranker-4B", name: "Qwen3 Reranker 4B" },
+      { id: "Qwen/Qwen3-Reranker-0.6B", name: "Qwen3 Reranker 0.6B" },
+      { id: "BAAI/bge-reranker-v2-m3", name: "BGE Reranker v2 m3" },
+    ],
+  },
+
+  // OpenRouter exposes a separate, Cohere-compatible POST /api/v1/rerank endpoint
+  // (not surfaced by its live /v1/models feed, which contains 0 rerank ids — confirmed
+  // by direct curl). Model IDs keep their vendor slash (e.g. "cohere/rerank-4-pro");
+  // parseRerankModel splits on the FIRST slash, so 3-segment ids resolve safely, same
+  // as siliconflow above. Seeded by hand and must be maintained here as OpenRouter adds
+  // more rerank models (#6574).
+  openrouter: {
+    id: "openrouter",
+    baseUrl: "https://openrouter.ai/api/v1/rerank",
+    authType: "apikey",
+    authHeader: "bearer",
+    models: [
+      { id: "cohere/rerank-4-pro", name: "Cohere Rerank 4 Pro (via OpenRouter)" },
+      { id: "cohere/rerank-4-fast", name: "Cohere Rerank 4 Fast (via OpenRouter)" },
+      { id: "cohere/rerank-v3.5", name: "Cohere Rerank v3.5 (via OpenRouter)" },
+    ],
+  },
+
+  // DeepInfra rerank is NOT Cohere-shaped: POST /v1/inference/<MODEL> with {queries:[q],documents}
+  // returning {scores:[…]} (one score per document, positional). The `deepinfra` format adapter in
+  // open-sse/handlers/rerank.ts builds the per-model URL and maps scores → Cohere results (#5332).
+  deepinfra: {
+    id: "deepinfra",
+    baseUrl: "https://api.deepinfra.com/v1/inference",
+    authType: "apikey",
+    authHeader: "bearer",
+    format: "deepinfra",
+    models: [
+      { id: "Qwen/Qwen3-Reranker-8B", name: "Qwen3 Reranker 8B" },
+      { id: "Qwen/Qwen3-Reranker-4B", name: "Qwen3 Reranker 4B" },
+      { id: "Qwen/Qwen3-Reranker-0.6B", name: "Qwen3 Reranker 0.6B" },
     ],
   },
 };
@@ -111,7 +170,7 @@ export function getRerankProvider(providerId) {
  * Returns { provider, model }
  */
 export function parseRerankModel(modelStr) {
-  if (!modelStr) return { provider: null, model: null };
+  if (!modelStr || hasUnsafeModelIdSyntax(modelStr)) return { provider: null, model: null };
 
   const slashIdx = modelStr.indexOf("/");
   if (slashIdx > 0) {
@@ -160,4 +219,30 @@ export function getAllRerankModels() {
     }
   }
   return models;
+}
+
+/**
+ * Derive a Cohere-compatible rerank config for a chat provider that has NO
+ * curated RERANK_PROVIDERS entry. Works for any registry provider whose base
+ * URL ends in /chat/completions by swapping that suffix for /rerank (groq,
+ * mistral, vercel-ai-gateway, ...). Dynamic-URL providers (no usable static
+ * base, e.g. dynamic account-scoped hosts) derive to null — they need bespoke
+ * URL handling.
+ *
+ * This is a FALLBACK only: callers must check getRerankProvider() first so
+ * curated entries keep their specialized configuration and format adapters.
+ */
+export function deriveRerankProviderForChatProvider(providerId, chatEntry) {
+  if (!chatEntry) return null;
+  const rawBase = Array.isArray(chatEntry.baseUrl) ? chatEntry.baseUrl[0] : chatEntry.baseUrl;
+  if (!rawBase || typeof rawBase !== "string") return null;
+  const base = rawBase.replace(/\/+$/, "");
+  if (!base.endsWith("/chat/completions")) return null;
+  return {
+    id: providerId,
+    baseUrl: `${base.slice(0, -"/chat/completions".length)}/rerank`,
+    authType: "apikey",
+    authHeader: "bearer",
+    models: [],
+  };
 }

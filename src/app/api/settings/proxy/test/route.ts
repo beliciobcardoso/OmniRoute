@@ -1,16 +1,21 @@
 import { request as undiciRequest } from "undici";
 import {
   createProxyDispatcher,
+  isRelayType,
   isSocks5ProxyEnabled,
   proxyConfigToUrl,
   proxyUrlForLogs,
 } from "@omniroute/open-sse/utils/proxyDispatcher.ts";
+import { probeEchoTargets } from "@/lib/proxyEchoTarget";
 import { testProxySchema } from "@/shared/validation/schemas";
 import { isValidationFailure, validateBody } from "@/shared/validation/helpers";
 import { createErrorResponse, createErrorResponseFromUnknown } from "@/lib/api/errorResponse";
-import { getProxyById } from "@/lib/localDb";
+
+import { extractRelayAuth, getProxyById } from "@/lib/db/proxies";
 import { requireManagementAuth } from "@/lib/api/requireManagementAuth";
 import { sanitizeErrorMessage } from "@omniroute/open-sse/utils/error";
+import { buildRelayTestResult } from "./relayTestResult";
+import { recordRelayProbe } from "@/lib/db/relayProbeStats";
 
 const BASE_SUPPORTED_PROXY_TYPES = new Set(["http", "https"]);
 
@@ -84,18 +89,17 @@ export async function POST(request: Request) {
 
     const proxyType = String(proxy.type || "http").toLowerCase();
 
-    // Vercel Relay: test by hitting ipify via the relay headers
-    if (proxyType === "vercel") {
+    // Relay proxies (Vercel / Deno / Cloudflare): test by hitting ipify via the
+    // relay headers. All three share the same x-relay-* header contract; the
+    // only difference is the deployed edge target (#5128 — Deno/Cloudflare were
+    // previously rejected here as unsupported proxy types).
+    if (isRelayType(proxyType)) {
       const relayHost = proxy.host;
-      // relayAuth lives in notes JSON: { relayAuth } stored by the vercel-deploy route.
-      // proxy.password is empty for relay entries; parse notes instead.
-      let relayAuth = "";
-      if (dbProxyNotes) {
-        try {
-          const parsed = JSON.parse(dbProxyNotes) as { relayAuth?: string };
-          relayAuth = parsed.relayAuth ?? "";
-        } catch {}
-      }
+      // relayAuth lives in notes JSON, written by the deploy routes as either a
+      // plaintext { relayAuth } or, on installs with STORAGE_ENCRYPTION_KEY, an
+      // encrypted { relayAuthEnc }. extractRelayAuth handles both (#5128 — the
+      // encrypted form was previously ignored, leaving relayAuth empty → 401).
+      let relayAuth = extractRelayAuth(dbProxyNotes) ?? "";
       // Fallback: ad-hoc callers may pass relayAuth in the password field
       if (!relayAuth) relayAuth = proxy.password ?? "";
       const relayUrl = `https://${relayHost}`;
@@ -120,19 +124,37 @@ export async function POST(request: Request) {
         try {
           parsedIp = JSON.parse(text) as { ip?: string };
         } catch {}
-        return Response.json({
-          success: res.statusCode === 200,
+        const relayResult = buildRelayTestResult({
+          statusCode: res.statusCode,
           publicIp: parsedIp.ip || null,
           latencyMs: Date.now() - start,
-          proxyUrl: relayUrl,
+          relayUrl,
+          relayAuthPresent: relayAuth.length > 0,
+          relayResponseHeaders: {
+            get: (name: string) => {
+              const value = res.headers[name.toLowerCase()];
+              return value === undefined ? null : String(value);
+            },
+          },
         });
+        // #5890: track relay probe outcomes so the dashboard can surface a
+        // relayTested / relayAlive pulse and flag an unhealthy sidecar backend.
+        recordRelayProbe(relayResult.success);
+        // #5716: a relay that *responds* non-200 (e.g. 401 auth mismatch) used to
+        // return `success:false` with no reason and no log — a silent failure.
+        if (!relayResult.success) {
+          console.warn(`[ProxyTest] relay ${relayHost}: ${relayResult.error}`);
+        }
+        return Response.json(relayResult);
       } catch (relayErr) {
+        const message =
+          relayErr instanceof Error && relayErr.name === "AbortError"
+            ? "Connection timeout (10s)"
+            : getErrorMessage(relayErr, "Relay test failed");
+        console.warn(`[ProxyTest] relay ${relayHost} request failed: ${message}`);
         return Response.json({
           success: false,
-          error:
-            relayErr instanceof Error && relayErr.name === "AbortError"
-              ? "Connection timeout (10s)"
-              : getErrorMessage(relayErr, "Relay test failed"),
+          error: message,
           latencyMs: Date.now() - start,
           proxyUrl: relayUrl,
         });
@@ -194,20 +216,28 @@ export async function POST(request: Request) {
     const publicProxyUrl = proxyUrlForLogs(proxyUrl);
 
     const startTime = Date.now();
-    const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), 10000);
     const dispatcher = createProxyDispatcher(proxyUrl);
 
     try {
-      const result = await undiciRequest("https://api64.ipify.org?format=json", {
-        method: "GET",
-        dispatcher,
-        signal: controller.signal,
-        headersTimeout: 10000,
-        bodyTimeout: 10000,
-      });
-
-      const responseText = await result.body.text();
+      // #9694: an IPv4-only SOCKS5/SSH tunnel has no route to the IPv6-first
+      // echo target and used to hang here until the deadline, reporting a
+      // healthy proxy as dead. Each target gets its own slice of the budget.
+      const { result: responseText } = await probeEchoTargets(async (url, timeoutMs) => {
+        const controller = new AbortController();
+        const timeout = setTimeout(() => controller.abort(), timeoutMs);
+        try {
+          const result = await undiciRequest(url, {
+            method: "GET",
+            dispatcher,
+            signal: controller.signal,
+            headersTimeout: timeoutMs,
+            bodyTimeout: timeoutMs,
+          });
+          return await result.body.text();
+        } finally {
+          clearTimeout(timeout);
+        }
+      }, 10000);
       let parsed: { ip?: string };
       try {
         const parsedJson = JSON.parse(responseText);
@@ -227,17 +257,18 @@ export async function POST(request: Request) {
         proxyUrl: publicProxyUrl,
       });
     } catch (fetchError) {
+      const message =
+        fetchError instanceof Error && fetchError.name === "AbortError"
+          ? "Connection timeout (10s)"
+          : getErrorMessage(fetchError, "Connection failed");
+      // #5716: surface the reason in server logs — a failing proxy test was silent.
+      console.warn(`[ProxyTest] ${proxyType} proxy ${publicProxyUrl} failed: ${message}`);
       return Response.json({
         success: false,
-        error:
-          fetchError instanceof Error && fetchError.name === "AbortError"
-            ? "Connection timeout (10s)"
-            : getErrorMessage(fetchError, "Connection failed"),
+        error: message,
         latencyMs: Date.now() - startTime,
         proxyUrl: publicProxyUrl,
       });
-    } finally {
-      clearTimeout(timeout);
     }
   } catch (error) {
     return createErrorResponseFromUnknown(error, "Unexpected server error");

@@ -5,29 +5,45 @@
 // dependency. Extracting them here unblocks moving the heavier modals
 // (AddApiKeyModal / EditConnectionModal) out of the god-component in later phases.
 import { LOCAL_PROVIDERS, isSelfHostedChatProvider } from "@/shared/constants/providers";
+import { MODAL_DEFAULT_VALIDATION_MODEL_ID } from "@/shared/constants/modal";
 import {
   MODEL_COMPAT_PROTOCOL_KEYS,
   type ModelCompatProtocolKey,
 } from "@/shared/constants/modelCompat";
+import { isHiddenForModality } from "@/shared/utils/modelVisibility";
 import {
   getClaudeCodeCompatibleRequestDefaults as _getClaudeCodeCompatibleRequestDefaults,
   getCodexRequestDefaults as _getCodexRequestDefaults,
   type CodexServiceTier,
 } from "@/lib/providers/requestDefaults";
 import { type CodexGlobalServiceMode } from "@/lib/providers/codexFastTier";
-import { type WebSessionCredentialRequirement } from "./webSessionCredentials";
 import { CC_COMPATIBLE_DEFAULT_CHAT_PATH } from "./providerDetailConstants";
+import { getRegistryEntry } from "@omniroute/open-sse/config/providerRegistry";
+import type { AlternateFormat } from "@omniroute/open-sse/config/providers/alternateFormats";
+import {
+  type ProviderMessageTranslator,
+  providerText,
+  getWebSessionCredentialLabel,
+  getWebSessionCredentialHint,
+  getWebSessionCredentialCheckLabel,
+  getAddCredentialModalTitle,
+} from "./providerCredentialText";
+
+// Re-exported for backward compatibility — these used to be defined here
+// (Issue #3501 strangler-fig home), but were extracted to providerCredentialText.ts
+// once this leaf hit its frozen file-size cap (#1904 own growth).
+export {
+  type ProviderMessageTranslator,
+  providerText,
+  getWebSessionCredentialLabel,
+  getWebSessionCredentialHint,
+  getWebSessionCredentialCheckLabel,
+  getAddCredentialModalTitle,
+};
 
 // ---------------------------------------------------------------------------
 // Types shared between page + modals
 // ---------------------------------------------------------------------------
-
-export type ProviderMessageTranslator = ((
-  key: string,
-  values?: Record<string, unknown>
-) => string) & {
-  has?: (key: string) => boolean;
-};
 
 export type LocalProviderMetadata = {
   name?: string;
@@ -37,14 +53,7 @@ export type LocalProviderMetadata = {
 
 export type CommandCodeAuthFlowState = {
   phase:
-    | "idle"
-    | "starting"
-    | "polling"
-    | "received"
-    | "applying"
-    | "applied"
-    | "expired"
-    | "error";
+    "idle" | "starting" | "polling" | "received" | "applying" | "applied" | "expired" | "error";
   state: string;
   authUrl: string;
   callbackUrl: string;
@@ -70,19 +79,26 @@ export type CompatByProtocolMap = Partial<
 export type CompatModelRow = {
   id?: string;
   name?: string;
+  /** optional registry aliases for display/import */ aliases?: readonly string[];
   source?: string;
   apiFormat?: string;
   supportedEndpoints?: string[];
   normalizeToolCallId?: boolean;
   preserveOpenAIDeveloperRole?: boolean;
   isHidden?: boolean;
+  /** #12172: per-modality visibility overrides (`{ chat: true }`) — see `isHiddenForModality`. */
+  hiddenModalities?: Record<string, boolean>;
   upstreamHeaders?: Record<string, string>;
   compatByProtocol?: CompatByProtocolMap;
   /** #2905: per-model upstream wire-format override. */ targetFormat?: string;
+  /** #4125: manual context-window override (tokens), when set. */ contextWindowOverride?: number;
+  /** #1904: manual vision-capability override for custom models whose upstream
+   * discovery metadata doesn't self-report an image input modality. */
+  supportsVision?: boolean;
+  isFree?: boolean;
 };
 
 export type CompatModelMap = Map<string, CompatModelRow>;
-
 export type HeaderDraftRow = { id: string; name: string; value: string };
 
 // ---------------------------------------------------------------------------
@@ -90,13 +106,11 @@ export type HeaderDraftRow = { id: string; name: string; value: string };
 // outside the .tsx). Returns the i18n key for a targetFormat value, or null when the
 // value is unknown (the caller then renders the raw value verbatim).
 // ---------------------------------------------------------------------------
-
 const TARGET_FORMAT_BADGE_I18N_KEYS: Record<string, string> = {
   openai: "compatProtocolOpenAI",
   "openai-responses": "compatProtocolOpenAIResponses",
   claude: "compatProtocolClaude",
   gemini: "targetFormatGemini",
-  "gemini-cli": "targetFormatGeminiCli",
   antigravity: "targetFormatAntigravity",
 };
 
@@ -104,33 +118,25 @@ export function targetFormatBadgeI18nKey(value: string): string | null {
   return TARGET_FORMAT_BADGE_I18N_KEYS[value] ?? null;
 }
 
-// ---------------------------------------------------------------------------
-// Utility — message translation with fallback
-// ---------------------------------------------------------------------------
-
-export function providerText(
-  t: ProviderMessageTranslator,
-  key: string,
-  fallback: string,
-  values?: Record<string, unknown>
-): string {
-  if (typeof t.has === "function" && t.has(key)) {
-    return t(key, values);
-  }
-  if (values) {
-    return Object.entries(values).reduce(
-      (acc, [name, value]) => acc.replaceAll(`{${name}}`, String(value)),
-      fallback
-    );
-  }
-  return fallback;
+/** #5442 — badge for add-credential validation; unsupported → neutral N/A (not red Invalid). */
+export function validationBadgeProps(result: string): {
+  variant: "success" | "error" | "info";
+  labelKey: string;
+  fallback: string;
+} {
+  if (result === "success") return { variant: "success", labelKey: "valid", fallback: "Valid" };
+  if (result === "unsupported")
+    return { variant: "info", labelKey: "notApplicable", fallback: "N/A" };
+  return { variant: "error", labelKey: "invalid", fallback: "Invalid" };
 }
 
 /** A single model's outcome from a `/api/models/test-all` response. */
 export interface TestAllModelOutcome {
   status: "ok" | "error";
+  isQuota?: boolean;
   shouldHide: boolean;
 }
+type TestAllEntryStatus = "ok" | "error" | "slow";
 
 /**
  * Decide a model's per-row test status (the green/red icon) and whether it should
@@ -143,30 +149,43 @@ export interface TestAllModelOutcome {
  * model failed (unlike the single-model ▶ test).
  *
  * Auto-hide policy: when `autoHideFailed` is on, only NON-TRANSIENT failures are
- * hidden. Transient failures (rate-limited, timeout) are surfaced as 'error' on
- * the row icon but NOT hidden, because:
- *   - The provider may have been temporarily throttled during a parallel batch
- *     (a single Test All across 10+ models routinely trips per-account rate
- *     limits on subscription-tier APIs).
- *   - The model itself is not broken — a retry seconds later would succeed.
- *   - Hidden state persists across server restarts and silently removes the
- *     model from `/v1/models`, so a transient blip turns into a permanent
- *     catalog gap that the user can only recover from by editing the DB or
- *     hand-toggling each row.
+ * hidden. Transient failures remain visible because the model may still be healthy
+ * and hidden state persists across restarts, removing it from `/v1/models`.
  *
  * Genuine failures (`status:"error"` without a transient flag — e.g. upstream
  * 400 "invalid model", schema mismatch, auth failure) ARE still auto-hidden,
  * which is the intended use of the toggle.
  */
 export function evaluateTestAllEntry(
-  entry: { status?: "ok" | "error"; rateLimited?: boolean; isTimeout?: boolean } | null | undefined,
+  entry:
+    | {
+        status?: TestAllEntryStatus;
+        rateLimited?: boolean;
+        isTimeout?: boolean;
+        isTransient?: boolean;
+        isQuota?: boolean;
+        skipped?: boolean;
+      }
+    | null
+    | undefined,
   autoHideFailed: boolean
 ): TestAllModelOutcome {
   const ok = entry?.status === "ok";
-  const transient = Boolean(entry?.rateLimited || entry?.isTimeout);
+  // #14780: a skipped probe (web-session provider) was never dispatched — keep it visible.
+  const transient = [
+    entry?.rateLimited,
+    entry?.isTimeout,
+    entry?.isTransient,
+    entry?.isQuota,
+    entry?.skipped,
+  ].some(Boolean);
   return {
     status: ok ? "ok" : "error",
-    // Hide only persistent failures. Transient (rate-limited, timeout) are
+    // #9511: quota errors (isQuota) are surfaced on the icon but kept visible
+    // so an evening Test All on a free-tier provider doesn't silently wipe the
+    // catalog for the next day.
+    ...(entry?.isQuota ? { isQuota: true } : {}),
+    // Hide only persistent failures. Transient (rate-limited, timeout, quota) are
     // surfaced on the icon but kept visible so a single throttled batch test
     // does not silently wipe the catalog.
     shouldHide: !ok && autoHideFailed && !transient,
@@ -215,24 +234,55 @@ export function readBooleanToggle(value: unknown, fallback: boolean): boolean {
 export const CONFIGURABLE_BASE_URL_PROVIDERS = new Set([
   "azure-openai",
   "azure-ai",
-  "bailian-coding-plan",
   "xiaomi-mimo",
   "siliconflow",
   "heroku",
   "databricks",
   "snowflake",
   "searxng-search",
+  "firecrawl",
   "petals",
+  "comfyui",
+  // #12704 — Modal is bring-your-own-deploy: every user runs their model on a
+  // unique endpoint (https://<workspace>--<app>.modal.run/v1), so there is no
+  // fixed host to preset. The server-side validator (src/lib/providers/
+  // validation.ts) requires providerSpecificData.baseUrl for modal, but the
+  // add-connection modal never exposed the field — connections could not be
+  // validated or saved at all. Expose the generic base-URL override
+  // affordance for this id (same mechanism as the kimi/moonshot case above).
+  "modal",
+  // #7447 — Moonshot/Kimi's international host (api.moonshot.ai) rejects
+  // CN-region keys (issued on platform.kimi.com/moonshot.cn — a separate
+  // account/keyspace). Neither "kimi" (legacy id) nor "moonshot" (current
+  // user-facing id) previously exposed a base-URL field at Add-connection
+  // time, so a CN-region user had no way to point a new connection at
+  // api.moonshot.cn. resolveBaseUrl()/buildUrl() already honor a
+  // providerSpecificData.baseUrl override generically — this only exposes
+  // the existing override affordance for these two ids.
+  "kimi",
+  "moonshot",
+  // Agnes CN-region keys (agnes-ai.cn) use a separate host from
+  // the international apihub.agnes-ai.com default. Same always-on field as
+  // #7447 Kimi/Moonshot so Add-connection can point at api.agnes-ai.cn.
+  "agnes",
 ]);
 
 export const DEFAULT_PROVIDER_BASE_URLS: Record<string, string> = {
   "azure-openai": "https://example-resource.openai.azure.com",
   "azure-ai": "https://example-resource.services.ai.azure.com/openai/v1",
-  "bailian-coding-plan": "https://coding-intl.dashscope.aliyuncs.com/apps/anthropic/v1",
-  "xiaomi-mimo": "https://token-plan-sgp.xiaomimimo.com/v1",
+  "bailian-coding-plan": "https://token-plan.ap-southeast-1.maas.aliyuncs.com/apps/anthropic/v1",
+  "xiaomi-mimo": "https://api.xiaomimimo.com/v1",
   siliconflow: "https://api.siliconflow.com/v1",
   "searxng-search": "http://localhost:8888/search",
+  firecrawl: "https://api.firecrawl.dev",
   petals: "https://chat.petals.dev/api/v1/generate",
+  comfyui: "http://localhost:8188",
+  // #7447 — default stays the international host so existing/new
+  // international Kimi/Moonshot users see the same prefilled value as
+  // before; a CN-region user overrides it (see placeholder hint below).
+  kimi: "https://api.moonshot.ai/v1",
+  moonshot: "https://api.moonshot.ai/v1",
+  agnes: "https://apihub.agnes-ai.com/v1",
 };
 
 export function getLocalProviderMetadata(providerId?: string | null) {
@@ -245,6 +295,35 @@ export function isBaseUrlConfigurableProvider(providerId?: string | null) {
     providerId &&
     (CONFIGURABLE_BASE_URL_PROVIDERS.has(providerId) || isSelfHostedChatProvider(providerId))
   );
+}
+
+/**
+ * #6147 — whether a built-in provider is eligible for an OPT-IN "Advanced →
+ * override base URL" affordance in the edit-connection modal.
+ *
+ * This does NOT widen the always-on base-URL field: providers already covered by
+ * `isBaseUrlConfigurableProvider` (the configurable set + self-hosted) keep their
+ * existing dedicated field and return `false` here. Every *other* provider id is
+ * eligible to opt in per-connection so an operator can hot-fix a broken built-in
+ * preset by pointing it at a custom endpoint. The field stays hidden until the
+ * user explicitly reveals it (or an override was already saved), so nothing is
+ * exposed by default. OAuth connections are excluded at the call site, since
+ * their save path does not persist `providerSpecificData.baseUrl`.
+ */
+export function isBaseUrlOverrideEligibleProvider(providerId?: string | null): boolean {
+  if (!providerId) return false;
+  if (isBaseUrlConfigurableProvider(providerId)) return false;
+  return true;
+}
+
+/**
+ * Alternate API protocols the provider declares in the registry (e.g. an
+ * Anthropic-compatible endpoint alongside the default OpenAI one). An empty list
+ * means the protocol selector stays hidden for this provider.
+ */
+export function getAlternateFormats(providerId?: string | null): AlternateFormat[] {
+  if (!providerId) return [];
+  return getRegistryEntry(providerId)?.alternateFormats ?? [];
 }
 
 export function getProviderBaseUrlDefault(providerId?: string | null) {
@@ -281,34 +360,47 @@ export function getProviderBaseUrlHint(
       return t ? t("snowflakeBaseUrlHint") : undefined;
     case "searxng-search":
       return t ? t("searxngBaseUrlHint") : undefined;
+    case "firecrawl":
+      return t ? t("firecrawlBaseUrlHint") : undefined;
     default:
       return undefined;
   }
 }
 
+// Literal placeholder examples keyed by provider id. Kept in a record instead
+// of a switch so the function stays under the complexity cap as ids are added.
+const BUILTIN_BASE_URL_PLACEHOLDER_EXAMPLES: Readonly<Record<string, string>> = {
+  "azure-openai": "https://my-resource.openai.azure.com",
+  siliconflow: "https://api.siliconflow.cn/v1",
+  heroku: "https://us.inference.heroku.com",
+  databricks: "https://adb-1234567890123456.7.azuredatabricks.net/serving-endpoints",
+  snowflake: "https://example-account.snowflakecomputing.com",
+  "searxng-search": "http://localhost:8888/search",
+  // #7447 — surfaces the CN-region alternative host as the placeholder
+  // example (mirrors the siliconflow.com/siliconflow.cn pattern above).
+  kimi: "https://api.moonshot.cn/v1",
+  moonshot: "https://api.moonshot.cn/v1",
+  agnes: "https://api.agnes-ai.cn/v1",
+  // #12704 — shows the Modal app URL shape the validator demands.
+  modal: "https://<workspace>--<app>.modal.run/v1",
+};
+
+// These ids have no literal example: the placeholder is their configured default URL.
+const DEFAULT_BASED_PLACEHOLDER_PROVIDERS = new Set([
+  "bailian-coding-plan",
+  "xiaomi-mimo",
+  "comfyui",
+  "firecrawl",
+]);
+
 export function getProviderBaseUrlPlaceholder(providerId?: string | null) {
   if (isSelfHostedChatProvider(providerId || "")) {
     return getProviderBaseUrlDefault(providerId);
   }
-  switch (providerId) {
-    case "azure-openai":
-      return "https://my-resource.openai.azure.com";
-    case "bailian-coding-plan":
-    case "xiaomi-mimo":
-      return getProviderBaseUrlDefault(providerId);
-    case "siliconflow":
-      return "https://api.siliconflow.cn/v1";
-    case "heroku":
-      return "https://us.inference.heroku.com";
-    case "databricks":
-      return "https://adb-1234567890123456.7.azuredatabricks.net/serving-endpoints";
-    case "snowflake":
-      return "https://example-account.snowflakecomputing.com";
-    case "searxng-search":
-      return "http://localhost:8888/search";
-    default:
-      return "";
-  }
+  const id = providerId || "";
+  const example = BUILTIN_BASE_URL_PLACEHOLDER_EXAMPLES[id];
+  if (example) return example;
+  return DEFAULT_BASED_PLACEHOLDER_PROVIDERS.has(id) ? getProviderBaseUrlDefault(providerId) : "";
 }
 
 export function isGlmProvider(providerId?: string | null) {
@@ -319,29 +411,9 @@ export function isGlmProvider(providerId?: string | null) {
 // Routing-tags / excluded-models parse + format
 // ---------------------------------------------------------------------------
 
-export function parseRoutingTagsInput(value: string): string[] | undefined {
-  const tags = Array.from(
-    new Set(
-      value
-        .split(",")
-        .map((tag) => tag.trim().toLowerCase())
-        .filter(Boolean)
-    )
-  );
-  return tags.length > 0 ? tags : undefined;
-}
-
-export function parseExcludedModelsInput(value: string): string[] | undefined {
-  const patterns = Array.from(
-    new Set(
-      value
-        .split(",")
-        .map((pattern) => pattern.trim())
-        .filter(Boolean)
-    )
-  );
-  return patterns.length > 0 ? patterns : undefined;
-}
+// parseRoutingTagsInput / parseExcludedModelsInput moved to the pure leaf
+// providerInputParsers.ts (kept re-exported here for existing UI importers).
+export { parseExcludedModelsInput, parseRoutingTagsInput } from "./providerInputParsers";
 
 export function formatRoutingTagsInput(value: unknown): string {
   if (!Array.isArray(value)) return "";
@@ -360,92 +432,9 @@ export function formatExcludedModelsInput(value: unknown): string {
 }
 
 // ---------------------------------------------------------------------------
-// Web-session credential label / hint helpers (Phase 2b)
+// Web-session credential label / hint helpers (Phase 2b) — moved to
+// providerCredentialText.ts (#1904 own growth); re-exported above.
 // ---------------------------------------------------------------------------
-
-export function getWebSessionCredentialLabel(
-  t: ProviderMessageTranslator,
-  requirement: WebSessionCredentialRequirement,
-  optional: boolean
-): string {
-  if (requirement.kind === "none") {
-    return providerText(t, "webNoAuthCredentialLabel", "No credential required");
-  }
-  const baseLabel =
-    requirement.kind === "token"
-      ? providerText(t, "webTokenCredentialLabel", "Web session token")
-      : t("sessionCookieLabel");
-  return optional ? `${baseLabel} (${t("optional").toLowerCase()})` : baseLabel;
-}
-
-export function getWebSessionCredentialHint(
-  t: ProviderMessageTranslator,
-  requirement: WebSessionCredentialRequirement,
-  providerName: string,
-  editing: boolean
-): string | undefined {
-  if (requirement.kind === "none") return undefined;
-
-  const values = { provider: providerName, credential: requirement.credentialName };
-  if (editing) {
-    return requirement.kind === "token"
-      ? providerText(
-          t,
-          "webTokenEditHint",
-          "Leave blank to keep the current web session token. Credential: {credential}.",
-          values
-        )
-      : providerText(
-          t,
-          "webCookieEditHint",
-          "Leave blank to keep the current session cookie. Required cookie: {credential}.",
-          values
-        );
-  }
-
-  return requirement.kind === "token"
-    ? providerText(
-        t,
-        "webTokenCredentialHint",
-        "Credential: {credential}. Paste the token value from your own signed-in {provider} web session, or a DevTools HAR export if the provider supports it.",
-        values
-      )
-    : providerText(
-        t,
-        "webCookieCredentialHint",
-        "Required cookie: {credential}. Paste the Cookie header value from your own signed-in {provider} web session. Do not include the Cookie: prefix.",
-        values
-      );
-}
-
-export function getWebSessionCredentialCheckLabel(
-  t: ProviderMessageTranslator,
-  requirement: WebSessionCredentialRequirement
-): string {
-  if (requirement.kind === "token") return providerText(t, "checkWebToken", "Check token");
-  return providerText(t, "checkCookie", "Check cookie");
-}
-
-export function getAddCredentialModalTitle(
-  t: ProviderMessageTranslator,
-  providerName: string,
-  requirement: WebSessionCredentialRequirement | null
-): string {
-  if (!requirement) return t("addProviderApiKeyTitle", { provider: providerName });
-  if (requirement.kind === "none") {
-    return providerText(t, "addProviderConnectionTitle", "Add {provider} connection", {
-      provider: providerName,
-    });
-  }
-  if (requirement.kind === "token") {
-    return providerText(t, "addProviderWebTokenTitle", "Add {provider} web token", {
-      provider: providerName,
-    });
-  }
-  return providerText(t, "addProviderSessionCookieTitle", "Add {provider} session cookie", {
-    provider: providerName,
-  });
-}
 
 // ---------------------------------------------------------------------------
 // Upstream-headers helpers (Phase 2b)
@@ -534,19 +523,41 @@ export function buildCompatMap(rows: CompatModelRow[]): CompatModelMap {
   return m;
 }
 
+/** The endpoint/modality this dashboard hides models from — see `readActiveHiddenFlag`. */
+const DASHBOARD_MODEL_MODALITY = "chat";
+
+export function getDisplayModelAlias(modelId: string, alias?: string | null): string | null {
+  const trimmed = typeof alias === "string" ? alias.trim() : "";
+  if (!trimmed || trimmed === modelId) return null;
+  return trimmed;
+}
+
+/**
+ * #12172: this page manages Chat models only, and its hide/unhide PATCH sends
+ * `modality: "chat"` — so the stored flag lives in `hiddenModalities.chat`, not in the
+ * legacy all-modalities `isHidden`. Reading only the legacy flag made the eye toggle,
+ * "Hide all" and the Hidden filter silently report every model as visible.
+ */
+function readActiveHiddenFlag(row: CompatModelRow | undefined): boolean | undefined {
+  if (!row) return undefined;
+  const hasScopedFlag = row.hiddenModalities?.[DASHBOARD_MODEL_MODALITY] !== undefined;
+  if (hasScopedFlag || Object.prototype.hasOwnProperty.call(row, "isHidden")) {
+    return isHiddenForModality(row, DASHBOARD_MODEL_MODALITY);
+  }
+  return undefined;
+}
+
 export function isModelHiddenFn(
   modelId: string,
   customMap: CompatModelMap,
   overrideMap: CompatModelMap
 ): boolean {
-  const c = customMap.get(modelId);
-  if (c && Object.prototype.hasOwnProperty.call(c, "isHidden")) {
-    return Boolean(c.isHidden);
-  }
-  const o = overrideMap.get(modelId);
-  if (o && Object.prototype.hasOwnProperty.call(o, "isHidden")) {
-    return Boolean(o.isHidden);
-  }
+  const customHidden = readActiveHiddenFlag(customMap.get(modelId));
+  if (customHidden !== undefined) return customHidden;
+
+  const overrideHidden = readActiveHiddenFlag(overrideMap.get(modelId));
+  if (overrideHidden !== undefined) return overrideHidden;
+
   return false;
 }
 
@@ -646,6 +657,7 @@ export const CODEX_REASONING_STRENGTH_OPTIONS = [
   { value: "medium", label: "Medium" },
   { value: "high", label: "High" },
   { value: "xhigh", label: "XHigh" },
+  { value: "max", label: "Max" },
 ];
 
 export const CODEX_ACCOUNT_SERVICE_TIER_VALUES: CodexServiceTier[] = [
@@ -653,6 +665,70 @@ export const CODEX_ACCOUNT_SERVICE_TIER_VALUES: CodexServiceTier[] = [
   "priority",
   "flex",
 ];
+
+export const CODEX_FINGERPRINT_MODE_VALUES = ["off", "device", "session", "full"] as const;
+export type CodexFingerprintModeValue = (typeof CODEX_FINGERPRINT_MODE_VALUES)[number];
+
+export function getCodexFingerprintMode(providerSpecificData: unknown): CodexFingerprintModeValue {
+  const data =
+    providerSpecificData &&
+    typeof providerSpecificData === "object" &&
+    !Array.isArray(providerSpecificData)
+      ? (providerSpecificData as Record<string, unknown>)
+      : undefined;
+  const raw = data?.codexFingerprintMode ?? data?.codex_fingerprint_mode;
+  const normalized = typeof raw === "string" ? raw.trim().toLowerCase() : "";
+  return (CODEX_FINGERPRINT_MODE_VALUES as readonly string[]).includes(normalized)
+    ? (normalized as CodexFingerprintModeValue)
+    : "session";
+}
+
+export const CODEX_PROMPT_CACHE_KEY_SCOPE_VALUES = ["client", "thread"] as const;
+export type CodexPromptCacheKeyScopeValue = (typeof CODEX_PROMPT_CACHE_KEY_SCOPE_VALUES)[number];
+
+export function getCodexPromptCacheKeyScope(
+  providerSpecificData: unknown
+): CodexPromptCacheKeyScopeValue {
+  const data =
+    providerSpecificData &&
+    typeof providerSpecificData === "object" &&
+    !Array.isArray(providerSpecificData)
+      ? (providerSpecificData as Record<string, unknown>)
+      : undefined;
+  const raw = data?.codexPromptCacheKeyScope;
+  const normalized = typeof raw === "string" ? raw.trim().toLowerCase() : "";
+  return normalized === "thread" ? "thread" : "client";
+}
+
+export function getCodexPromptCacheKeyScopeLabel(
+  t: ProviderMessageTranslator,
+  value: CodexPromptCacheKeyScopeValue
+): string {
+  if (value === "thread") {
+    return providerText(t, "codexPromptCacheKeyScopeThread", "Thread — match the converged thread");
+  }
+  return providerText(t, "codexPromptCacheKeyScopeClient", "Client — forward the client's key");
+}
+
+export function getCodexFingerprintModeLabel(
+  t: ProviderMessageTranslator,
+  value: CodexFingerprintModeValue
+): string {
+  if (value === "off") {
+    return providerText(t, "codexFingerprintModeOff", "Off — pass client IDs through");
+  }
+  if (value === "device") {
+    return providerText(t, "codexFingerprintModeDevice", "Device — one installation ID");
+  }
+  if (value === "full") {
+    return providerText(t, "codexFingerprintModeFull", "Full — one device, session, and thread");
+  }
+  return providerText(
+    t,
+    "codexFingerprintModeSession",
+    "Session — one device and session, thread per client"
+  );
+}
 
 export const CODEX_GLOBAL_SERVICE_MODE_VALUES: CodexGlobalServiceMode[] = [
   "none",
@@ -696,12 +772,12 @@ export function getCodexRequestDefaults(providerSpecificData: unknown): {
     ...(defaults.serviceTier ? { serviceTier: defaults.serviceTier } : {}),
   };
 }
-
 export function getClaudeCodeCompatibleRequestDefaults(providerSpecificData: unknown) {
   const defaults = _getClaudeCodeCompatibleRequestDefaults(providerSpecificData);
   return {
     context1m: defaults.context1m === true,
     redactThinking: defaults.redactThinking === true,
+    summarizeThinking: defaults.summarizeThinking === true,
   };
 }
 
@@ -719,6 +795,30 @@ export function compatProtocolLabelKey(protocol: string): string {
   if (protocol === "openai-responses") return "compatProtocolOpenAIResponses";
   if (protocol === "claude") return "compatProtocolClaude";
   return "compatProtocolOpenAI";
+}
+
+/**
+ * #5446 — Modal authenticates with two credentials, a Token ID (`ak-…`) and a
+ * Token Secret (`as-…`), sent as `Authorization: Bearer <TOKEN_ID>:<TOKEN_SECRET>`.
+ * The add-connection form collects them in two fields and combines them here into
+ * the single encrypted `apiKey` value, so the generic bearer executor path emits
+ * `Bearer <id:secret>` with no provider-specific header code. When only the id
+ * field is filled, it is returned verbatim so users can still paste a pre-combined
+ * `id:secret` string into the single field.
+ */
+// #5446 checklist item 4 — Modal is bring-your-own-deploy, but the server-side
+// validator probes a known public model; pre-fill the same id so the UI and the
+// probe never drift.
+export function defaultValidationModelIdForProvider(provider: string | undefined): string {
+  return provider === "modal" ? MODAL_DEFAULT_VALIDATION_MODEL_ID : "";
+}
+
+export function combineModalCredential(tokenId: string, tokenSecret: string): string {
+  const id = tokenId.trim();
+  const secret = tokenSecret.trim();
+  if (!secret) return id;
+  if (!id) return secret;
+  return `${id}:${secret}`;
 }
 
 export function extractCommandCodeCredentialInput(value: string): string {
@@ -829,7 +929,10 @@ export function shouldSwitchToVisibleFilter(opts: {
 // ---------------------------------------------------------------------------
 // Error-type label map — shared by ConnectionRow and EditConnectionModal
 // ---------------------------------------------------------------------------
-export const ERROR_TYPE_LABELS: Record<string, { labelKey: string; variant: string }> = {
+export const ERROR_TYPE_LABELS: Record<
+  string,
+  { labelKey: string; variant: "error" | "default" | "warning" | "success" | "info" | "primary" }
+> = {
   runtime_error: { labelKey: "errorTypeRuntime", variant: "warning" },
   upstream_auth_error: { labelKey: "errorTypeUpstreamAuth", variant: "error" },
   account_deactivated: { labelKey: "Account Deactivated", variant: "error" },
@@ -970,4 +1073,23 @@ export function getHeaderIconProviderId(
     return "anthropic-m";
   }
   return providerInfoId;
+}
+
+/**
+ * #4125: parse the free-text "Context Window Override" field. Blank → no override
+ * (`value: null`, not an error). A non-empty value must be a positive whole number of
+ * tokens; anything else is rejected.
+ *
+ * Lives here rather than in one section because #14337 gives synced/imported rows the
+ * same control: two copies of this rule would be two places for "blank clears" and
+ * "zero is invalid" to drift apart.
+ */
+export function parseContextWindowOverrideInput(raw: string): {
+  value: number | null;
+  invalid: boolean;
+} {
+  const trimmed = raw.trim();
+  if (!trimmed) return { value: null, invalid: false };
+  if (!/^\d+$/.test(trimmed) || Number(trimmed) <= 0) return { value: null, invalid: true };
+  return { value: Number(trimmed), invalid: false };
 }

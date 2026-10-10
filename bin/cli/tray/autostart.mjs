@@ -6,17 +6,20 @@ import { fileURLToPath } from "node:url";
 
 const APP_LABEL = "com.omniroute.autostart";
 const WIN_REG_VALUE = "OmniRoute";
+const WIN_STARTUP_FILE = "OmniRoute.vbs";
 const LINUX_SERVICE_NAME = "omniroute.service";
 const LINUX_DESKTOP_NAME = "omniroute.desktop";
 
 function resolveCliPath() {
   const candidates = [];
   if (process.argv[1]) candidates.push(process.argv[1]);
-  try {
-    const which = execSync("command -v omniroute 2>/dev/null", { encoding: "utf8" }).trim();
-    if (which) candidates.push(which);
-  } catch {
-    // command -v unavailable
+  if (process.platform !== "win32") {
+    try {
+      const which = execSync("command -v omniroute 2>/dev/null", { encoding: "utf8" }).trim();
+      if (which) candidates.push(which);
+    } catch {
+      // command -v unavailable
+    }
   }
   candidates.push(join(dirname(fileURLToPath(import.meta.url)), "..", "..", "omniroute.mjs"));
 
@@ -113,17 +116,30 @@ function writeLinuxSystemdUnit(cliPath) {
   const unitDir = dirname(linuxSystemdUnitPath());
   mkdirSync(unitDir, { recursive: true });
   const envFile = join(userHomeDir(), ".omniroute", ".env");
+  const nodeBinDir = dirname(process.execPath);
+  const userLocalBin = join(userHomeDir(), ".local", "bin");
+  const pathEnv = `${nodeBinDir}:${userLocalBin}:/usr/local/sbin:/usr/local/bin:/usr/bin:/bin`;
   const lines = [
     "[Unit]",
     "Description=OmniRoute AI proxy router",
-    "After=network-online.target",
+    "After=network-online.target graphical-session.target",
     "Wants=network-online.target",
     "",
     "[Service]",
-    "Type=simple",
+    // Type=notify + WatchdogSec: the server sends READY=1 once listening and
+    // WATCHDOG=1 every 60s; if its event loop ever blocks (frozen process),
+    // the pings stop and systemd kills+restarts the service. NotifyAccess=all
+    // because the pings come from the server child, not the serve supervisor.
+    // Foreground serve only: `--daemon` escapes the cgroup and would break
+    // the notify handshake.
+    "Type=notify",
+    "NotifyAccess=all",
+    "WatchdogSec=180",
+    "TimeoutStartSec=300",
     `ExecStart=${buildServeExecLine(cliPath, { tray: false })}`,
     "Restart=on-failure",
     "RestartSec=5",
+    `Environment="PATH=${pathEnv}"`,
   ];
   if (existsSync(envFile)) lines.push(`EnvironmentFile=-${envFile}`);
   lines.push("", "[Install]", "WantedBy=default.target", "");
@@ -166,6 +182,10 @@ export function getAutostartStatus() {
       linger: tryReadLingerEnabled(),
     };
   }
+  if (process.platform === "win32") {
+    const winMechanism = isAutostartEnabled() ? "vbs-startup" : null;
+    return { enabled: isAutostartEnabled(), mechanism: winMechanism };
+  }
   return { enabled: isAutostartEnabled(), mechanism: null };
 }
 
@@ -204,6 +224,68 @@ export function isAutostartEnabled() {
   return false;
 }
 
+/**
+ * Pure parse of `launchctl list <label>` output: true only when the agent's
+ * "PID" line matches the given process id. launchctl prints the running PID for
+ * a managed Aqua agent; a loaded-but-not-running agent omits the key entirely.
+ *
+ * Exported for unit testing — the darwin branch can't execute on the Linux CI.
+ */
+export function parseAgentSelfFromLaunchctl(output, pid) {
+  if (!output) return false;
+  const match = output.match(/"PID"\s*=\s*(\d+)/);
+  return !!(match && parseInt(match[1], 10) === pid);
+}
+
+/**
+ * True when `runList()` (which should run `launchctl list <label>`) succeeds,
+ * i.e. launchd actually recognizes the agent. A plist sitting on disk that
+ * launchd never loaded must NOT count as enabled — checking file existence
+ * alone makes the tray menu lie ("✓ Enabled" while launchd has the agent in a
+ * failed state or never loaded it).
+ *
+ * `runList` is injectable so the parse/branch logic is testable without a real
+ * launchctl on the (Linux) CI runner.
+ */
+export function isLaunchdAgentLoaded(runList) {
+  try {
+    runList();
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Returns true when the current Node process IS the running instance launchd is
+ * managing under our agent label.
+ *
+ * `launchctl unload`/`load -w` for a user-domain agent sends SIGTERM to the
+ * running process. When the running OmniRoute cli was itself spawned by the
+ * autostart launchd agent (autostart was enabled, then the machine rebooted,
+ * then the user clicked the tray "Disable Autostart" item), an unload would
+ * kill the very process executing the click handler — the tray icon would
+ * silently disappear instead of the menu label flipping. Enable/disable skip
+ * launchctl in that case; the on-disk plist change is what matters for the next
+ * login, and launchd already has us loaded under our own PID.
+ */
+function isAgentSelfMac() {
+  try {
+    const output = execFileSync("launchctl", ["list", APP_LABEL], {
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "ignore"],
+      timeout: 3000,
+    });
+    return parseAgentSelfFromLaunchctl(output, process.pid);
+  } catch {
+    return false;
+  }
+}
+
+function isDetachedTrayWorker() {
+  return process.argv.includes("--tray-worker");
+}
+
 function enableMac() {
   const plistDir = join(homedir(), "Library", "LaunchAgents");
   mkdirSync(plistDir, { recursive: true });
@@ -225,6 +307,10 @@ function enableMac() {
   <key>KeepAlive</key><false/>
 </dict></plist>`;
   writeFileSync(plistPath, plist, { mode: 0o644 });
+  // If we're already the running agent, launchctl load/unload would SIGTERM us.
+  // The plist is updated on disk and launchd already has us loaded under our own
+  // PID — nothing more to do for the current session.
+  if (isAgentSelfMac() || isDetachedTrayWorker()) return existsSync(plistPath);
   try {
     execSync("launchctl load -w " + JSON.stringify(plistPath), { stdio: "ignore" });
   } catch {}
@@ -233,9 +319,15 @@ function enableMac() {
 
 function disableMac() {
   const plistPath = join(homedir(), "Library", "LaunchAgents", `${APP_LABEL}.plist`);
-  try {
-    execSync("launchctl unload -w " + JSON.stringify(plistPath), { stdio: "ignore" });
-  } catch {}
+  // Don't kill ourselves: when the current process is the running agent,
+  // `launchctl unload` sends SIGTERM and a user clicking "Disable Autostart"
+  // from the tray would lose the tray icon instead of just flipping the label.
+  // Removing the plist file is enough to stop the agent at the next login.
+  if (!isAgentSelfMac() && !isDetachedTrayWorker()) {
+    try {
+      execSync("launchctl unload -w " + JSON.stringify(plistPath), { stdio: "ignore" });
+    } catch {}
+  }
   try {
     unlinkSync(plistPath);
   } catch {}
@@ -243,41 +335,113 @@ function disableMac() {
 }
 
 function isEnabledMac() {
-  return existsSync(join(homedir(), "Library", "LaunchAgents", `${APP_LABEL}.plist`));
+  const plistPath = join(homedir(), "Library", "LaunchAgents", `${APP_LABEL}.plist`);
+  if (!existsSync(plistPath)) return false;
+  // The plist file existing is not enough — launchd must actually recognize the
+  // agent, otherwise the tray menu reports "Enabled" for an inert/failed agent.
+  return isLaunchdAgentLoaded(() =>
+    execFileSync("launchctl", ["list", APP_LABEL], {
+      stdio: ["ignore", "ignore", "ignore"],
+      timeout: 3000,
+    })
+  );
+}
+
+/**
+ * Returns the absolute path to the Windows Startup folder
+ * (%APPDATA%\Microsoft\Windows\Start Menu\Programs\Startup\),
+ * or null when APPDATA is not set.
+ */
+function winStartupDir() {
+  if (!process.env.APPDATA) return null;
+  return join(process.env.APPDATA, "Microsoft", "Windows", "Start Menu", "Programs", "Startup");
+}
+
+/**
+ * Returns the full path to the VBS autostart script in the Startup folder,
+ * or null when the Startup folder cannot be resolved.
+ */
+function winStartupPath() {
+  const dir = winStartupDir();
+  return dir ? join(dir, WIN_STARTUP_FILE) : null;
+}
+
+/**
+ * Builds the VBScript source that launches OmniRoute with WSH's Run method
+ * using SW_HIDE (0) so no console window appears.
+ *
+ * 9Router uses the same pattern: a .vbs file in the Startup folder that calls
+ * WScript.Shell.Run with window style 0 (hidden). This avoids the console
+ * window flash that HKCU\Run causes for console-mode node.exe.
+ */
+function buildWinVbsContent(cliPath) {
+  const execLine = buildServeExecLine(cliPath, { tray: true });
+  // VBScript doubles `"` inside a string to escape them. The execLine already
+  // contains quoted paths; escape each `"` to `""` so the VBS parser reads
+  // them as literal quote characters in the command string passed to Run().
+  const vbsSafe = execLine.replace(/"/g, '""');
+  return [
+    'Set WshShell = CreateObject("WScript.Shell")',
+    `WshShell.Run "${vbsSafe}", 0, False`,
+    "",
+  ].join("\n");
+}
+
+/**
+ * Removes the legacy HKCU\Run registry value if present. Callers use this
+ * during migration so stale Run entries don't linger after switching to the
+ * VBS-based autostart.
+ */
+function cleanLegacyWinReg() {
+  try {
+    execSync(
+      `reg delete HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run /v ${WIN_REG_VALUE} /f 2>nul`,
+      { stdio: "ignore", windowsHide: true }
+    );
+  } catch {
+    // entry did not exist or already removed — noop
+  }
 }
 
 function enableWin() {
   const cliPath = resolveCliPath();
   if (!cliPath) return false;
-  const value = `"${process.execPath}" "${cliPath}" serve --tray --no-open`;
-  try {
-    execSync(
-      `reg add HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run /v ${WIN_REG_VALUE} /t REG_SZ /d "${value}" /f`,
-      { stdio: "ignore", windowsHide: true }
-    );
-    return true;
-  } catch {
-    return false;
-  }
+  const vbsPath = winStartupPath();
+  if (!vbsPath) return false;
+  const dir = dirname(vbsPath);
+  mkdirSync(dir, { recursive: true });
+  writeFileSync(vbsPath, buildWinVbsContent(cliPath), { mode: 0o644 });
+  // Migrate away from the legacy HKCU\Run entry — it launches node.exe with
+  // a visible console window. The VBS approach is the replacement.
+  cleanLegacyWinReg();
+  return existsSync(vbsPath);
 }
 
 function disableWin() {
+  const vbsPath = winStartupPath();
+  if (!vbsPath) return false;
   try {
-    execSync(
-      `reg delete HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run /v ${WIN_REG_VALUE} /f`,
-      { stdio: "ignore", windowsHide: true }
-    );
-    return true;
+    unlinkSync(vbsPath);
   } catch {
-    return false;
+    // already removed
   }
+  // Also clean up any lingering legacy registry entry as a safety net.
+  cleanLegacyWinReg();
+  return !existsSync(vbsPath);
 }
 
 function isEnabledWin() {
+  const vbsPath = winStartupPath();
+  if (!vbsPath) return false;
+  // Primary check: VBS file exists in the Startup folder.
+  if (existsSync(vbsPath)) return true;
+  // Fallback check: legacy HKCU\Run entry (for users who enabled autostart
+  // before the VBS migration). Treat it as enabled so the tray menu shows
+  // the correct toggle state, and calling disable() will clean it up.
   try {
     const out = execSync(
       `reg query HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run /v ${WIN_REG_VALUE}`,
-      { stdio: "pipe", windowsHide: true, encoding: "utf8" }
+      { stdio: "pipe", windowsHide: true, encoding: "utf8", timeout: 3000 }
     );
     return out.includes(WIN_REG_VALUE);
   } catch {

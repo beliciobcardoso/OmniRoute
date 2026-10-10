@@ -5,6 +5,7 @@ import {
 
 import { HTTP_STATUS } from "../config/constants.ts";
 import { buildErrorBody } from "./error.ts";
+import { sanitizeErrorMessage } from "./errorSanitization.ts";
 
 export type StreamCompletionPayload = {
   status: number;
@@ -22,12 +23,116 @@ export type StreamFailurePayload = {
   message: string;
   code?: string;
   type?: string;
+  /** The stream had already forwarded text/reasoning/tool output to the client. */
+  outputEmitted?: boolean;
 };
 
 export type PipelineStreamErrorHandler = (event: {
+  error?: unknown;
   message: string;
   statusCode: number;
 }) => boolean;
+
+export type ClientDisconnectEvent = { reason: string; duration: number };
+
+function classifyPipelineStreamCode(text: string): string {
+  const lower = text.toLowerCase();
+  if (lower.includes("stream content stall")) return "stream_content_stall";
+  if (lower.includes("terminated")) return "stream_terminated";
+  return "stream_pipeline_error";
+}
+
+const TRANSPORT_DIAGNOSTIC_CODES = new Set([
+  "ECONNRESET",
+  "ECONNREFUSED",
+  "EPIPE",
+  "ETIMEDOUT",
+  "EPROTO",
+  "ENOTFOUND",
+  "EAI_AGAIN",
+  "EHOSTUNREACH",
+  "ENETUNREACH",
+  "UND_ERR_SOCKET",
+  "UND_ERR_CONNECT_TIMEOUT",
+  "UND_ERR_HEADERS_TIMEOUT",
+  "UND_ERR_BODY_TIMEOUT",
+  "ERR_HTTP2_STREAM_ERROR",
+  "ERR_HTTP2_SESSION_ERROR",
+  "ERR_HTTP2_GOAWAY_SESSION",
+  "ERR_HTTP2_INVALID_SESSION",
+  "ERR_HTTP2_STREAM_CANCEL",
+]);
+
+function transportDiagnosticSuffix(error: unknown): string {
+  const codes = new Set<string>();
+  const seen = new Set<unknown>();
+  let current = error;
+  for (let depth = 0; depth < 8 && current && typeof current === "object"; depth++) {
+    if (seen.has(current)) break;
+    seen.add(current);
+    try {
+      const record = current as { code?: unknown; cause?: unknown };
+      const code = record.code;
+      if (typeof code === "string" && TRANSPORT_DIAGNOSTIC_CODES.has(code)) codes.add(code);
+      current = record.cause;
+    } catch {
+      break; // Diagnostics must not interfere with finalization on a hostile getter.
+    }
+  }
+  // Never include cause.message, stack, socket addresses or arbitrary code strings.
+  return codes.size ? ` (transport: ${[...codes].join(", ")})` : "";
+}
+
+/**
+ * #9653: a client that closes its connection right after reading a fully-completed
+ * SSE stream can race the stream's own completion bookkeeping — the bytes already
+ * reached the client, but the transform stream's completion callback (which flips
+ * `isStreamCompletionRecorded()` to true) hasn't finished bubbling up yet when the
+ * disconnect handler fires. Persisting immediately in that case records a false
+ * 499 with zero token usage for a request that actually delivered its full response.
+ *
+ * This wraps a disconnect finalizer with a grace period: instead of finalizing
+ * immediately, poll `isStreamCompletionRecorded()` until it flips true (a real
+ * completion landed — nothing more to do) or the deadline passes (genuinely gone —
+ * finalize as a 499 same as before). Pass `gracePeriodMs <= 0` to disable and
+ * finalize immediately, matching the pre-#9653 behavior.
+ */
+export function createClientDisconnectGraceHandler({
+  isStreamCompletionRecorded,
+  gracePeriodMs,
+  finalize,
+  pollIntervalMs = 250,
+  setTimeoutFn = setTimeout,
+}: {
+  isStreamCompletionRecorded: () => boolean;
+  gracePeriodMs: number;
+  finalize: (event: ClientDisconnectEvent) => unknown;
+  pollIntervalMs?: number;
+  setTimeoutFn?: (callback: () => void, ms: number) => unknown;
+}): (event: ClientDisconnectEvent) => boolean {
+  return (event) => {
+    if (isStreamCompletionRecorded()) return true;
+    if (gracePeriodMs <= 0) {
+      finalize(event);
+      return true;
+    }
+
+    const deadline = Date.now() + gracePeriodMs;
+    const poll = () => {
+      if (isStreamCompletionRecorded()) return;
+      if (Date.now() >= deadline) {
+        finalize(event);
+        return;
+      }
+      setTimeoutFn(poll, pollIntervalMs);
+    };
+    setTimeoutFn(poll, pollIntervalMs);
+
+    // Claim "handled" immediately so the caller's own immediate-finalize fallback
+    // doesn't fire while the grace-period poll is still pending.
+    return true;
+  };
+}
 
 export function finalizeStreamRequestLog({
   pendingRequestId,
@@ -76,9 +181,7 @@ export function finalizeStreamRequestLog({
       } else {
         console.warn(
           "finalizeMostRecentPendingRequest failed:",
-          error && typeof error === "object" && "message" in error
-            ? (error as { message?: unknown }).message
-            : error
+          sanitizeErrorMessage(error) || "Stream request finalization failed"
         );
       }
     } catch {}
@@ -87,22 +190,32 @@ export function finalizeStreamRequestLog({
 
 export function createStreamFailureFinalizers({
   isFailureCompletionRecorded,
+  isStreamCompletionRecorded = () => false,
   onStreamComplete,
   persistFailureUsage,
   onStreamFailure,
+  hasEmittedOutput = () => false,
 }: {
   isFailureCompletionRecorded: () => boolean;
+  isStreamCompletionRecorded?: () => boolean;
   onStreamComplete: (payload: StreamCompletionPayload) => void;
   persistFailureUsage: (status: number, errorCode?: string) => void;
   onStreamFailure?: ((failure: StreamFailurePayload) => void) | null;
+  hasEmittedOutput?: () => boolean;
 }) {
   const handleStreamFailure = (failure: StreamFailurePayload) => {
+    if (isStreamCompletionRecorded()) {
+      return true;
+    }
+
     const status = failure.status || HTTP_STATUS.BAD_GATEWAY;
     const message = failure.message || "Upstream stream error";
-    const code = failure.code || failure.type || String(status);
+    const classification =
+      failure.code || failure.type ? { code: failure.code, type: failure.type } : undefined;
+    const errorBody = buildErrorBody(status, message, undefined, classification);
+    const projectedCode = errorBody.error.code || String(status);
 
     if (!isFailureCompletionRecorded()) {
-      const errorBody = buildErrorBody(status, message);
       onStreamComplete({
         status,
         usage: null,
@@ -110,39 +223,55 @@ export function createStreamFailureFinalizers({
         providerPayload: errorBody,
         clientPayload: errorBody,
         error: message,
-        errorCode: code,
+        errorCode: projectedCode,
         ttft: 0,
       });
     }
 
-    persistFailureUsage(status, code);
+    persistFailureUsage(status, projectedCode);
     try {
-      onStreamFailure?.(failure);
+      onStreamFailure?.({ ...failure, outputEmitted: hasEmittedOutput() });
     } catch {
       // Best-effort fallback state update only.
     }
     return true;
   };
 
+  const isClientClosedPipelineError = (message: string, statusCode: number) => {
+    const normalized = message.toLowerCase();
+    return (
+      statusCode === 499 ||
+      normalized.includes("responseaborted") ||
+      normalized.includes("controller is already closed") ||
+      normalized.includes("readablestream is closed") ||
+      normalized.includes("writablestream is closed") ||
+      normalized.includes("aborterror")
+    );
+  };
+
   let pipelineStreamFailureFinalized = false;
-  const onPipelineStreamError: PipelineStreamErrorHandler = ({ message, statusCode }) => {
+
+  const onPipelineStreamError: PipelineStreamErrorHandler = ({ error, message, statusCode }) => {
     if (pipelineStreamFailureFinalized) return true;
     pipelineStreamFailureFinalized = true;
 
-    const status =
-      Number.isFinite(statusCode) && statusCode >= 400 && statusCode <= 599
+    const normalizedMessage = message || "Upstream stream error";
+    const clientClosed = isClientClosedPipelineError(normalizedMessage, statusCode);
+    const status = clientClosed
+      ? 499
+      : Number.isFinite(statusCode) && statusCode >= 400 && statusCode <= 599
         ? statusCode
         : HTTP_STATUS.BAD_GATEWAY;
-    const normalizedMessage = message || "Upstream stream error";
-    const code = normalizedMessage.toLowerCase().includes("terminated")
-      ? "stream_terminated"
-      : "stream_pipeline_error";
+    const code = clientClosed
+      ? "client_disconnected"
+      : classifyPipelineStreamCode(normalizedMessage);
+    const type = clientClosed ? "client_disconnected" : "stream_error";
 
     handleStreamFailure({
       status,
-      message: normalizedMessage,
+      message: normalizedMessage + (status >= 500 ? transportDiagnosticSuffix(error) : ""),
       code,
-      type: "stream_error",
+      type,
     });
     return true;
   };

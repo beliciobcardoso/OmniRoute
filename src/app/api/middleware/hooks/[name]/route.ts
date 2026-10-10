@@ -5,11 +5,12 @@ import {
   updateMiddlewareHook,
   deleteMiddlewareHook,
   getHookLogs,
-} from "@/lib/localDb";
+} from "@/lib/db/middleware";
 import { registerHook, unregisterHook, updateHook } from "@/lib/middleware/registry";
 import type { HookConfig } from "@/lib/middleware/types";
 import { isValidationFailure, validateBody } from "@/shared/validation/helpers";
 import { requireManagementAuth } from "@/lib/api/requireManagementAuth";
+import { sanitizeErrorMessage } from "@omniroute/open-sse/utils/error";
 
 type RouteParams = { params: Promise<{ name: string }> };
 
@@ -105,7 +106,10 @@ export async function PUT(request: Request, { params }: RouteParams) {
     return NextResponse.json({ hook: saved });
   } catch (error: any) {
     console.error("[API] PUT /api/middleware/hooks/[name] error:", error);
-    return NextResponse.json({ error: error?.message || "Failed to update hook" }, { status: 500 });
+    return NextResponse.json(
+      { error: sanitizeErrorMessage(error) || "Failed to update hook" },
+      { status: 500 }
+    );
   }
 }
 

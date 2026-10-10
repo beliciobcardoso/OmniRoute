@@ -1,5 +1,6 @@
 // src/shared/schemas/playground.ts
 import { z } from "zod";
+import { partialWithoutDefaults } from "@/shared/validation/partialWithoutDefaults";
 
 /** Row da tabela playground_presets. */
 export const PlaygroundPresetRowSchema = z.object({
@@ -11,7 +12,6 @@ export const PlaygroundPresetRowSchema = z.object({
   params_json: z.string(), // JSON serializado (parsed na rota)
   created_at: z.string().datetime(),
 });
-export type PlaygroundPresetRow = z.infer<typeof PlaygroundPresetRowSchema>;
 
 /** Body de POST /api/playground/presets. */
 export const PlaygroundPresetCreateSchema = z.object({
@@ -23,7 +23,7 @@ export const PlaygroundPresetCreateSchema = z.object({
 });
 
 /** Body de PUT /api/playground/presets/[id]. */
-export const PlaygroundPresetUpdateSchema = PlaygroundPresetCreateSchema.partial();
+export const PlaygroundPresetUpdateSchema = partialWithoutDefaults(PlaygroundPresetCreateSchema);
 
 export const PlaygroundPresetListItemSchema = z.object({
   id: z.string().uuid(),

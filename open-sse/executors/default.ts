@@ -1,40 +1,179 @@
-import { BaseExecutor, setUserAgentHeader, type ExecuteInput } from "./base.ts";
+import { createHash } from "node:crypto";
+import { BaseExecutor, type ExecuteInput } from "./base.ts";
+import { mapNvidiaGlm52ReasoningParams } from "./base/reasoningEffort.ts";
 import { PROVIDERS, OAUTH_ENDPOINTS } from "../config/constants.ts";
 import { getAccessToken } from "../services/tokenRefresh.ts";
-import {
-  getRotatingApiKey,
-  getValidApiKey,
-  resolveKeyForRequest,
-} from "../services/apiKeyRotator.ts";
-import type { KeyHealth } from "../services/apiKeyRotator.ts";
+
 import {
   buildClaudeCodeCompatibleHeaders,
   CLAUDE_CODE_COMPATIBLE_DEFAULT_CHAT_PATH,
   joinClaudeCodeCompatibleUrl,
 } from "../services/claudeCodeCompatible.ts";
 import { getGigachatAccessToken } from "../services/gigachatAuth.ts";
-import { getRegistryEntry } from "../config/providerRegistry.ts";
-import { mergeClientAnthropicBeta } from "../config/anthropicHeaders.ts";
+import { getRegistryEntry, requireCompatibleBaseUrl } from "../config/providerRegistry.ts";
+import { getModelTargetFormat } from "../config/providerModels.ts";
+import {
+  applyClientAnthropicBeta,
+  normalizeAnthropicHeaderVariants,
+  maybeAppendSkillsBeta,
+} from "../config/anthropicHeaders.ts";
+import { isOfficialAnthropicBaseUrl } from "../utils/anthropicHost.ts";
 import { applyProviderRequestDefaults } from "../services/providerRequestDefaults.ts";
 import { stripUnsupportedParams } from "../translator/paramSupport.ts";
+import { normalizeOpenAIToolNames } from "../translator/helpers/toolCallHelper.ts";
+import {
+  injectReasoningContentForThinkingModel,
+  shouldInjectReasoningContentPlaceholder,
+} from "../utils/reasoningContentInjector.ts";
 import {
   detectFormat,
   getOpenAICompatibleType,
   getTargetFormat,
   isClaudeCodeCompatible,
 } from "../services/provider.ts";
-import { sanitizeQwenThinkingToolChoice } from "../services/qwenThinking.ts";
-import { buildDataRobotChatUrl } from "../config/datarobot.ts";
-import { buildAzureAiChatUrl } from "../config/azureAi.ts";
-import { buildWatsonxChatUrl } from "../config/watsonx.ts";
-import { buildOciChatUrl } from "../config/oci.ts";
-import { buildSapChatUrl, getSapResourceGroup } from "../config/sap.ts";
+import { ensureToolMessageNames } from "./kimiToolNames.ts";
+import { getSapResourceGroup } from "../config/sap.ts";
+import {
+  normalizeBailianMessagesUrl,
+  normalizeDataRobotChatUrl,
+  normalizeAzureAiChatUrl,
+  normalizeWatsonxChatUrl,
+  normalizeOciChatUrl,
+  normalizeSapChatUrl,
+  normalizeOpenAIChatUrl,
+  getOpenRouterConnectionPreset,
+} from "./default/urlNormalizers.ts";
+import {
+  isPoeMessagesEligibleModel,
+  resolvePoeUpstreamUrl,
+} from "../config/providers/registry/poe/index.ts";
 import { buildMaritalkChatUrl } from "../config/maritalk.ts";
 import { LOCAL_PROVIDERS } from "@/shared/constants/providers";
 import { isForbiddenCustomHeaderName } from "@/shared/constants/upstreamHeaders";
 import { getClaudeCodeCompatibleRequestDefaults } from "@/lib/providers/requestDefaults";
+import { applyClineAuthHeaders } from "@/shared/utils/clineAuth";
+import {
+  normalizeHerokuChatUrl,
+  normalizeDatabricksChatUrl,
+  normalizeSnowflakeChatUrl,
+  normalizeGigachatChatUrl,
+} from "@/lib/providers/validation/urlHelpers";
+import { forwardOpencodeClientHeaders } from "../utils/opencodeHeaders.ts";
+import { resolveZaiUrl } from "./default/zaiFormatOverride.ts";
+import { normalizePoolConfig, rejectStrictPool } from "./default/poolConfig.ts";
+import { acquireNvidiaConcurrencySlot } from "./default/nvidiaConcurrencyGate.ts";
+import { resolveAlibabaProviderBaseUrl } from "@/shared/constants/alibabaProviderRegions";
+import { xiaomiAlternateUrl, xiaomiMimoChatUrl } from "./default/xiaomiTokenPlan.ts";
+import { usesCcWireImage } from "../services/ccWireImageBuiltins.ts";
+import { applyRegistryBodyRepairs } from "../utils/strictChatHistory.ts";
 
-import type { PoolConfig } from "../services/sessionPool/types.ts";
+const NVIDIA_TOOL_CALL_ID_PATTERN = /^[A-Za-z0-9]{9}$/;
+const PERPLEXITY_AGENT_DEFAULT_MAX_OUTPUT_TOKENS = 4096;
+
+function defaultPerplexityAgentMaxOutputTokens<T>(body: T): T {
+  if (!body || typeof body !== "object" || Array.isArray(body)) return body;
+
+  const record = body as Record<string, unknown>;
+  if (
+    record.max_output_tokens !== undefined ||
+    record.max_completion_tokens !== undefined ||
+    record.max_tokens !== undefined
+  ) {
+    return body;
+  }
+
+  return {
+    ...record,
+    max_output_tokens: PERPLEXITY_AGENT_DEFAULT_MAX_OUTPUT_TOKENS,
+  } as T;
+}
+
+const ZAI_GLM_53_OPENAI_MODEL_PATTERN = /^glm-5\.3(?:-flash)?$/i;
+const ZAI_GLM_53_EFFORT_MODEL_PATTERN = /^(glm-5\.3(?:-flash)?)-(low|high|max)$/i;
+
+function hasTools(body: unknown): boolean {
+  if (!body || typeof body !== "object" || Array.isArray(body)) return false;
+  const tools = (body as Record<string, unknown>).tools;
+  return Array.isArray(tools) && tools.length > 0;
+}
+
+function applyZaiGlm53OpenAIDefaults<T>(
+  provider: string,
+  model: string,
+  body: T,
+  stream: boolean
+): T {
+  if (provider !== "zai" && provider !== "glm-coding-apikey") return body;
+  if (!body || typeof body !== "object" || Array.isArray(body)) return body;
+
+  const record = body as Record<string, unknown>;
+  const outboundModel = typeof record.model === "string" ? record.model : model;
+  const effortMatch = outboundModel.match(ZAI_GLM_53_EFFORT_MODEL_PATTERN);
+  const baseModel = effortMatch?.[1] ?? outboundModel;
+  if (!ZAI_GLM_53_OPENAI_MODEL_PATTERN.test(baseModel)) return body;
+
+  let next: Record<string, unknown> | null = null;
+  const mutate = (): Record<string, unknown> => (next ??= { ...record });
+
+  const editableForEffort = mutate();
+  if (effortMatch) editableForEffort.model = baseModel;
+  if (record.reasoning_effort === undefined && record.reasoning === undefined) {
+    // GLM-5.3 always reasons (thinking cannot be disabled upstream), so a
+    // request with no effort — Pi "off", plain API calls — maps to the floor
+    // tier "low" per the declared-tier clamp convention (none/minimal → low),
+    // not the vendor default "max". Explicit max stays opt-in via
+    // reasoning_effort or the -max model aliases; xhigh normalizes to max in
+    // the shared sanitizer via the declared tiers.
+    editableForEffort.reasoning_effort = (effortMatch?.[2] ?? "low").toLowerCase();
+  }
+
+  const existingThinking =
+    record.thinking && typeof record.thinking === "object" && !Array.isArray(record.thinking)
+      ? (record.thinking as Record<string, unknown>)
+      : null;
+  const editableForThinking = mutate();
+  editableForThinking.thinking = {
+    ...(existingThinking || {}),
+    type: "enabled",
+    clear_thinking: false,
+  };
+
+  if (stream && hasTools(record) && record.tool_stream === undefined) {
+    mutate().tool_stream = true;
+  }
+
+  return (next ?? body) as T;
+}
+
+function normalizeNvidiaToolCallId(id: unknown): unknown {
+  if (id === null || id === undefined) return id;
+  const value = String(id);
+  if (NVIDIA_TOOL_CALL_ID_PATTERN.test(value)) return value;
+  return createHash("sha256").update(value).digest("hex").slice(0, 9);
+}
+
+function normalizeNvidiaToolCallIds(body: unknown): void {
+  if (!body || typeof body !== "object" || Array.isArray(body)) return;
+  const messages = (body as Record<string, unknown>).messages;
+  if (!Array.isArray(messages)) return;
+
+  for (const message of messages) {
+    if (!message || typeof message !== "object" || Array.isArray(message)) continue;
+    const record = message as Record<string, unknown>;
+    if (Array.isArray(record.tool_calls)) {
+      for (const toolCall of record.tool_calls) {
+        if (!toolCall || typeof toolCall !== "object" || Array.isArray(toolCall)) continue;
+        const call = toolCall as Record<string, unknown>;
+        if (call.id !== null && call.id !== undefined) {
+          call.id = normalizeNvidiaToolCallId(call.id);
+        }
+      }
+    }
+    if (record.tool_call_id !== null && record.tool_call_id !== undefined) {
+      record.tool_call_id = normalizeNvidiaToolCallId(record.tool_call_id);
+    }
+  }
+}
 
 /**
  * Apply operator-configured per-provider custom headers onto an outgoing header
@@ -78,96 +217,12 @@ function applyCustomHeaders(headers: Record<string, string>, rawCustomHeaders: u
   }
 }
 
-function normalizeBaseUrl(baseUrl) {
-  return (baseUrl || "").trim().replace(/\/$/, "");
-}
-
-function normalizeBailianMessagesUrl(baseUrl) {
-  const normalized = normalizeBaseUrl(baseUrl).replace(/\?beta=true$/, "");
-  const messagesUrl = normalized.endsWith("/messages") ? normalized : `${normalized}/messages`;
-  return messagesUrl;
-}
-
-function normalizeHerokuChatUrl(baseUrl) {
-  const normalized = normalizeBaseUrl(baseUrl);
-  if (normalized.endsWith("/v1/chat/completions")) return normalized;
-  return `${normalized}/v1/chat/completions`;
-}
-
-function normalizeDatabricksChatUrl(baseUrl) {
-  const normalized = normalizeBaseUrl(baseUrl);
-  if (normalized.endsWith("/chat/completions")) return normalized;
-  return `${normalized}/chat/completions`;
-}
-
-function normalizeDataRobotChatUrl(baseUrl) {
-  return buildDataRobotChatUrl(baseUrl);
-}
-
-function normalizeAzureAiChatUrl(baseUrl: string, apiType: "chat" | "responses" = "chat") {
-  return buildAzureAiChatUrl(baseUrl, apiType);
-}
-
-function normalizeWatsonxChatUrl(baseUrl: string) {
-  return buildWatsonxChatUrl(baseUrl);
-}
-
-function normalizeOciChatUrl(baseUrl: string, apiType: "chat" | "responses" = "chat") {
-  return buildOciChatUrl(baseUrl, apiType);
-}
-
-function normalizeSapChatUrl(baseUrl) {
-  return buildSapChatUrl(baseUrl);
-}
-
-function normalizeXiaomiMimoChatUrl(baseUrl) {
-  const normalized = normalizeBaseUrl(baseUrl).replace(/\/chat\/completions$/, "");
-  return `${normalized}/chat/completions`;
-}
-
-function normalizeSnowflakeChatUrl(baseUrl) {
-  const normalized = normalizeBaseUrl(baseUrl)
-    .replace(/\/cortex\/inference:complete$/, "")
-    .replace(/\/api\/v2$/, "");
-  return `${normalized}/api/v2/cortex/inference:complete`;
-}
-
-function normalizeGigachatChatUrl(baseUrl) {
-  const normalized = normalizeBaseUrl(baseUrl).replace(/\/chat\/completions$/, "");
-  return `${normalized}/chat/completions`;
-}
-
-function normalizeOpenAIChatUrl(baseUrl) {
-  const normalized = normalizeBaseUrl(baseUrl);
-  if (
-    normalized.endsWith("/chat/completions") ||
-    normalized.endsWith("/responses") ||
-    normalized.endsWith("/chat")
-  ) {
-    return normalized;
-  }
-  if (normalized.endsWith("/v1")) {
-    return `${normalized}/chat/completions`;
-  }
-  // Assume OpenAI-compatible /v1/chat/completions path structure
-  // when the base URL is a bare hostname or custom path (e.g. llama.cpp, vLLM, LM Studio).
-  return `${normalized}/v1/chat/completions`;
-}
-
-function getOpenRouterConnectionPreset(
-  providerSpecificData?: Record<string, unknown> | null
-): string | null {
-  const preset =
-    typeof providerSpecificData?.preset === "string" ? providerSpecificData.preset.trim() : "";
-  return preset || null;
-}
-
 export class DefaultExecutor extends BaseExecutor {
   constructor(provider) {
     super(provider, PROVIDERS[provider] || PROVIDERS.openai);
     const registryEntry = getRegistryEntry(provider);
     if (registryEntry?.poolConfig) {
-      this.poolConfig = registryEntry.poolConfig as PoolConfig;
+      this.poolConfig = normalizePoolConfig(registryEntry.poolConfig) ?? undefined;
     }
   }
 
@@ -177,19 +232,20 @@ export class DefaultExecutor extends BaseExecutor {
     void urlIndex;
     if (this.provider?.startsWith?.("openai-compatible-")) {
       const psd = credentials?.providerSpecificData;
-      const baseUrl = psd?.baseUrl || "https://api.openai.com/v1";
+      const baseUrl = requireCompatibleBaseUrl(this.provider, psd); // #13452
       const normalized = baseUrl.replace(/\/$/, "");
       const customPath = typeof psd?.chatPath === "string" && psd.chatPath ? psd.chatPath : null;
       if (customPath) return `${normalized}${customPath}`;
+      const forceResponses = psd?._omnirouteForceResponsesUpstream === true;
       const path =
-        getOpenAICompatibleType(this.provider, psd) === "responses"
+        forceResponses || getOpenAICompatibleType(this.provider, psd) === "responses"
           ? "/responses"
           : "/chat/completions";
       return `${normalized}${path}`;
     }
     if (this.provider?.startsWith?.("anthropic-compatible-")) {
       const psd = credentials?.providerSpecificData;
-      const baseUrl = psd?.baseUrl || "https://api.anthropic.com/v1";
+      const baseUrl = requireCompatibleBaseUrl(this.provider, psd); // #13452
       const customPath = typeof psd?.chatPath === "string" && psd.chatPath ? psd.chatPath : null;
       if (isClaudeCodeCompatible(this.provider)) {
         return joinClaudeCodeCompatibleUrl(
@@ -200,21 +256,78 @@ export class DefaultExecutor extends BaseExecutor {
       const normalized = baseUrl.replace(/\/$/, "");
       return `${normalized}${customPath || "/messages"}`;
     }
+    // An alternate protocol selected on the connection carries a complete endpoint
+    // URL, so it must bypass the per-provider normalizers in the switch below —
+    // those assume the provider's default (OpenAI-shaped) path and would mangle it,
+    // e.g. appending "/chat/completions" to an Anthropic ".../v1/messages" endpoint.
+    {
+      const alternate = this.resolveAlternate(credentials);
+      const manualBaseUrl = credentials?.providerSpecificData?.baseUrl;
+      const hasManualBaseUrl = typeof manualBaseUrl === "string" && !!manualBaseUrl;
+      if (alternate?.baseUrl && !hasManualBaseUrl) {
+        // Operator's manual override (#6147) keeps its own semantics and falls
+        // through to the provider-specific handling below.
+        const normalized = xiaomiAlternateUrl(this.provider, alternate.baseUrl, credentials);
+        // A model-scoped alternate (the Gemini protocol: `{base}/{model}:generateContent`)
+        // builds its own URL — chatPath/urlSuffix are constants and cannot carry the model.
+        if (alternate.urlBuilder) return alternate.urlBuilder(normalized, model, stream);
+        return `${normalized}${alternate.chatPath || ""}${alternate.urlSuffix || ""}`;
+      }
+    }
     switch (this.provider) {
+      case "muse-code": {
+        const baseUrl = normalizeOpenAIChatUrl(this.resolveBaseUrl(credentials));
+        return baseUrl.replace(/\/(?:chat\/completions|chat)$/, "/responses");
+      }
+      case "perplexity-agent":
+        return this.config.baseUrl;
+      case "openai": {
+        // #5842: responses-only models (o1-pro / gpt-5.x-pro) 404 on
+        // /v1/chat/completions ("only supported in v1/responses"). Route them to
+        // the native /responses endpoint — the per-model targetFormat (registry tag
+        // + the -pro heuristic in getModelTargetFormat) is the single source of
+        // truth, keeping the URL in lockstep with the chatCore body translation.
+        // Mirrors the gh executor's targetFormat-driven routing (9router#102).
+        const customBaseUrl =
+          typeof credentials?.providerSpecificData?.baseUrl === "string" &&
+          credentials.providerSpecificData.baseUrl.trim()
+            ? (credentials.providerSpecificData.baseUrl as string)
+            : null;
+        const chatUrl = customBaseUrl ? normalizeOpenAIChatUrl(customBaseUrl) : this.config.baseUrl;
+        if (getModelTargetFormat("openai", model) === "openai-responses") {
+          return chatUrl.replace(/\/chat\/completions\/?$/, "/responses");
+        }
+        return chatUrl;
+      }
       case "bailian-coding-plan": {
-        const baseUrl = credentials?.providerSpecificData?.baseUrl || this.config.baseUrl;
+        const baseUrl = resolveAlibabaProviderBaseUrl(
+          this.provider,
+          credentials?.providerSpecificData,
+          this.config.baseUrl
+        );
         return normalizeBailianMessagesUrl(baseUrl);
       }
+      case "alibaba":
+      case "alibaba-cn":
+      case "qwen-cloud":
+      case "qwen-cloud-token-plan": {
+        const baseUrl = resolveAlibabaProviderBaseUrl(
+          this.provider,
+          credentials?.providerSpecificData,
+          this.config.baseUrl
+        );
+        return normalizeOpenAIChatUrl(baseUrl);
+      }
       case "heroku": {
-        const baseUrl = credentials?.providerSpecificData?.baseUrl || this.config.baseUrl;
+        const baseUrl = this.resolveBaseUrl(credentials);
         return normalizeHerokuChatUrl(baseUrl);
       }
       case "databricks": {
-        const baseUrl = credentials?.providerSpecificData?.baseUrl || this.config.baseUrl;
+        const baseUrl = this.resolveBaseUrl(credentials);
         return normalizeDatabricksChatUrl(baseUrl);
       }
       case "datarobot": {
-        const baseUrl = credentials?.providerSpecificData?.baseUrl || this.config.baseUrl;
+        const baseUrl = this.resolveBaseUrl(credentials);
         return normalizeDataRobotChatUrl(baseUrl);
       }
       case "azure-ai": {
@@ -224,11 +337,16 @@ export class DefaultExecutor extends BaseExecutor {
           forceResponses || credentials?.providerSpecificData?.apiType === "responses"
             ? "responses"
             : "chat";
-        const baseUrl = credentials?.providerSpecificData?.baseUrl || this.config.baseUrl;
-        return normalizeAzureAiChatUrl(baseUrl, apiType);
+        const baseUrl = this.resolveBaseUrl(credentials);
+        const apiVersion =
+          typeof credentials?.providerSpecificData?.apiVersion === "string" &&
+          credentials.providerSpecificData.apiVersion.trim()
+            ? credentials.providerSpecificData.apiVersion.trim()
+            : "2024-12-01-preview";
+        return normalizeAzureAiChatUrl(baseUrl, apiType, model, apiVersion);
       }
       case "watsonx": {
-        const baseUrl = credentials?.providerSpecificData?.baseUrl || this.config.baseUrl;
+        const baseUrl = this.resolveBaseUrl(credentials);
         return normalizeWatsonxChatUrl(baseUrl);
       }
       case "oci": {
@@ -238,33 +356,35 @@ export class DefaultExecutor extends BaseExecutor {
           forceResponses || credentials?.providerSpecificData?.apiType === "responses"
             ? "responses"
             : "chat";
-        const baseUrl = credentials?.providerSpecificData?.baseUrl || this.config.baseUrl;
+        const baseUrl = this.resolveBaseUrl(credentials);
         return normalizeOciChatUrl(baseUrl, apiType);
       }
       case "sap": {
-        const baseUrl = credentials?.providerSpecificData?.baseUrl || this.config.baseUrl;
+        const baseUrl = this.resolveBaseUrl(credentials);
         return normalizeSapChatUrl(baseUrl);
       }
-      case "xiaomi-mimo": {
-        const baseUrl = credentials?.providerSpecificData?.baseUrl || this.config.baseUrl;
-        return normalizeXiaomiMimoChatUrl(baseUrl);
-      }
+      case "xiaomi-mimo":
+      case "xiaomi-mimo-token-plan":
+        return xiaomiMimoChatUrl(this.provider, credentials, () =>
+          this.resolveBaseUrl(credentials)
+        );
       case "snowflake": {
-        const baseUrl = credentials?.providerSpecificData?.baseUrl || this.config.baseUrl;
+        const baseUrl = this.resolveBaseUrl(credentials);
         return normalizeSnowflakeChatUrl(baseUrl);
       }
       case "gigachat": {
-        const baseUrl = credentials?.providerSpecificData?.baseUrl || this.config.baseUrl;
+        const baseUrl = this.resolveBaseUrl(credentials);
         return normalizeGigachatChatUrl(baseUrl);
       }
       case "maritalk": {
-        const baseUrl = credentials?.providerSpecificData?.baseUrl || this.config.baseUrl;
+        const baseUrl = this.resolveBaseUrl(credentials);
         return buildMaritalkChatUrl(baseUrl);
       }
       case "siliconflow": {
-        const baseUrl = credentials?.providerSpecificData?.baseUrl || this.config.baseUrl;
+        const baseUrl = this.resolveBaseUrl(credentials);
         return normalizeOpenAIChatUrl(baseUrl);
       }
+      case "ollama-local":
       case "llama-cpp":
       case "lm-studio":
       case "modal":
@@ -287,23 +407,50 @@ export class DefaultExecutor extends BaseExecutor {
         return normalizeOpenAIChatUrl(baseUrl);
       }
       case "zai":
-      case "glm-coding-apikey": {
-        const zaiBaseUrl = credentials?.providerSpecificData?.baseUrl || this.config.baseUrl;
-        return `${zaiBaseUrl}?beta=true`;
+      case "glm-coding-apikey":
+        // #7364: format override extracted to zaiFormatOverride.ts (file-size ratchet).
+        return resolveZaiUrl(credentials, (fallback) => this.resolveBaseUrl(credentials, fallback));
+      case "poe": {
+        // #8969: Poe API-key surfaces — Chat Completions, Responses, and
+        // Claude-only Messages. Prefer the responses marker from
+        // resolveExecutionCredentials (incoming /v1/responses), then the
+        // registry Claude targetFormat → messagesUrl, else chat/completions.
+        // GPT models must never hit /v1/messages (Poe rejects non-Claude there).
+        const psd = credentials?.providerSpecificData;
+        const manualBaseUrl =
+          typeof psd?.baseUrl === "string" && psd.baseUrl.trim() ? psd.baseUrl.trim() : null;
+        const forceResponses = psd?._omnirouteForceResponsesUpstream === true;
+        const modelTarget = getModelTargetFormat("poe", model);
+        const connectionTarget =
+          typeof psd?.targetFormat === "string" ? (psd.targetFormat as string) : null;
+        const effectiveTarget = modelTarget || connectionTarget;
+
+        let protocol: "chat" | "responses" | "messages" = "chat";
+        if (forceResponses || effectiveTarget === "openai-responses") {
+          protocol = "responses";
+        } else if (effectiveTarget === "claude" && isPoeMessagesEligibleModel(model)) {
+          protocol = "messages";
+        }
+
+        return resolvePoeUpstreamUrl({
+          protocol,
+          configuredBaseUrl: manualBaseUrl,
+          responsesBaseUrl: this.config.responsesBaseUrl,
+          messagesUrl: this.config.messagesUrl,
+          defaultChatUrl: this.config.baseUrl,
+        });
       }
       case "claude":
       case "glm":
       case "glmt":
       case "kimi-coding":
-      case "minimax":
-      case "minimax-cn":
         return `${this.config.baseUrl}?beta=true`;
+      case "agentrouter":
+        return this.usesClaudeCodeProtocol(credentials)
+          ? `${this.config.baseUrl}?beta=true`
+          : this.config.baseUrl;
       case "gemini":
         return `${this.config.baseUrl}/${model}:${stream ? "streamGenerateContent?alt=sse" : "generateContent"}`;
-      case "qwen": {
-        const resourceUrl = credentials?.providerSpecificData?.resourceUrl;
-        return `https://${resourceUrl || "portal.qwen.ai"}/v1/chat/completions`;
-      }
       default: {
         // Honor a user-supplied custom base URL (providerSpecificData.baseUrl) for
         // OpenAI-format providers (e.g. the built-in "openai" provider pointed at a
@@ -327,41 +474,15 @@ export class DefaultExecutor extends BaseExecutor {
     }
   }
 
-  buildHeaders(credentials, stream = true, clientHeaders?: Record<string, string> | null) {
-    const headers = { "Content-Type": "application/json", ...this.config.headers };
-
-    // Allow per-provider User-Agent override via environment variable.
-    const providerId = this.config?.id || this.provider;
-    if (providerId) {
-      const envKey = `${providerId.toUpperCase().replace(/[^A-Z0-9]/g, "_")}_USER_AGENT`;
-      const envUA = process.env[envKey]?.trim();
-      if (envUA) {
-        headers["User-Agent"] = envUA;
-        if ("user-agent" in headers) {
-          headers["user-agent"] = envUA;
-        }
-      }
-    }
-
-    // T07: resolve extra keys round-robin locally since DefaultExecutor overrides BaseExecutor buildHeaders
-    const extraKeys =
-      (credentials.providerSpecificData?.extraApiKeys as string[] | undefined) ?? [];
-    const selectedKeyId = (credentials.providerSpecificData as Record<string, unknown> | undefined)
-      ?.selectedKeyId as string | undefined;
-    let effectiveKey = credentials.apiKey;
-    if (extraKeys.length > 0 && credentials.connectionId && credentials.apiKey) {
-      const resolved = resolveKeyForRequest(
-        credentials.connectionId,
-        credentials.apiKey,
-        extraKeys,
-        selectedKeyId ?? null
-      );
-      effectiveKey = resolved?.key ?? credentials.apiKey;
-      if (resolved && credentials.providerSpecificData) {
-        (credentials.providerSpecificData as Record<string, unknown>).selectedKeyId =
-          resolved.keyId;
-      }
-    }
+  buildHeaders(
+    credentials,
+    stream = true,
+    clientHeaders?: Record<string, string> | null,
+    model?: string | null,
+    _health?: unknown,
+    body?: unknown
+  ) {
+    const { headers, effectiveKey } = this.buildHeadersPreamble(credentials, stream);
 
     switch (this.provider) {
       case "gemini":
@@ -434,9 +555,26 @@ export class DefaultExecutor extends BaseExecutor {
       }
       case "claude":
       case "anthropic":
-        effectiveKey
-          ? (headers["x-api-key"] = effectiveKey)
-          : (headers["Authorization"] = `Bearer ${credentials.accessToken}`);
+        if (effectiveKey) {
+          headers["x-api-key"] = effectiveKey;
+          // Port of decolua/9router commit b977bf74:
+          // Third-party Anthropic-compatible gateways frequently require
+          // Authorization: Bearer ALONGSIDE x-api-key — without it they
+          // return 401 missing_api_key on every forward. Only emit the
+          // Bearer fallback for non-official upstreams; api.anthropic.com
+          // (and the empty/default baseUrl that targets it) must keep the
+          // x-api-key-only behavior to avoid regressing the official path.
+          const baseUrl = credentials?.providerSpecificData?.baseUrl || "";
+          const isOfficial = isOfficialAnthropicBaseUrl(baseUrl);
+          if (!isOfficial) {
+            headers["Authorization"] = `Bearer ${effectiveKey}`;
+          }
+        } else if (credentials.accessToken) {
+          headers["Authorization"] = `Bearer ${credentials.accessToken}`;
+        }
+        // If neither effectiveKey nor accessToken is available, emit no
+        // auth header — the handler will produce a clean "no credentials"
+        // 4xx instead of forwarding garbage auth headers to the upstream.
         break;
       case "glm":
       case "glmt":
@@ -447,8 +585,26 @@ export class DefaultExecutor extends BaseExecutor {
       case "glm-coding-apikey":
         headers["x-api-key"] = effectiveKey || credentials.accessToken;
         break;
+      case "clinepass": // dual-auth (OAuth or BYOK) — see applyClineAuthHeaders()
+        // buildClinepassHeaders() (called below via isClinepass=true) is the single
+        // source of truth for the OAuth-vs-BYOK decision, keyed off
+        // credentials.accessToken — do not re-decide it here off credentials.authType,
+        // which can diverge from the real credential shape (#11828 review).
+        if (credentials?.accessToken) {
+          console.debug("[Auth] Using OAuth token for Cline/Kilo Code request.");
+        } else {
+          console.debug("[Auth] Using direct API key for Cline/Kilo Code request.");
+        }
+        applyClineAuthHeaders(headers, credentials, effectiveKey, clientHeaders, true);
+        break;
+      case "cline": {
+        // OAuth: `workos:`-prefixed bearer + Cline client headers. BYOK API key: plain Bearer.
+        const byok = credentials?.authType === "apikey" || credentials?.authType === "api_key";
+        applyClineAuthHeaders(headers, credentials, effectiveKey, clientHeaders, byok);
+        break;
+      }
       default:
-        if (isClaudeCodeCompatible(this.provider)) {
+        if (this.usesClaudeCodeProtocol(credentials)) {
           const ccRequestDefaults = getClaudeCodeCompatibleRequestDefaults(
             credentials?.providerSpecificData
           );
@@ -458,6 +614,10 @@ export class DefaultExecutor extends BaseExecutor {
             credentials?.providerSpecificData?.ccSessionId,
             { redactThinking: ccRequestDefaults.redactThinking === true }
           );
+          if (usesCcWireImage(this.provider)) {
+            delete ccHeaders["Authorization"];
+            ccHeaders["x-api-key"] = effectiveKey || credentials.accessToken || "";
+          }
           // CC nodes are also anthropic-compatible-*, so honor operator custom
           // headers here (the early return skips the shared block below).
           applyCustomHeaders(ccHeaders, credentials.providerSpecificData?.customHeaders);
@@ -469,14 +629,38 @@ export class DefaultExecutor extends BaseExecutor {
           } else if (credentials.accessToken) {
             headers["Authorization"] = `Bearer ${credentials.accessToken}`;
           }
-          if (!headers["anthropic-version"]) {
+          // Port of decolua/9router commit b977bf74:
+          // Third-party Anthropic-compatible gateways frequently require
+          // Authorization: Bearer ALONGSIDE x-api-key — without it they
+          // return 401 missing_api_key on every forward. Only emit the
+          // Bearer fallback for non-official upstreams; api.anthropic.com
+          // (and the empty/default baseUrl that targets it) must keep the
+          // x-api-key-only behavior to avoid regressing the official path.
+          if (effectiveKey && !headers["Authorization"]) {
+            const baseUrl = credentials?.providerSpecificData?.baseUrl || "";
+            const isOfficialAnthropic = isOfficialAnthropicBaseUrl(baseUrl);
+            if (!isOfficialAnthropic) {
+              headers["Authorization"] = `Bearer ${effectiveKey}`;
+            }
+          }
+          // Default the anthropic-version header only when the caller/operator
+          // has not already supplied one. The lookup is case-insensitive so a
+          // pre-set "Anthropic-Version" (e.g. from this.config.headers or a
+          // custom header) is not clobbered with a duplicate lowercase entry.
+          const hasAnthropicVersion = Object.keys(headers).some(
+            (key) => key.toLowerCase() === "anthropic-version"
+          );
+          if (!hasAnthropicVersion) {
             headers["anthropic-version"] = "2023-06-01";
           }
         } else {
-          // Use registry authHeader if available, otherwise default to bearer
+          // Use registry authHeader if available, otherwise default to bearer.
+          // An alternate protocol selected on the connection carries its own auth
+          // scheme (e.g. claude uses x-api-key where openai uses bearer).
           const entry = getRegistryEntry(this.provider);
-          const authHeader = entry?.authHeader || "bearer";
-          const token = effectiveKey || credentials.accessToken;
+          const alternate = this.resolveAlternate(credentials);
+          const authHeader = alternate?.authHeader || entry?.authHeader || "bearer";
+          const token = effectiveKey || credentials.accessToken || entry?.anonymousApiKey;
           if (token) {
             if (authHeader === "x-api-key") {
               headers["x-api-key"] = token;
@@ -491,16 +675,6 @@ export class DefaultExecutor extends BaseExecutor {
 
     headers["Accept"] = stream ? "text/event-stream" : "application/json";
 
-    // Qwen header cleanup: Remove X-Dashscope-* headers if using an API key (DashScope compatible mode).
-    // If using OAuth (Qwen Code), we MUST keep them for portal.qwen.ai to accept the request.
-    if (this.provider === "qwen" && effectiveKey) {
-      for (const key of Object.keys(headers)) {
-        if (key.toLowerCase().startsWith("x-dashscope-")) {
-          delete headers[key];
-        }
-      }
-    }
-
     const isCompatibleProvider =
       this.provider?.startsWith?.("openai-compatible-") ||
       this.provider?.startsWith?.("anthropic-compatible-");
@@ -510,27 +684,9 @@ export class DefaultExecutor extends BaseExecutor {
     }
 
     // Forward client request metadata headers (from OpenCode or similar clients)
-    // Allowlist-based: only specific x-opencode-* headers and User-Agent are forwarded
+    // Allowlist-based: x-opencode-* headers only; the caller's User-Agent is NOT forwarded (#15632)
     if (clientHeaders) {
-      const clientUA = clientHeaders["User-Agent"] || clientHeaders["user-agent"];
-      if (clientUA) {
-        setUserAgentHeader(headers, clientUA);
-      }
-
-      const opencodeHeaderKeys = [
-        "x-opencode-session",
-        "x-opencode-request",
-        "x-opencode-project",
-        "x-opencode-client",
-      ];
-      for (const headerName of opencodeHeaderKeys) {
-        const value = Object.entries(clientHeaders).find(
-          ([key]) => key.toLowerCase() === headerName.toLowerCase()
-        )?.[1];
-        if (value) {
-          headers[headerName] = value;
-        }
-      }
+      forwardOpencodeClientHeaders(headers, clientHeaders, { forwardUserAgent: false });
 
       // #3974: merge the client's negotiated anthropic-beta (allowlisted) into the
       // outbound set. The registry's static ANTHROPIC_BETA_CLAUDE_OAUTH lacks
@@ -538,13 +694,100 @@ export class DefaultExecutor extends BaseExecutor {
       // 400 "Tool reference not found". Allowlist-merge preserves it without
       // forwarding betas the backend rejects.
       const clientBeta = clientHeaders["anthropic-beta"] ?? clientHeaders["Anthropic-Beta"] ?? null;
-      const betaKey = Object.keys(headers).find((key) => key.toLowerCase() === "anthropic-beta");
-      if (betaKey && clientBeta) {
-        headers[betaKey] = mergeClientAnthropicBeta(headers[betaKey], clientBeta);
-      }
+      // `model` gates the client-negotiated context-1m beta on the RESOLVED target:
+      // combo/fallback can route a request negotiated for a [1m] sibling onto a model
+      // that does not qualify (e.g. Haiku), which Anthropic rejects (#10119).
+      // `body` gates skills-2025-10-02 on presence of code_execution tool (#14200).
+      applyClientAnthropicBeta(headers, clientBeta, {
+        seedWhenAbsent: this.provider?.startsWith?.("anthropic-compatible-") === true,
+        model,
+        body,
+      });
     }
 
+    maybeAppendSkillsBeta(headers, this.provider, body, this.usesClaudeCodeProtocol(credentials));
+
+    normalizeAnthropicHeaderVariants(headers);
+
     return headers;
+  }
+
+  /**
+   * Downgrade `response_format: { type: "json_schema" }` to `json_object` for
+   * `openai-compatible-*` providers AND `kilocode`, injecting the JSON schema
+   * into the system prompt instead. DeepSeek / Ollama / local OpenAI-compatible
+   * models often lack native Structured Output and return empty or malformed
+   * content when a `json_schema` response_format is forwarded as-is (kilocode's
+   * DeepSeek V4 Flash rejects it with HTTP 400 `Invalid input: response_format`,
+   * verified live 2026-08-15 — same class as #9992's opencode fix). Gated so
+   * providers with native Structured Output support keep the native
+   * `json_schema` path.
+   */
+  applyJsonSchemaFallback<T>(body: T): T {
+    const provider = this.provider ?? "";
+    const isOpenAiCompatible = provider.startsWith("openai-compatible-");
+    const isKiloCode = provider === "kilocode";
+    if (!isOpenAiCompatible && !isKiloCode) return body;
+    if (!body || typeof body !== "object" || Array.isArray(body)) return body;
+
+    const record = body as Record<string, unknown>;
+    const rf = record.response_format as
+      { type?: string; json_schema?: { schema?: unknown } } | undefined;
+    if (!rf) return body;
+
+    // openai-compatible-* providers accept json_object natively — only the
+    // json_schema form needs downgrading there. kilocode rejects BOTH forms,
+    // so it enters the strip path below regardless.
+    if (isOpenAiCompatible && rf.type === "json_object") return body;
+
+    const schema = rf.type === "json_schema" ? rf.json_schema?.schema : undefined;
+    if (rf.type === "json_schema" && !schema) return body;
+
+    const schemaJson = schema ? JSON.stringify(schema, null, 2) : null;
+    const prompt =
+      schemaJson !== null
+        ? `You must respond with valid JSON that strictly follows this JSON schema:\n\`\`\`json\n${schemaJson}\n\`\`\`\nRespond ONLY with the JSON object, no other text.`
+        : "You must respond with valid JSON only (a single JSON object), no other text.";
+
+    const messages: Array<Record<string, unknown>> = Array.isArray(record.messages)
+      ? (record.messages as Array<Record<string, unknown>>).map((m) => ({ ...m }))
+      : [];
+    const sys = messages.find((m) => m.role === "system");
+    if (sys) {
+      if (typeof sys.content === "string") {
+        sys.content = `${sys.content}\n\n${prompt}`;
+      } else if (Array.isArray(sys.content)) {
+        sys.content.push({ type: "text", text: `\n\n${prompt}` });
+      }
+    } else {
+      messages.unshift({ role: "system", content: prompt });
+    }
+
+    // kilocode's DeepSeek rejects ANY response_format (verified live 2026-08-15:
+    // both json_schema AND json_object 400 with `param: response_format`) — strip
+    // it entirely and rely on the schema prompt. openai-compatible-* providers
+    // accept json_object, so keep the downgrade there.
+    if (isKiloCode) {
+      const { response_format: _dropped, ...rest } = record;
+      return { ...rest, messages } as T;
+    }
+    return { ...record, messages, response_format: { type: "json_object" } } as T;
+  }
+
+  // Some Responses-compatible upstreams (e.g. LM Studio) reject a request whose
+  // `text` is an object missing `text.format` with a 400 missing_required_parameter.
+  // The Responses API default for that field is { type: "text" }, so default it
+  // for openai-compatible "responses" providers before forwarding upstream.
+  defaultResponsesTextFormat<T>(body: T): T {
+    if (!this.provider?.startsWith?.("openai-compatible-")) return body;
+    if (!this.provider.includes("responses")) return body;
+    if (!body || typeof body !== "object" || Array.isArray(body)) return body;
+    const record = body as Record<string, unknown>;
+    const text = record.text;
+    if (!text || typeof text !== "object" || Array.isArray(text)) return body;
+    const textRecord = text as Record<string, unknown>;
+    if (textRecord.format !== undefined) return body;
+    return { ...record, text: { ...textRecord, format: { type: "text" } } } as T;
   }
 
   /**
@@ -558,6 +801,116 @@ export class DefaultExecutor extends BaseExecutor {
   transformRequest(model, body, stream, credentials) {
     const cleanedBody = super.transformRequest(model, body, stream, credentials);
     let withDefaults = applyProviderRequestDefaults(cleanedBody, this.config.requestDefaults);
+
+    // ponytail: backfill missing tool message names for strict OpenAI-compatible providers.
+    // Kimi K3 and some BYOK endpoints reject tool messages whose `name` field was stripped
+    // during combo routing or format translation. Build a tool_call_id → function.name
+    // lookup from assistant messages and restore missing names before forwarding.
+    if (
+      withDefaults &&
+      typeof withDefaults === "object" &&
+      !Array.isArray(withDefaults) &&
+      Array.isArray((withDefaults as Record<string, unknown>).messages)
+    ) {
+      withDefaults = ensureToolMessageNames(withDefaults as Record<string, unknown>);
+    }
+
+    withDefaults = this.applyJsonSchemaFallback(withDefaults);
+    withDefaults = this.defaultResponsesTextFormat(withDefaults);
+    if (this.provider === "perplexity-agent") {
+      withDefaults = defaultPerplexityAgentMaxOutputTokens(withDefaults);
+    }
+
+    if (this.provider === "nvidia") {
+      normalizeNvidiaToolCallIds(withDefaults);
+    }
+
+    // Port of decolua/9router commit d652300e:
+    // Cerebras returns 400 (wrong_api_format), Mistral returns 422
+    // (extra_forbidden), and NVIDIA's OpenAI-compatible wrapper returns 400
+    // (Unsupported parameter) when the forwarded body carries `client_metadata`
+    // (an OpenAI Codex / Claude CLI passthrough field with no equivalent on
+    // these upstreams). Strip it before sending downstream. Other providers
+    // (notably `openai` / `codex`) intentionally keep it.
+    if (
+      withDefaults &&
+      typeof withDefaults === "object" &&
+      !Array.isArray(withDefaults) &&
+      (this.provider === "cerebras" || this.provider === "mistral" || this.provider === "nvidia") &&
+      Object.prototype.hasOwnProperty.call(withDefaults, "client_metadata")
+    ) {
+      const withoutClientMetadata = { ...(withDefaults as Record<string, unknown>) };
+      delete withoutClientMetadata.client_metadata;
+      withDefaults = withoutClientMetadata;
+    }
+    // Nous Research inference gateway (portal.nousresearch.com) requires a top-level
+    // `tags` array containing at least a `user=` item on raw API-key requests (#11861).
+    // Without `tags`, upstream returns 400 "missing tags".
+    // Without `user=...`, upstream returns 400 "missing user tag".
+    if (
+      this.provider === "nous-research" &&
+      withDefaults &&
+      typeof withDefaults === "object" &&
+      !Array.isArray(withDefaults)
+    ) {
+      const record = withDefaults as Record<string, unknown>;
+      const extraBody = record.extra_body as Record<string, unknown> | undefined;
+
+      const rawTags = Array.isArray(record.tags)
+        ? (record.tags as unknown[])
+        : Array.isArray(extraBody?.tags)
+          ? (extraBody.tags as unknown[])
+          : [];
+
+      const stringTags = rawTags.filter(
+        (t): t is string => typeof t === "string" && t.trim().length > 0
+      );
+
+      const hasUserTag = stringTags.some((t) => t.startsWith("user="));
+      if (!hasUserTag) {
+        const username =
+          typeof record.user === "string" && record.user.trim() ? record.user.trim() : "omniroute";
+        record.tags = [...stringTags, `user=${username}`];
+      } else {
+        record.tags = stringTags;
+      }
+    }
+
+    // 9router#1649: Mistral's API returns 422 (extra_forbidden) when an
+    // assistant message carries a `reasoning_content` field (replayed thinking
+    // from a prior turn, e.g. via the Codex /responses path). The field is
+    // nested per-message, so the generic top-level 400/field-downgrade retry
+    // doesn't cover it. Strip it from every message before sending — scoped to
+    // Mistral so DeepSeek (which *requires* replayed reasoning_content) is
+    // unaffected.
+    if (
+      this.provider === "mistral" &&
+      withDefaults &&
+      typeof withDefaults === "object" &&
+      !Array.isArray(withDefaults) &&
+      Array.isArray((withDefaults as Record<string, unknown>).messages)
+    ) {
+      const record = withDefaults as Record<string, unknown>;
+      const messages = record.messages as unknown[];
+      let mutated = false;
+      const cleaned = messages.map((msg) => {
+        if (
+          msg &&
+          typeof msg === "object" &&
+          !Array.isArray(msg) &&
+          Object.prototype.hasOwnProperty.call(msg, "reasoning_content")
+        ) {
+          mutated = true;
+          const { reasoning_content: _dropped, ...rest } = msg as Record<string, unknown>;
+          return rest;
+        }
+        return msg;
+      });
+      if (mutated) {
+        withDefaults = { ...record, messages: cleaned };
+      }
+    }
+
     const targetFormat = getTargetFormat(this.provider, credentials?.providerSpecificData);
     const requestFormat =
       withDefaults && typeof withDefaults === "object" && !Array.isArray(withDefaults)
@@ -572,21 +925,11 @@ export class DefaultExecutor extends BaseExecutor {
           withDefaults = withoutStreamOptions;
         }
       } else if (stream && targetFormat === "openai" && requestFormat !== "openai-responses") {
-        // Port of decolua/9router#663 (closes upstream #557): Qwen rejects with
-        // 400 "'stream_options' only set this when you set stream: true" when the
-        // outgoing body carries `stream: false` (Claude Code / Claude-Code-
-        // compatible callers force the executor-level stream flag on via
-        // `upstreamStream = stream || isClaudeCodeCompatible`, but the body keeps
-        // the caller's original `stream: false`). Same upstream also rejects the
-        // injection when `thinking` / `enable_thinking` is set. Skip injection in
-        // those cases instead of unconditionally adding `stream_options`.
+        // Do not inject stream_options when the outgoing body explicitly disables streaming.
         const defaultsRecord = withDefaults as Record<string, unknown>;
-        const qwenBlocksStreamOptions =
-          this.provider === "qwen" &&
-          (defaultsRecord.stream === false ||
-            Boolean(defaultsRecord.thinking) ||
-            Boolean(defaultsRecord.enable_thinking));
-        if (qwenBlocksStreamOptions) {
+        const bodyDisablesStreamOptions =
+          defaultsRecord.stream !== undefined && defaultsRecord.stream !== true;
+        if (bodyDisablesStreamOptions) {
           if (Object.prototype.hasOwnProperty.call(defaultsRecord, "stream_options")) {
             const withoutStreamOptions = { ...defaultsRecord };
             delete withoutStreamOptions.stream_options;
@@ -595,6 +938,7 @@ export class DefaultExecutor extends BaseExecutor {
         } else if (!credentials?.providerSpecificData?.disableStreamOptions) {
           withDefaults = {
             ...withDefaults,
+            stream: true,
             stream_options: {
               ...((defaultsRecord.stream_options as object) || {}),
               include_usage: true,
@@ -624,7 +968,9 @@ export class DefaultExecutor extends BaseExecutor {
 
       // #1961: Map max_tokens -> max_completion_tokens for recent OpenAI models
       if (targetFormat === "openai") {
-        const isRecentOpenAI = /^(o1|o3|o4|gpt-5)/i.test(model);
+        const isRecentOpenAI = /^(?:openai\/)?(?:o1|o3|o4|gpt-(?:[5-9]|1\d)(?:[._-]|$))/i.test(
+          model
+        );
         if (isRecentOpenAI && withDefaults && typeof withDefaults === "object") {
           const defaultsRecord = withDefaults as Record<string, unknown>;
           if ("max_tokens" in defaultsRecord) {
@@ -643,13 +989,8 @@ export class DefaultExecutor extends BaseExecutor {
           };
         }
       }
-    }
 
-    if (this.provider === "qwen" && typeof withDefaults === "object" && withDefaults !== null) {
-      return sanitizeQwenThinkingToolChoice(
-        withDefaults as Record<string, unknown>,
-        "QwenExecutor"
-      );
+      withDefaults = applyZaiGlm53OpenAIDefaults(this.provider, model, withDefaults, stream);
     }
 
     // Config-driven strip of params unsupported by the target provider/model
@@ -658,9 +999,9 @@ export class DefaultExecutor extends BaseExecutor {
     // ../translator/paramSupport.ts so adding one means editing one table.
     if (typeof withDefaults === "object" && withDefaults !== null) {
       const bodyRecord = withDefaults as Record<string, unknown>;
-      const outboundModel =
-        typeof bodyRecord.model === "string" ? bodyRecord.model : model;
-      stripUnsupportedParams(this.provider, outboundModel, bodyRecord);
+      const outboundModel = typeof bodyRecord.model === "string" ? bodyRecord.model : model;
+      withDefaults = mapNvidiaGlm52ReasoningParams(bodyRecord, this.provider, outboundModel);
+      stripUnsupportedParams(this.provider, outboundModel, withDefaults as Record<string, unknown>);
     }
 
     // Apply modelIdPrefix from RegistryEntry (e.g. "accounts/fireworks/models/")
@@ -683,7 +1024,99 @@ export class DefaultExecutor extends BaseExecutor {
       }
     }
 
-    return withDefaults;
+    // Reasoning models burn all of max_tokens on the thinking phase when the budget is too
+    // small, leaving content empty (finish_reason: "length"); applies to all providers (#6912).
+    if (typeof withDefaults === "object" && withDefaults !== null) {
+      this.ensureThinkingBudget(withDefaults as Record<string, unknown>, model);
+    }
+
+    // 9router#1480: native Moonshot providers 400 when a prior assistant turn lacks
+    // reasoning_content. Scope to Moonshot ids, or a registry entry opting in via
+    // `requiresReasoningContentEcho` (e.g. `bai`'s DeepSeek resale, #13599).
+    const reasoningEcho =
+      this.provider === "kimi" ||
+      this.provider === "moonshot" ||
+      !!getRegistryEntry(this.provider)?.requiresReasoningContentEcho;
+    if (reasoningEcho) {
+      const outboundModel =
+        typeof (withDefaults as Record<string, unknown>)?.model === "string"
+          ? ((withDefaults as Record<string, unknown>).model as string)
+          : model;
+      if (shouldInjectReasoningContentPlaceholder(reasoningEcho, this.provider, outboundModel)) {
+        withDefaults = injectReasoningContentForThinkingModel(withDefaults);
+      }
+    }
+
+    const toolNameMaxLength = getRegistryEntry(this.provider)?.toolNameMaxLength;
+    if (
+      toolNameMaxLength &&
+      withDefaults &&
+      typeof withDefaults === "object" &&
+      !Array.isArray(withDefaults)
+    ) {
+      const toolNameMap = normalizeOpenAIToolNames(withDefaults, toolNameMaxLength);
+      if (toolNameMap.size > 0) {
+        const existingToolNameMap =
+          (withDefaults as Record<string, unknown>)._toolNameMap instanceof Map
+            ? ((withDefaults as Record<string, unknown>)._toolNameMap as Map<string, string>)
+            : null;
+        const responseToolNameMap = existingToolNameMap
+          ? new Map(existingToolNameMap)
+          : new Map<string, string>();
+        for (const [alias, original] of toolNameMap) {
+          responseToolNameMap.set(alias, original);
+        }
+        Object.defineProperty(withDefaults, "_toolNameMap", {
+          value: responseToolNameMap,
+          enumerable: false,
+          configurable: true,
+          writable: true,
+        });
+      }
+    }
+
+    return applyRegistryBodyRepairs(this.provider, withDefaults);
+  }
+
+  // Reasoning models (ClinePass, OpenRouter, etc.) leave content empty when the reasoning
+  // budget consumes all of max_tokens; bump max_tokens to a safe minimum when undersized.
+  ensureThinkingBudget(body: Record<string, unknown>, model: string): Record<string, unknown> {
+    if (!body) return body;
+
+    const outboundModel = typeof body.model === "string" ? body.model : model;
+    const entry = getRegistryEntry(this.provider);
+    const modelEntry = entry?.models?.find((m) => m.id === outboundModel);
+    if (!modelEntry?.supportsReasoning) return body;
+
+    const extraBody = body.extra_body as Record<string, unknown> | undefined;
+    const thinking = extraBody?.thinking as Record<string, unknown> | undefined;
+    const effort = body.reasoning_effort;
+    const reasoningEnabled =
+      thinking?.type === "enabled" ||
+      (typeof effort === "string" && effort !== "none" && effort !== "off") ||
+      effort === true ||
+      modelEntry.alwaysReasons === true;
+    if (!reasoningEnabled) return body;
+
+    const MIN_TOKENS = 4096;
+    const maxOutput =
+      typeof modelEntry.maxOutputTokens === "number" && modelEntry.maxOutputTokens > 0
+        ? modelEntry.maxOutputTokens
+        : MIN_TOKENS;
+    const target = Math.min(MIN_TOKENS, maxOutput);
+    const current = body.max_tokens ?? body.max_completion_tokens;
+
+    // #6912: keep whichever token key transformRequest already set (o1/o3/o4/gpt-5 use
+    // max_completion_tokens) instead of re-introducing max_tokens alongside it.
+    const tokenKey =
+      body.max_completion_tokens !== undefined ? "max_completion_tokens" : "max_tokens";
+
+    // #14888: a positive client budget is a choice. Raising it made reasoning
+    // models spend the whole window on thinking and return empty content.
+    if (typeof current !== "number" || current <= 0) {
+      body[tokenKey] = target;
+    }
+    return body;
   }
 
   /**
@@ -721,6 +1154,20 @@ export class DefaultExecutor extends BaseExecutor {
   }
 
   async execute(input: ExecuteInput) {
+    rejectStrictPool(input.validationDispatch, this.poolConfig);
+    // #6846 Phase 1: per-connection nvidia concurrency cap — no-op for other providers.
+    const releaseNvidiaSlot = await acquireNvidiaConcurrencySlot(
+      this.provider,
+      input.credentials?.connectionId
+    );
+    try {
+      return await this.executeWithSessionPool(input);
+    } finally {
+      releaseNvidiaSlot?.();
+    }
+  }
+
+  private async executeWithSessionPool(input: ExecuteInput) {
     const pool = this.getPool();
     if (!pool) return super.execute(input);
 

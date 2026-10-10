@@ -119,13 +119,14 @@ test("#2463 — undici error with a NON-STRING code must not crash on errCode.st
   assert.equal(await res.text(), "native-fallback-body");
 });
 
-test("does not retry when body is a ReadableStream (non-replayable body)", async () => {
+test("does not retry or native-fallback when body is a ReadableStream (non-replayable body)", async () => {
   let undiciCalls = 0;
   let nativeCalls = 0;
 
+  const dispatcherError = makeUndiciError("fetch failed");
   const mockUndici = async (_input: RequestInfo | URL, _init?: RequestInit): Promise<Response> => {
     undiciCalls++;
-    throw makeUndiciError("fetch failed");
+    throw dispatcherError;
   };
 
   const mockNative = async (_input: RequestInfo | URL, _init?: RequestInit): Promise<Response> => {
@@ -140,10 +141,17 @@ test("does not retry when body is a ReadableStream (non-replayable body)", async
     },
   });
 
-  const res = await proxyFetch(
-    "https://example.invalid/test",
-    { method: "POST", body: stream },
-    { undiciFetch: mockUndici, nativeFetch: mockNative }
+  await assert.rejects(
+    proxyFetch(
+      "https://example.invalid/test",
+      { method: "POST", body: stream },
+      { undiciFetch: mockUndici, nativeFetch: mockNative }
+    ),
+    (err: Error & { proxyFetchDetail?: string }) => {
+      assert.equal(err, dispatcherError, "must rethrow the original dispatcher error");
+      assert.match(err.proxyFetchDetail ?? "", /native=\[skipped: non-replayable request body\]/);
+      return true;
+    }
   );
 
   assert.equal(
@@ -151,8 +159,40 @@ test("does not retry when body is a ReadableStream (non-replayable body)", async
     1,
     "undici must NOT retry when body is a ReadableStream (called exactly once)"
   );
-  assert.equal(nativeCalls, 1, "native fallback fires after single undici attempt");
-  assert.equal(await res.text(), "native-stream-fallback");
+  assert.equal(nativeCalls, 0, "native fallback must NOT consume a non-replayable body");
+});
+
+test("does not retry or native-fallback when input is a Request with a body", async () => {
+  let undiciCalls = 0;
+  let nativeCalls = 0;
+
+  const dispatcherError = makeUndiciError("fetch failed");
+  const mockUndici = async (_input: RequestInfo | URL, _init?: RequestInit): Promise<Response> => {
+    undiciCalls++;
+    throw dispatcherError;
+  };
+
+  const mockNative = async (_input: RequestInfo | URL, _init?: RequestInit): Promise<Response> => {
+    nativeCalls++;
+    return new Response("native-request-fallback", { status: 200 });
+  };
+
+  const request = new Request("https://example.invalid/test", {
+    method: "POST",
+    body: "request-body",
+  });
+
+  await assert.rejects(
+    proxyFetch(request, {}, { undiciFetch: mockUndici, nativeFetch: mockNative }),
+    (err: Error & { proxyFetchDetail?: string }) => {
+      assert.equal(err, dispatcherError, "must rethrow the original dispatcher error");
+      assert.match(err.proxyFetchDetail ?? "", /native=\[skipped: non-replayable request body\]/);
+      return true;
+    }
+  );
+
+  assert.equal(undiciCalls, 1, "undici must NOT retry a Request body");
+  assert.equal(nativeCalls, 0, "native fallback must NOT replay a Request body");
 });
 
 // ── #4252: surface err.cause so silent "fetch failed" dispatcher bursts are diagnosable ──
@@ -198,6 +238,29 @@ test("#4252 describeFetchCause expands AggregateError sub-errors (Happy-Eyeballs
 
 test("#4252 describeFetchCause falls back to String(err) when nothing is structured", () => {
   assert.equal(describeFetchCause("boom"), "boom");
+});
+
+test("#8788 tagProxyUnreachable tags UND_ERR_SOCKET errors as PROXY_UNREACHABLE", async () => {
+  const socketErr = Object.assign(new Error("socket closed"), { code: "UND_ERR_SOCKET" });
+  await assert.rejects(
+    proxyFetch(
+      "https://example.invalid/socket-test",
+      { method: "GET" },
+      {
+        undiciFetch: async () => {
+          throw socketErr;
+        },
+        nativeFetch: async () => {
+          throw socketErr;
+        },
+      }
+    ),
+    (err: Error & { code?: string; errorCode?: string }) => {
+      assert.equal(err.code, "PROXY_UNREACHABLE");
+      assert.equal(err.errorCode, "proxy_unreachable");
+      return true;
+    }
+  );
 });
 
 test("#4252 both undici AND native fetch fail → rejects fast with cause detail attached", async () => {

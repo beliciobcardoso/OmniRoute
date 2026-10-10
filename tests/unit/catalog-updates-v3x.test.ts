@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 
 import { getModelsByProviderId } from "../../open-sse/config/providerModels.ts";
 import { resolveCanonicalProviderModel } from "../../open-sse/services/model.ts";
+import { getStaticModelsForProvider } from "../../src/lib/providers/staticModels.ts";
 import { DEFAULT_PRICING } from "../../src/shared/constants/pricing.ts";
 
 test("Pollinations catalog mirrors the current public text model lineup", () => {
@@ -22,64 +23,115 @@ test("Pollinations catalog mirrors the current public text model lineup", () => 
   );
 });
 
-test("Puter catalog exposes the currently documented Sonar models", () => {
-  const ids = new Set(getModelsByProviderId("puter").map((model) => model.id));
-
-  assert.ok(ids.has("perplexity/sonar"));
-  assert.ok(ids.has("perplexity/sonar-pro"));
-  assert.ok(ids.has("perplexity/sonar-pro-search"));
-  assert.ok(ids.has("perplexity/sonar-reasoning-pro"));
-  assert.ok(ids.has("perplexity/sonar-deep-research"));
-});
-
-test("NVIDIA catalog includes the verified 2026 additions and GPT OSS 20B alias resolution", () => {
+test("NVIDIA catalog includes the current hosted models and GPT OSS 120B alias resolution", () => {
   const ids = new Set(getModelsByProviderId("nvidia").map((model) => model.id));
 
-  assert.ok(ids.has("openai/gpt-oss-20b"));
+  assert.ok(ids.has("moonshotai/kimi-k3"));
+  assert.ok(ids.has("deepseek-ai/deepseek-v4-pro-0813"));
+  assert.ok(ids.has("deepseek-ai/deepseek-v4-flash-0731"));
+  assert.ok(ids.has("nvidia/nemotron-3.5-lightning-30b-a3b"));
+  assert.ok(ids.has("meta/muse-glimmer-30b"));
+  assert.ok(ids.has("google/diffusiongemma-26b-a4b-it"));
+  assert.ok(ids.has("openai/gpt-oss-120b"));
   assert.ok(ids.has("nvidia/nemotron-3-super-120b-a12b"));
-  assert.ok(ids.has("mistralai/mistral-large-3-675b-instruct-2512"));
-  assert.ok(ids.has("qwen/qwen3.5-397b-a17b"));
-  assert.ok(ids.has("mistralai/devstral-2-123b-instruct-2512"));
 
-  assert.deepEqual(resolveCanonicalProviderModel("nvidia", "gpt-oss-20b"), {
+  assert.deepEqual(resolveCanonicalProviderModel("nvidia", "gpt-oss-120b"), {
     provider: "nvidia",
-    model: "openai/gpt-oss-20b",
+    model: "openai/gpt-oss-120b",
   });
 });
 
-test("Fable 5 catalog exposes claude-fable-5 in cc and kiro providers with matching pricing", () => {
+test("Fable 5 catalog exposes claude-fable-5 in cc — but NOT via Kiro (fabricated)", () => {
+  // claude-fable-5 is a real Claude flagship served by the Claude Code (cc) channel,
+  // but Kiro's upstream never served it — it had been copied verbatim into the Kiro
+  // registry from OmniRoute's own Anthropic catalog and returned upstream 400
+  // "Invalid model". #6170 removed the fabricated Kiro copy.
   const ccIds = new Set(getModelsByProviderId("cc").map((m) => m.id));
   assert.ok(ccIds.has("claude-fable-5"), "cc must expose claude-fable-5");
-
-  const kiroModels = getModelsByProviderId("kiro");
-  const kiroIds = new Set(kiroModels.map((m) => m.id));
-  assert.ok(kiroIds.has("claude-fable-5"), "kiro must expose claude-fable-5");
-
-  const fable = kiroModels.find((m) => m.id === "claude-fable-5");
-  assert.equal(fable?.contextLength, 1000000);
-  assert.equal(fable?.maxOutputTokens, 128000);
 
   const ccPricing = (DEFAULT_PRICING as Record<string, Record<string, unknown>>).cc;
   assert.ok(ccPricing["claude-fable-5"], "cc pricing must include claude-fable-5");
 
-  const kiroPricing = (DEFAULT_PRICING as Record<string, Record<string, unknown>>).kiro;
-  assert.ok(kiroPricing["claude-fable-5"], "kiro pricing must include claude-fable-5");
+  const kiroIds = new Set(getModelsByProviderId("kiro").map((m) => m.id));
+  assert.equal(
+    kiroIds.has("claude-fable-5"),
+    false,
+    "kiro must NOT expose claude-fable-5 (fabricated)"
+  );
 });
 
-test("Kiro catalog exposes Claude Opus 4.8 alongside 4.7 with matching pricing", () => {
-  const models = getModelsByProviderId("kiro");
-  const ids = new Set(models.map((model) => model.id));
+test("Opus 5 catalog is limited to verified first-party, web, and Copilot providers", () => {
+  for (const providerId of ["claude", "github", "claude-web", "anthropic"]) {
+    const model = getModelsByProviderId(providerId).find((entry) => entry.id === "claude-opus-5");
+    assert.ok(model, `${providerId} must expose claude-opus-5`);
+  }
 
-  assert.ok(ids.has("claude-opus-4.8"), "kiro must expose claude-opus-4.8");
-  assert.ok(ids.has("claude-opus-4.7"), "kiro must still expose claude-opus-4.7");
+  const claude = getModelsByProviderId("claude").find((entry) => entry.id === "claude-opus-5");
+  assert.equal(claude?.contextLength, 1000000);
+  assert.equal(claude?.maxOutputTokens, 128000);
+  assert.ok(
+    getStaticModelsForProvider("claude")?.some((entry) => entry.id === "claude-opus-5"),
+    "claude OAuth discovery must expose claude-opus-5"
+  );
 
-  const opus48 = models.find((model) => model.id === "claude-opus-4.8");
-  assert.equal(opus48?.contextLength, 1000000);
-  assert.equal(opus48?.maxOutputTokens, 128000);
+  const github = getModelsByProviderId("github").find((entry) => entry.id === "claude-opus-5");
+  assert.equal(github?.targetFormat, "claude");
 
-  // Pricing for the Kiro channel must cover the new model so usage cost is non-zero.
+  const kiroIds = new Set(getModelsByProviderId("kiro").map((entry) => entry.id));
+  assert.equal(kiroIds.has("claude-opus-5"), false, "do not fabricate Kiro availability");
+
+  const pricing = DEFAULT_PRICING as Record<string, Record<string, unknown>>;
+  for (const providerId of ["cc", "gh", "anthropic"]) {
+    const price = pricing[providerId]["claude-opus-5"] as { input: number; output: number };
+    assert.equal(price.input, 5.0, `${providerId} Opus 5 input price`);
+    assert.equal(price.output, 25.0, `${providerId} Opus 5 output price`);
+  }
+});
+
+test("Sonnet 5 catalog exposes claude-sonnet-5 across cc/kiro/anthropic/blackbox with Sonnet-tier pricing", () => {
+  // Sonnet 5 must be wired everywhere the last flagship (Fable 5) was — but as a
+  // Sonnet-tier model: kiro's own table is $3/$15 (not the official $2/$10), 1M ctx / 128K out.
+  for (const providerId of ["cc", "kiro", "anthropic", "blackbox"]) {
+    const ids = new Set(getModelsByProviderId(providerId).map((m) => m.id));
+    assert.ok(ids.has("claude-sonnet-5"), `${providerId} must expose claude-sonnet-5`);
+  }
+
+  const kiroSonnet5 = getModelsByProviderId("kiro").find((m) => m.id === "claude-sonnet-5");
+  assert.equal(kiroSonnet5?.contextLength, 1000000);
+  assert.equal(kiroSonnet5?.maxOutputTokens, 128000);
+
+  const ccPricing = (DEFAULT_PRICING as Record<string, Record<string, unknown>>).cc;
+  assert.ok(ccPricing["claude-sonnet-5"], "cc pricing must include claude-sonnet-5");
+
   const kiroPricing = (DEFAULT_PRICING as Record<string, Record<string, unknown>>).kiro;
-  assert.ok(kiroPricing["claude-opus-4.8"], "kiro pricing must include claude-opus-4.8");
+  const kiroSonnet5Price = kiroPricing["claude-sonnet-5"] as { input: number; output: number };
+  assert.ok(kiroSonnet5Price, "kiro pricing must include claude-sonnet-5");
+  // Sonnet-tier, not Opus-tier — guards against copying Fable 5's $15/$75.
+  assert.equal(kiroSonnet5Price.input, 3.0);
+  assert.equal(kiroSonnet5Price.output, 15.0);
+});
+
+test("Kiro catalog does NOT expose Claude Opus (fabricated — Kiro upstream has no Opus)", () => {
+  // Kiro's real upstream never served any Opus model; the Opus 4.8/4.7/4.6 ids had been
+  // copied into the Kiro registry from OmniRoute's Anthropic catalog and returned upstream
+  // 400 "Invalid model. Please select a different model". #6170 removed them.
+  const ids = new Set(getModelsByProviderId("kiro").map((model) => model.id));
+
+  assert.equal(
+    ids.has("claude-opus-4.8"),
+    false,
+    "kiro must NOT expose claude-opus-4.8 (fabricated)"
+  );
+  assert.equal(
+    ids.has("claude-opus-4.7"),
+    false,
+    "kiro must NOT expose claude-opus-4.7 (fabricated)"
+  );
+  assert.equal(
+    ids.has("claude-opus-4.6"),
+    false,
+    "kiro must NOT expose claude-opus-4.6 (fabricated)"
+  );
 });
 
 test("Every Kiro registry model resolves a non-zero pricing row (no $0.00 usage)", async () => {
@@ -101,14 +153,15 @@ test("Every Kiro registry model resolves a non-zero pricing row (no $0.00 usage)
     );
   }
 
-  // Regression guard for the reported issue: Sonnet 4.6 must be priced like Sonnet 4.5.
-  const sonnet46 = getPricingForModel("kiro", "claude-sonnet-4.6") as {
+  // Regression guard: Kiro's real Sonnet is 4.5 (the "4.6" id was fabricated — #6170) and
+  // must carry Sonnet-tier pricing ($3/$15).
+  const sonnet45 = getPricingForModel("kiro", "claude-sonnet-4.5") as {
     input: number;
     output: number;
   } | null;
-  assert.ok(sonnet46, "kiro pricing must include claude-sonnet-4.6");
-  assert.equal(sonnet46?.input, 3.0);
-  assert.equal(sonnet46?.output, 15.0);
+  assert.ok(sonnet45, "kiro pricing must include claude-sonnet-4.5");
+  assert.equal(sonnet45?.input, 3.0);
+  assert.equal(sonnet45?.output, 15.0);
 });
 
 test("Every OpenAI registry model resolves a non-zero pricing row (alias: openai)", async () => {
@@ -148,34 +201,4 @@ test("Every Codex registry model resolves a non-zero pricing row (alias: cx)", a
       `cx pricing for "${model.id}" must have numeric input/output`
     );
   }
-});
-
-test("Every Qwen registry model resolves a non-zero pricing row (alias: qw)", async () => {
-  const { getPricingForModel } = await import("../../src/shared/constants/pricing.ts");
-  const models = getModelsByProviderId("qwen");
-  assert.ok(models.length > 0, "qwen must expose models");
-
-  for (const model of models) {
-    // Qwen pricing lives under the "qw" alias (its DEFAULT_PRICING key).
-    const pricing = getPricingForModel("qw", model.id) as {
-      input?: number;
-      output?: number;
-    } | null;
-    assert.ok(pricing, `qw pricing must include qwen model "${model.id}"`);
-    assert.equal(
-      typeof pricing?.input === "number" && typeof pricing?.output === "number",
-      true,
-      `qw pricing for "${model.id}" must have numeric input/output`
-    );
-  }
-
-  // Regression guard: the "coder-model" id (Qwen3.5/3.6 Coder Model, ported from
-  // upstream 9router PR #156) must be priced like the other Qwen coder tier.
-  const coderModel = getPricingForModel("qw", "coder-model") as {
-    input: number;
-    output: number;
-  } | null;
-  assert.ok(coderModel, "qw pricing must include coder-model");
-  assert.equal(typeof coderModel?.input, "number");
-  assert.equal(typeof coderModel?.output, "number");
 });

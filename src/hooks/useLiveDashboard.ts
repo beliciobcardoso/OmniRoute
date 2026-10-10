@@ -11,25 +11,40 @@
 
 "use client";
 
-import { useEffect, useRef, useState, useCallback } from "react";
+import { useEffect, useRef, useState, useCallback, useMemo } from "react";
 import type { DashboardChannel, DashboardEventName } from "@/lib/events/types";
+import { deriveLiveWsPath, resolveLiveWsUrl, sanitizeLiveWsPort } from "@/shared/utils/wsPath";
 
 // ── Config ────────────────────────────────────────────────────────────────
 
 const WS_RECONNECT_DELAYS = [1000, 2000, 4000, 8000, 16000, 30000];
+
+// Must stay <= the server's HEARTBEAT_TIMEOUT_MS (35s in src/server/ws/liveServer.ts) so a
+// healthy, connected-but-idle client is never force-terminated by the server's heartbeat sweep.
+// Matches the server's own HEARTBEAT_INTERVAL_MS (15s).
+const CLIENT_PING_INTERVAL_MS = 15_000;
+
+/** Only accept ws:// or wss:// URLs (mirrors the guard in src/app/api/v1/ws/route.ts). */
+function sanitizeWsPublicUrl(url: unknown): string | null {
+  if (typeof url !== "string" || url.length === 0) return null;
+  return url.startsWith("ws://") || url.startsWith("wss://") ? url : null;
+}
+
+// Build-time inlined value (Docker/npm prebuilt images won't have this — the
+// runtime value is discovered via the /api/v1/ws?handshake=1 handshake below).
+const BUILD_TIME_PUBLIC_WS_URL = sanitizeWsPublicUrl(process.env.NEXT_PUBLIC_LIVE_WS_PUBLIC_URL);
+const BUILD_TIME_WS_PATH = deriveLiveWsPath(process.env.NEXT_PUBLIC_LIVE_WS_PUBLIC_URL);
+
 function getDefaultWsUrl(): string {
-  if (typeof window === "undefined") return "ws://localhost:20129";
+  if (BUILD_TIME_PUBLIC_WS_URL) return BUILD_TIME_PUBLIC_WS_URL;
+  if (typeof window === "undefined") return `ws://localhost:20132${BUILD_TIME_WS_PATH}`;
   const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
   const { hostname } = window.location;
-  // Bug #1 fix: Use the WS server's actual port (20129) for both loopback
-  // and non-loopback clients. Previously the non-loopback branch tried to
-  // upgrade the HTTP port (window.location.host) which has no upgrade
-  // handler in src/proxy.ts. If the user wants the upgrade to go through
-  // Next.js (same-origin), they should explicitly pass `wsUrl`.
-  if (hostname === "localhost" || hostname === "127.0.0.1" || hostname === "::1") {
-    return `${protocol}//${hostname}:20129`;
-  }
-  return `${protocol}//${hostname}:20129`;
+  // The WS server's own port, for loopback and non-loopback alike: the HTTP
+  // port has no upgrade handler in src/proxy.ts. This is only the starting
+  // point - the handshake below replaces the port when the server reports a
+  // different one, and a caller can always pass `wsUrl` outright.
+  return `${protocol}//${hostname}:20132${BUILD_TIME_WS_PATH}`;
 }
 
 const DEFAULT_WS_URL = getDefaultWsUrl();
@@ -53,7 +68,7 @@ export interface DashboardConnectionState {
 // ── Core Hook ─────────────────────────────────────────────────────────────
 
 export interface UseLiveDashboardOptions {
-  /** WebSocket URL (default: ws://hostname:20129) */
+  /** WebSocket URL (default: ws://hostname:20132) */
   wsUrl?: string;
   /** Whether the WebSocket connection should be active (default: true) */
   enabled?: boolean;
@@ -72,7 +87,7 @@ export interface UseLiveDashboardOptions {
  * Manages connection lifecycle, reconnection, and event streaming.
  */
 export function useLiveDashboard({
-  wsUrl = DEFAULT_WS_URL,
+  wsUrl,
   enabled = true,
   apiKey,
   channels = ["requests", "combo", "credentials"],
@@ -86,16 +101,86 @@ export function useLiveDashboard({
     reconnectAttempt: 0,
   });
 
+  // Runtime discovery of the public WS URL via the handshake endpoint.
+  // NEXT_PUBLIC_* env vars are inlined at build time, so prebuilt Docker/npm
+  // images never see a runtime NEXT_PUBLIC_LIVE_WS_PUBLIC_URL — the server
+  // echoes it in the /api/v1/ws?handshake=1 response instead.
+  // Skipped when the caller passes an explicit wsUrl or the env was inlined.
+  const needsHandshake = !wsUrl && !BUILD_TIME_PUBLIC_WS_URL && typeof window !== "undefined";
+  const [handshakeUrl, setHandshakeUrl] = useState<string | null>(null);
+  const [handshakePath, setHandshakePath] = useState<string | null>(null);
+  const [handshakePort, setHandshakePort] = useState<number | null>(null);
+  const [wsUrlResolved, setWsUrlResolved] = useState(!needsHandshake);
+
+  useEffect(() => {
+    if (!needsHandshake || wsUrlResolved) return;
+    let cancelled = false;
+    fetch("/api/v1/ws?handshake=1")
+      .then((res) => (res.ok ? res.json() : null))
+      .then((body) => {
+        if (cancelled) return;
+        const publicUrl = sanitizeWsPublicUrl(body?.live?.publicUrl);
+        if (publicUrl) setHandshakeUrl(publicUrl);
+        if (typeof body?.live?.path === "string" && body.live.path.startsWith("/")) {
+          setHandshakePath(body.live.path);
+        }
+        // The live server reports the port it is actually listening on, so a
+        // LIVE_WS_PORT override reaches a prebuilt image instead of being
+        // overruled by the compiled-in default (#11331).
+        const port = sanitizeLiveWsPort(body?.live?.port);
+        if (port !== null) setHandshakePort(port);
+      })
+      .catch(() => {
+        // Handshake unavailable — fall back to the default URL.
+      })
+      .finally(() => {
+        if (!cancelled) setWsUrlResolved(true);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [needsHandshake, wsUrlResolved]);
+
+  const effectiveWsUrl = resolveLiveWsUrl({
+    explicit: wsUrl,
+    handshakeUrl,
+    handshakePort,
+    handshakePath: handshakePath !== BUILD_TIME_WS_PATH ? handshakePath : null,
+    defaultUrl: DEFAULT_WS_URL,
+  });
+
   const [events, setEvents] = useState<WsEventPayload[]>([]);
   const wsRef = useRef<WebSocket | null>(null);
   const reconnectTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const pingIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const mountedRef = useRef(true);
+  // Consecutive connection attempts that ended without an accepted session. A ref,
+  // not state: bumping it must not re-create `connect`, whose effect cleanup would
+  // drop the next socket mid-handshake.
+  const failedAttemptsRef = useRef(0);
+  // Each bump makes the connect effect open a fresh socket (backoff timer, reconnect()).
+  const [reconnectTick, setReconnectTick] = useState(0);
+
+  const stopPingHeartbeat = useCallback(() => {
+    if (pingIntervalRef.current) {
+      clearInterval(pingIntervalRef.current);
+      pingIntervalRef.current = null;
+    }
+  }, []);
   const maxEvents = 500;
 
   const onEventRef = useRef(onEvent);
   useEffect(() => {
     onEventRef.current = onEvent;
   }, [onEvent]);
+
+  // Key + memo pair: the channel ARRAY is usually a fresh literal each render,
+  // so `connect` deps use a stable identity derived from its contents.
+  const channelsKey = channels.join(",");
+  const stableChannels = useMemo(
+    () => channelsKey.split(",").filter(Boolean) as DashboardChannel[],
+    [channelsKey]
+  );
 
   const connect = useCallback(() => {
     if (!mountedRef.current) return;
@@ -108,26 +193,40 @@ export function useLiveDashboard({
     }));
 
     try {
-      const wsUrlWithAuth = apiKey ? `${wsUrl}?token=${encodeURIComponent(apiKey)}` : wsUrl;
+      const wsUrlWithAuth = apiKey
+        ? `${effectiveWsUrl}?token=${encodeURIComponent(apiKey)}`
+        : effectiveWsUrl;
 
       const ws = new WebSocket(wsUrlWithAuth);
       wsRef.current = ws;
 
       ws.onopen = () => {
-        if (!mountedRef.current) return;
-        setConnection({
+        if (!mountedRef.current || wsRef.current !== ws) return;
+        // The server authorizes only after the upgrade, so `open` is not an accepted
+        // session yet: the backoff resets on "welcome", not here.
+        setConnection((prev) => ({
+          ...prev,
           isConnected: true,
           isConnecting: false,
           error: null,
-          reconnectAttempt: 0,
-        });
+        }));
 
         // Subscribe to channels
-        ws.send(JSON.stringify({ type: "subscribe", channels }));
+        ws.send(JSON.stringify({ type: "subscribe", channels: stableChannels }));
+
+        // Heartbeat: send a periodic ping so the server (which only refreshes
+        // liveness from inbound messages) never terminates a healthy, idle
+        // connection for exceeding its inactivity timeout (#10319).
+        stopPingHeartbeat();
+        pingIntervalRef.current = setInterval(() => {
+          if (ws.readyState === WebSocket.OPEN) {
+            ws.send(JSON.stringify({ type: "ping" }));
+          }
+        }, CLIENT_PING_INTERVAL_MS);
       };
 
       ws.onmessage = (event) => {
-        if (!mountedRef.current) return;
+        if (!mountedRef.current || wsRef.current !== ws) return;
         try {
           const msg = JSON.parse(event.data);
 
@@ -146,6 +245,9 @@ export function useLiveDashboard({
           } else if (msg.type === "pong") {
             // Heartbeat response
           } else if (msg.type === "welcome") {
+            // First frame of an accepted session: the backoff starts over.
+            failedAttemptsRef.current = 0;
+            setConnection((prev) => ({ ...prev, reconnectAttempt: 0 }));
             // Send backlog
             if (Array.isArray(msg.data)) {
               setEvents((prev) => {
@@ -171,6 +273,9 @@ export function useLiveDashboard({
       };
 
       ws.onclose = () => {
+        // A superseded socket must not touch the refs its successor now owns.
+        if (wsRef.current !== ws) return;
+        stopPingHeartbeat();
         if (!mountedRef.current) return;
         wsRef.current = null;
         setConnection((prev) => ({
@@ -180,19 +285,18 @@ export function useLiveDashboard({
         }));
 
         if (autoReconnect) {
-          const attempt = connection.reconnectAttempt;
+          const attempt = failedAttemptsRef.current;
+          failedAttemptsRef.current = attempt + 1;
           const delay = WS_RECONNECT_DELAYS[Math.min(attempt, WS_RECONNECT_DELAYS.length - 1)];
           reconnectTimeoutRef.current = setTimeout(() => {
-            setConnection((prev) => ({
-              ...prev,
-              reconnectAttempt: prev.reconnectAttempt + 1,
-            }));
+            setConnection((prev) => ({ ...prev, reconnectAttempt: attempt + 1 }));
+            setReconnectTick((tick) => tick + 1);
           }, delay);
         }
       };
 
       ws.onerror = () => {
-        if (!mountedRef.current) return;
+        if (!mountedRef.current || wsRef.current !== ws) return;
         setConnection((prev) => ({
           ...prev,
           isConnecting: false,
@@ -206,7 +310,7 @@ export function useLiveDashboard({
         error: err instanceof Error ? err.message : "Connection failed",
       }));
     }
-  }, [wsUrl, apiKey, channels.join(","), autoReconnect, connection.reconnectAttempt]);
+  }, [effectiveWsUrl, apiKey, stableChannels, autoReconnect, stopPingHeartbeat]);
 
   // Connect on mount and on reconnect trigger
   useEffect(() => {
@@ -216,8 +320,11 @@ export function useLiveDashboard({
         clearTimeout(reconnectTimeoutRef.current);
         reconnectTimeoutRef.current = null;
       }
-      wsRef.current?.close();
+      stopPingHeartbeat();
+      const ws = wsRef.current;
       wsRef.current = null;
+      ws?.close();
+      failedAttemptsRef.current = 0;
       setConnection({
         isConnected: false,
         isConnecting: false,
@@ -227,23 +334,29 @@ export function useLiveDashboard({
       return;
     }
 
+    // Wait for the handshake URL resolution before opening the socket, so we
+    // never connect to the hardcoded default and then flap to the public URL.
+    if (!wsUrlResolved) return;
+
     connect();
     return () => {
       mountedRef.current = false;
       if (reconnectTimeoutRef.current) {
         clearTimeout(reconnectTimeoutRef.current);
       }
-      wsRef.current?.close();
+      stopPingHeartbeat();
+      const ws = wsRef.current;
+      wsRef.current = null;
+      ws?.close();
     };
-  }, [connect, enabled]);
+  }, [connect, enabled, wsUrlResolved, stopPingHeartbeat, reconnectTick]);
 
   // Connect (for manual retry)
   const reconnect = useCallback(() => {
-    wsRef.current?.close();
-    setConnection((prev) => ({
-      ...prev,
-      reconnectAttempt: prev.reconnectAttempt + 1,
-    }));
+    const ws = wsRef.current;
+    wsRef.current = null;
+    ws?.close();
+    setReconnectTick((tick) => tick + 1);
   }, []);
 
   return {

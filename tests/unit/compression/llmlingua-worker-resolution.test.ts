@@ -39,9 +39,16 @@ test("worker.ts CODE never uses import.meta.url / createRequire (both die in the
     !code.includes('from "node:module"'),
     "worker.ts must not import from node:module (createRequire)"
   );
-  assert.ok(
-    !code.includes('from "node:url"'),
-    "worker.ts must not import from node:url (fileURLToPath)"
+  // pathToFileURL from node:url is safe — it's a pure path→URL converter with no
+  // import.meta.url or createRequire dependency. It's needed to fix "File URL path
+  // must be absolute" errors when the Worker constructor receives a path that needs
+  // explicit file: URL conversion.
+  const urlImports = code.match(/from\s+["']node:url["']/g) ?? [];
+  const safeUrlImports = urlImports.filter((imp) => code.includes("pathToFileURL"));
+  assert.equal(
+    urlImports.length,
+    safeUrlImports.length,
+    "worker.ts must not import fileURLToPath or other unsafe node:url APIs (pathToFileURL is allowed)"
   );
 });
 
@@ -60,7 +67,7 @@ test("firstAncestorWith walks up from anchors to find a marker", () => {
     assert.equal(found, path.join(tmp, "dist"), "must find the dist root by walking up");
     assert.equal(firstAncestorWith([anchor], path.join("node_modules", "nope")), null);
   } finally {
-    fs.rmSync(tmp, { recursive: true, force: true });
+    fs.rmSync(tmp, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
   }
 });
 
@@ -69,6 +76,28 @@ test("resolveWorkerFile returns an existing onnxWorker file (no import.meta.url)
   const { workerFile } = resolveWorkerFile();
   assert.ok(fs.existsSync(workerFile), `resolved worker file must exist: ${workerFile}`);
   assert.ok(/onnxWorker\.(t|j)s$/.test(workerFile), `must point at onnxWorker: ${workerFile}`);
+});
+
+test("resolveWorkerFile chooses TS over a tracked JS placeholder in the source tree", () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "slm-placeholder-"));
+  const originalCwd = process.cwd();
+  const originalArgv1 = process.argv[1];
+  try {
+    const dir = path.join(root, "open-sse", "services", "compression", "engines", "llmlingua");
+    fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(path.join(dir, "onnxWorker.js"), "export {};\n");
+    fs.writeFileSync(path.join(dir, "onnxWorker.ts"), "// source worker\n");
+    process.chdir(root);
+    process.argv[1] = path.join(root, "server.js");
+    assert.deepEqual(resolveWorkerFile(), {
+      workerFile: path.join(dir, "onnxWorker.ts"),
+      execArgv: ["--import", "tsx/esm"],
+    });
+  } finally {
+    process.argv[1] = originalArgv1;
+    process.chdir(originalCwd);
+    fs.rmSync(root, { recursive: true, force: true });
+  }
 });
 
 test("depsAvailable is true when @atjsh/llmlingua-2 is installed (symlinked node_modules)", () => {

@@ -7,6 +7,10 @@ import { pickDisplayValue } from "@/shared/utils/maskEmail";
 import { readBooleanToggle, providerCountText } from "../providerPageHelpers";
 import { compareTr } from "@/shared/utils/turkishText";
 import type { CodexGlobalServiceMode } from "@/lib/providers/codexFastTier";
+import { supportsProviderQuota } from "@/shared/utils/providerQuotaVisibility";
+import type { ConnectionDeleteConfirmState } from "../hooks/useConnectionDeleteConfirm";
+import type { ProviderQuotaCacheEntry } from "../hooks/useProviderQuota";
+import { filterConnectionsByQuery } from "../connectionsSearchFilter";
 
 type ConnectionsListPanelProps = {
   connections: ConnectionRowConnection[];
@@ -24,26 +28,39 @@ type ConnectionsListPanelProps = {
   distributingProxies: boolean;
   healthFilter: string;
   page: number;
+  accountSearch: string;
   PAGE_SIZE: number;
-  connProxyMap: Record<string, { proxy?: { host?: string }; level?: string } | undefined>;
+  connProxyMap: Record<
+    string,
+    { proxy?: { host?: string; name?: string }; level?: string } | undefined
+  >;
   proxyConfig: any;
   applyingCodexAuthId: string | null;
   exportingCodexAuthId: string | null;
   applyingClaudeAuthId: string | null;
   exportingClaudeAuthId: string | null;
-  applyingGeminiAuthId: string | null;
-  exportingGeminiAuthId: string | null;
   emailsVisible: boolean;
   // Setters
   setSelectedIds: React.Dispatch<React.SetStateAction<Set<string>>>;
   setPage: React.Dispatch<React.SetStateAction<number>>;
   setHealthFilter: (v: string) => void;
+  setAccountSearch: (v: string) => void;
   // Callbacks from useProviderConnections
-  handleDelete: (id: string) => void;
+  deleteConfirm: ConnectionDeleteConfirmState;
   handleUpdateConnectionStatus: (id: string, isActive: boolean) => void;
   handleToggleRateLimit: (id: string, enabled: boolean) => void;
+  handleToggleQuotaVisibility: (id: string, visible: boolean) => void;
   handleToggleClaudeExtraUsage: (id: string, enabled: boolean) => void;
+  handleToggleCodexPaidCredits: (id: string, enabled: boolean) => void;
+  canAutoSync?: boolean;
+  handleToggleConnectionAutoSync?: (connectionId: string, enabled: boolean) => void;
   handleToggleCliproxyapiMode: (id: string, enabled: boolean) => void;
+  handleSetUpstreamProxyMode: (
+    mode: "native" | "cliproxyapi" | "dario" | "fallback",
+    fallbackBackend?: "cliproxyapi" | "dario"
+  ) => void;
+  upstreamProxyMode: "native" | "cliproxyapi" | "dario" | "fallback";
+  upstreamProxyFallbackBackend: "cliproxyapi" | "dario";
   handleToggleCodexLimit: (id: string, type: "use5h" | "useWeekly", enabled: boolean) => void;
   handleToggleProxyEnabled: (id: string, enabled: boolean) => void;
   handleTogglePerKeyProxyEnabled: (id: string, enabled: boolean) => void;
@@ -57,6 +74,10 @@ type ConnectionsListPanelProps = {
   handleToggleSelectAll: () => void;
   handleDistributeProxies: (tag?: string) => void;
   cpaProviderEnabled: boolean;
+  // Per-account quota strip (useProviderQuota) — threaded to every row.
+  quotaByConnectionId: Record<string, ProviderQuotaCacheEntry>;
+  quotaRefreshingIds: ReadonlySet<string>;
+  handleRefreshQuota: (id: string) => void;
   // Modal triggers (all pass through from client, no closing over client internals)
   onOpenEditModal: (conn: ConnectionRowConnection) => void;
   onOpenOAuth: (conn: ConnectionRowConnection) => void;
@@ -65,11 +86,27 @@ type ConnectionsListPanelProps = {
   onExportCodexAuthFile: (connId: string) => void;
   onOpenApplyClaudeModal: (connId: string) => void;
   onExportClaudeAuthFile: (connId: string) => void;
-  onOpenApplyGeminiModal: (connId: string) => void;
-  onExportGeminiAuthFile: (connId: string) => void;
   gateConnectionFlow: (callback: () => void) => void;
   t: any; // ProviderMessageTranslator
 };
+
+function quotaVisibilityHandler(
+  supported: boolean,
+  connectionId: string,
+  toggle: (id: string, visible: boolean) => void
+) {
+  return supported ? (visible: boolean) => toggle(connectionId, visible) : undefined;
+}
+
+// #7643 — extracted so the two ConnectionRow render call sites (already
+// oversized map callbacks) don't each pick up a new `||` decision point.
+function resolveConnProxyField(
+  connProxyMap: ConnectionsListPanelProps["connProxyMap"],
+  connId: string,
+  field: "host" | "name"
+): string | null {
+  return connProxyMap[connId]?.proxy?.[field] || null;
+}
 
 export default function ConnectionsListPanel({
   connections,
@@ -87,6 +124,7 @@ export default function ConnectionsListPanel({
   distributingProxies,
   healthFilter,
   page,
+  accountSearch,
   PAGE_SIZE,
   connProxyMap,
   proxyConfig,
@@ -94,17 +132,22 @@ export default function ConnectionsListPanel({
   exportingCodexAuthId,
   applyingClaudeAuthId,
   exportingClaudeAuthId,
-  applyingGeminiAuthId,
-  exportingGeminiAuthId,
   emailsVisible,
   setSelectedIds,
   setPage,
   setHealthFilter,
-  handleDelete,
+  setAccountSearch,
+  deleteConfirm,
   handleUpdateConnectionStatus,
   handleToggleRateLimit,
+  handleToggleQuotaVisibility,
   handleToggleClaudeExtraUsage,
+  handleToggleCodexPaidCredits,
+  handleToggleConnectionAutoSync,
   handleToggleCliproxyapiMode,
+  handleSetUpstreamProxyMode,
+  upstreamProxyMode,
+  upstreamProxyFallbackBackend,
   handleToggleCodexLimit,
   handleToggleProxyEnabled,
   handleTogglePerKeyProxyEnabled,
@@ -118,6 +161,10 @@ export default function ConnectionsListPanel({
   handleToggleSelectAll,
   handleDistributeProxies,
   cpaProviderEnabled,
+  quotaByConnectionId,
+  quotaRefreshingIds,
+  handleRefreshQuota,
+  canAutoSync,
   onOpenEditModal,
   onOpenOAuth,
   onSetProxyTarget,
@@ -125,12 +172,11 @@ export default function ConnectionsListPanel({
   onExportCodexAuthFile,
   onOpenApplyClaudeModal,
   onExportClaudeAuthFile,
-  onOpenApplyGeminiModal,
-  onExportGeminiAuthFile,
   gateConnectionFlow,
   t,
 }: ConnectionsListPanelProps) {
   const sorted = [...connections].sort((a, b) => (a.priority || 0) - (b.priority || 0));
+  const quotaSupported = supportsProviderQuota(providerId);
   const hasAnyTag = sorted.some((c) => c.providerSpecificData?.tag as string | undefined);
   const allSelected = selectedIds.size === connections.length && connections.length > 0;
   const someSelected = selectedIds.size > 0 && selectedIds.size < connections.length;
@@ -194,24 +240,41 @@ export default function ConnectionsListPanel({
       label: t("filterCreditsExhausted", "Credits Exhausted"),
     },
   ];
-  const filtered =
+  const healthFiltered =
     healthFilter === "all"
       ? sorted
       : sorted.filter((c) => {
           if (healthFilter === "active") return isHealthy(c);
           if (healthFilter === "error")
             return (
-              !isHealthy(c) &&
-              c.testStatus !== "banned" &&
-              c.testStatus !== "credits_exhausted"
+              !isHealthy(c) && c.testStatus !== "banned" && c.testStatus !== "credits_exhausted"
             );
           return c.testStatus === healthFilter;
         });
+  // #7937 — substring search over id/tag/name/email, applied across the FULL
+  // in-memory list (not just the current page).
+  const filtered = filterConnectionsByQuery(accountSearch, healthFiltered);
 
   const totalFilteredPages = Math.max(1, Math.ceil(filtered.length / PAGE_SIZE));
   const clampedPage = Math.min(page, totalFilteredPages - 1);
   const pageStart = clampedPage * PAGE_SIZE;
   const pageEnd = pageStart + PAGE_SIZE;
+
+  const accountSearchInput = (
+    <div className="relative min-w-[160px] max-w-[220px]">
+      <span className="material-symbols-outlined pointer-events-none absolute left-2 top-1/2 -translate-y-1/2 text-[15px] text-text-muted">
+        search
+      </span>
+      <input
+        type="text"
+        value={accountSearch}
+        onChange={(e) => setAccountSearch(e.target.value)}
+        placeholder={t("accountSearchPlaceholder", "Search accounts…")}
+        aria-label={t("accountSearchPlaceholder", "Search accounts…")}
+        className="w-full rounded-lg border border-border bg-sidebar/50 py-1.5 pl-7 pr-3 text-xs text-text-main placeholder:text-text-muted focus:outline-none focus:ring-1 focus:ring-primary"
+      />
+    </div>
+  );
 
   const filterPills = (
     <div className="flex items-center gap-1.5 flex-wrap">
@@ -315,11 +378,13 @@ export default function ConnectionsListPanel({
                     )}
               </span>
             </label>
+            {accountSearchInput}
             {filterPills}
           </div>
 
           {bulkActions}
         </div>
+        {paginationBar}
         <div className="flex flex-col divide-y divide-black/[0.03] dark:divide-white/[0.03] border border-t-0 border-border rounded-b-lg overflow-hidden">
           {pageConnections.length === 0 ? (
             <div className="px-3 py-6 text-center text-sm text-text-muted">
@@ -341,16 +406,29 @@ export default function ConnectionsListPanel({
                 onMoveDown={() => handleSwapPriority(conn, sorted[index + 1])}
                 onToggleActive={(isActive) => handleUpdateConnectionStatus(conn.id, isActive)}
                 onToggleRateLimit={(enabled) => handleToggleRateLimit(conn.id, enabled)}
+                onToggleQuotaVisibility={quotaVisibilityHandler(
+                  quotaSupported,
+                  conn.id,
+                  handleToggleQuotaVisibility
+                )}
                 onToggleClaudeExtraUsage={(enabled) =>
                   handleToggleClaudeExtraUsage(conn.id, enabled)
                 }
-                isCodex={providerId === "codex"}
-                isGeminiCli={providerId === "gemini-cli"}
+                onToggleCodexPaidCredits={(enabled) =>
+                  handleToggleCodexPaidCredits(conn.id, enabled)
+                }
+                onToggleAutoSync={
+                  canAutoSync && handleToggleConnectionAutoSync
+                    ? (enabled) => handleToggleConnectionAutoSync(conn.id, enabled)
+                    : undefined
+                }
+                isCodex={providerId === "codex" || providerId === "codex-app-server"}
                 isCcCompatible={isCcCompatible}
                 cliproxyapiEnabled={cpaProviderEnabled}
-                onToggleCliproxyapiMode={(enabled) =>
-                  handleToggleCliproxyapiMode(conn.id, enabled)
-                }
+                onToggleCliproxyapiMode={(enabled) => handleToggleCliproxyapiMode(conn.id, enabled)}
+                upstreamProxyMode={upstreamProxyMode}
+                upstreamProxyFallbackBackend={upstreamProxyFallbackBackend}
+                onSetUpstreamProxyMode={handleSetUpstreamProxyMode}
                 onToggleCodex5h={(enabled) => handleToggleCodexLimit(conn.id, "use5h", enabled)}
                 onToggleCodexWeekly={(enabled) =>
                   handleToggleCodexLimit(conn.id, "useWeekly", enabled)
@@ -358,7 +436,12 @@ export default function ConnectionsListPanel({
                 onRetest={() => handleRetestConnection(conn.id)}
                 isRetesting={retestingId === conn.id}
                 onEdit={() => onOpenEditModal(conn)}
-                onDelete={() => handleDelete(conn.id)}
+                onDelete={() =>
+                  deleteConfirm.request(
+                    conn.id,
+                    pickDisplayValue([conn.name, conn.email], emailsVisible, conn.id)
+                  )
+                }
                 onReauth={
                   conn.authType === "oauth"
                     ? () => gateConnectionFlow(() => onOpenOAuth(conn))
@@ -384,18 +467,6 @@ export default function ConnectionsListPanel({
                   providerId === "claude" ? () => onExportClaudeAuthFile(conn.id) : undefined
                 }
                 isExportingClaudeAuthFile={exportingClaudeAuthId === conn.id}
-                onApplyGeminiAuthLocal={
-                  providerId === "gemini-cli"
-                    ? () => onOpenApplyGeminiModal(conn.id)
-                    : undefined
-                }
-                isApplyingGeminiAuthLocal={applyingGeminiAuthId === conn.id}
-                onExportGeminiAuthFile={
-                  providerId === "gemini-cli"
-                    ? () => onExportGeminiAuthFile(conn.id)
-                    : undefined
-                }
-                isExportingGeminiAuthFile={exportingGeminiAuthId === conn.id}
                 onProxy={() =>
                   onSetProxyTarget({
                     level: "key",
@@ -405,13 +476,17 @@ export default function ConnectionsListPanel({
                 }
                 hasProxy={!!connProxyMap[conn.id]?.proxy}
                 proxySource={connProxyMap[conn.id]?.level || null}
-                proxyHost={connProxyMap[conn.id]?.proxy?.host || null}
+                proxyHost={resolveConnProxyField(connProxyMap, conn.id, "host")}
+                proxyName={resolveConnProxyField(connProxyMap, conn.id, "name")}
                 proxyEnabled={readBooleanToggle(conn.proxyEnabled, true)}
                 onToggleProxyEnabled={(enabled) => handleToggleProxyEnabled(conn.id, enabled)}
                 perKeyProxyEnabled={readBooleanToggle(conn.perKeyProxyEnabled, false)}
                 onTogglePerKeyProxyEnabled={(enabled) =>
                   handleTogglePerKeyProxyEnabled(conn.id, enabled)
                 }
+                quotaCache={quotaByConnectionId[conn.id]}
+                quotaRefreshing={quotaRefreshingIds.has(conn.id)}
+                onRefreshQuota={() => handleRefreshQuota(conn.id)}
               />
             ))
           )}
@@ -421,7 +496,10 @@ export default function ConnectionsListPanel({
     );
   }
 
-  // Build ordered tag groups: untagged first, then alphabetically
+  // Build ordered tag groups: untagged first, then alphabetically. Group
+  // ordering + per-tag totals come from the FULL filtered set so the tag
+  // order/count stay stable across pages; row rendering below only shows the
+  // slice that belongs to the current page (#7937 — tagged view pagination).
   const groupMap = new Map<string, ConnectionRowConnection[]>();
   for (const conn of filtered) {
     const tag = (conn.providerSpecificData?.tag as string | undefined)?.trim() || "";
@@ -433,6 +511,15 @@ export default function ConnectionsListPanel({
     if (b === "") return 1;
     return compareTr(a, b);
   });
+
+  const pageConnectionsTagged = filtered.slice(pageStart, pageEnd);
+  const pagedGroupMap = new Map<string, ConnectionRowConnection[]>();
+  for (const conn of pageConnectionsTagged) {
+    const tag = (conn.providerSpecificData?.tag as string | undefined)?.trim() || "";
+    if (!pagedGroupMap.has(tag)) pagedGroupMap.set(tag, []);
+    pagedGroupMap.get(tag)!.push(conn);
+  }
+  const visibleGroupKeys = groupKeys.filter((tag) => (pagedGroupMap.get(tag)?.length ?? 0) > 0);
 
   return (
     <>
@@ -467,6 +554,7 @@ export default function ConnectionsListPanel({
                     )}
               </span>
             </label>
+            {accountSearchInput}
             {filterPills}
           </div>
 
@@ -478,16 +566,16 @@ export default function ConnectionsListPanel({
           </div>
         </div>
       ) : null}
+      {paginationBar}
       <div className="flex flex-col gap-0 border border-t-0 border-border rounded-b-lg overflow-hidden">
-        {groupKeys.map((tag, gi) => {
-          const groupConns = groupMap.get(tag)!;
+        {visibleGroupKeys.map((tag, gi) => {
+          const groupConns = pagedGroupMap.get(tag)!;
+          const groupTotal = groupMap.get(tag)!.length;
           return (
             <div
               key={tag || "__untagged__"}
               className={
-                gi > 0
-                  ? "border-t border-black/[0.06] dark:border-white/[0.06] mt-1 pt-1"
-                  : ""
+                gi > 0 ? "border-t border-black/[0.06] dark:border-white/[0.06] mt-1 pt-1" : ""
               }
             >
               {tag && (
@@ -500,11 +588,13 @@ export default function ConnectionsListPanel({
                   </span>
                   <div className="flex-1 h-px bg-black/[0.04] dark:bg-white/[0.04]" />
                   <DistributeProxiesButton
-                    onDistribute={async () => { await handleDistributeProxies(tag); }}
+                    onDistribute={async () => {
+                      await handleDistributeProxies(tag);
+                    }}
                     disabled={batchTesting || !!retestingId}
                     size="sm"
                   />
-                  <span className="text-[10px] text-text-muted/40">{groupConns.length}</span>
+                  <span className="text-[10px] text-text-muted/40">{groupTotal}</span>
                 </div>
               )}
               <div className="flex flex-col divide-y divide-black/[0.03] dark:divide-white/[0.03]">
@@ -516,86 +606,76 @@ export default function ConnectionsListPanel({
                     isClaude={providerId === "claude"}
                     codexGlobalServiceMode={codexGlobalServiceMode}
                     isFirst={gi === 0 && index === 0}
-                    isLast={gi === groupKeys.length - 1 && index === groupConns.length - 1}
+                    isLast={gi === visibleGroupKeys.length - 1 && index === groupConns.length - 1}
                     isSelected={selectedIds.has(conn.id)}
                     onToggleSelect={() => handleToggleSelectOne(conn.id)}
-                    onMoveUp={() =>
-                      handleSwapPriority(conn, sorted[sorted.indexOf(conn) - 1])
-                    }
-                    onMoveDown={() =>
-                      handleSwapPriority(conn, sorted[sorted.indexOf(conn) + 1])
-                    }
-                    onToggleActive={(isActive) =>
-                      handleUpdateConnectionStatus(conn.id, isActive)
-                    }
+                    onMoveUp={() => handleSwapPriority(conn, sorted[sorted.indexOf(conn) - 1])}
+                    onMoveDown={() => handleSwapPriority(conn, sorted[sorted.indexOf(conn) + 1])}
+                    onToggleActive={(isActive) => handleUpdateConnectionStatus(conn.id, isActive)}
                     onToggleRateLimit={(enabled) => handleToggleRateLimit(conn.id, enabled)}
+                    onToggleQuotaVisibility={quotaVisibilityHandler(
+                      quotaSupported,
+                      conn.id,
+                      handleToggleQuotaVisibility
+                    )}
                     onToggleClaudeExtraUsage={(enabled) =>
                       handleToggleClaudeExtraUsage(conn.id, enabled)
                     }
-                    isCodex={providerId === "codex"}
-                    isGeminiCli={providerId === "gemini-cli"}
+                    onToggleCodexPaidCredits={(enabled) =>
+                      handleToggleCodexPaidCredits(conn.id, enabled)
+                    }
+                    onToggleAutoSync={
+                      canAutoSync && handleToggleConnectionAutoSync
+                        ? (enabled) => handleToggleConnectionAutoSync(conn.id, enabled)
+                        : undefined
+                    }
+                    isCodex={providerId === "codex" || providerId === "codex-app-server"}
                     isCcCompatible={isCcCompatible}
                     cliproxyapiEnabled={cpaProviderEnabled}
                     onToggleCliproxyapiMode={(enabled) =>
                       handleToggleCliproxyapiMode(conn.id, enabled)
                     }
-                    onToggleCodex5h={(enabled) =>
-                      handleToggleCodexLimit(conn.id, "use5h", enabled)
-                    }
+                    upstreamProxyMode={upstreamProxyMode}
+                    upstreamProxyFallbackBackend={upstreamProxyFallbackBackend}
+                    onSetUpstreamProxyMode={handleSetUpstreamProxyMode}
+                    onToggleCodex5h={(enabled) => handleToggleCodexLimit(conn.id, "use5h", enabled)}
                     onToggleCodexWeekly={(enabled) =>
                       handleToggleCodexLimit(conn.id, "useWeekly", enabled)
                     }
                     onRetest={() => handleRetestConnection(conn.id)}
                     isRetesting={retestingId === conn.id}
                     onEdit={() => onOpenEditModal(conn)}
-                    onDelete={() => handleDelete(conn.id)}
+                    onDelete={() =>
+                      deleteConfirm.request(
+                        conn.id,
+                        pickDisplayValue([conn.name, conn.email], emailsVisible, conn.id)
+                      )
+                    }
                     onReauth={
                       conn.authType === "oauth"
                         ? () => gateConnectionFlow(() => onOpenOAuth(conn))
                         : undefined
                     }
                     onRefreshToken={
-                      conn.authType === "oauth"
-                        ? () => handleRefreshToken(conn.id)
-                        : undefined
+                      conn.authType === "oauth" ? () => handleRefreshToken(conn.id) : undefined
                     }
                     isRefreshing={refreshingId === conn.id}
                     onApplyCodexAuthLocal={
-                      providerId === "codex"
-                        ? () => onOpenApplyCodexModal(conn.id)
-                        : undefined
+                      providerId === "codex" ? () => onOpenApplyCodexModal(conn.id) : undefined
                     }
                     isApplyingCodexAuthLocal={applyingCodexAuthId === conn.id}
                     onExportCodexAuthFile={
-                      providerId === "codex"
-                        ? () => onExportCodexAuthFile(conn.id)
-                        : undefined
+                      providerId === "codex" ? () => onExportCodexAuthFile(conn.id) : undefined
                     }
                     isExportingCodexAuthFile={exportingCodexAuthId === conn.id}
                     onApplyClaudeAuthLocal={
-                      providerId === "claude"
-                        ? () => onOpenApplyClaudeModal(conn.id)
-                        : undefined
+                      providerId === "claude" ? () => onOpenApplyClaudeModal(conn.id) : undefined
                     }
                     isApplyingClaudeAuthLocal={applyingClaudeAuthId === conn.id}
                     onExportClaudeAuthFile={
-                      providerId === "claude"
-                        ? () => onExportClaudeAuthFile(conn.id)
-                        : undefined
+                      providerId === "claude" ? () => onExportClaudeAuthFile(conn.id) : undefined
                     }
                     isExportingClaudeAuthFile={exportingClaudeAuthId === conn.id}
-                    onApplyGeminiAuthLocal={
-                      providerId === "gemini-cli"
-                        ? () => onOpenApplyGeminiModal(conn.id)
-                        : undefined
-                    }
-                    isApplyingGeminiAuthLocal={applyingGeminiAuthId === conn.id}
-                    onExportGeminiAuthFile={
-                      providerId === "gemini-cli"
-                        ? () => onExportGeminiAuthFile(conn.id)
-                        : undefined
-                    }
-                    isExportingGeminiAuthFile={exportingGeminiAuthId === conn.id}
                     onProxy={() =>
                       onSetProxyTarget({
                         level: "key",
@@ -605,15 +685,17 @@ export default function ConnectionsListPanel({
                     }
                     hasProxy={!!connProxyMap[conn.id]?.proxy}
                     proxySource={connProxyMap[conn.id]?.level || null}
-                    proxyHost={connProxyMap[conn.id]?.proxy?.host || null}
+                    proxyHost={resolveConnProxyField(connProxyMap, conn.id, "host")}
+                    proxyName={resolveConnProxyField(connProxyMap, conn.id, "name")}
                     proxyEnabled={readBooleanToggle(conn.proxyEnabled, true)}
-                    onToggleProxyEnabled={(enabled) =>
-                      handleToggleProxyEnabled(conn.id, enabled)
-                    }
+                    onToggleProxyEnabled={(enabled) => handleToggleProxyEnabled(conn.id, enabled)}
                     perKeyProxyEnabled={readBooleanToggle(conn.perKeyProxyEnabled, false)}
                     onTogglePerKeyProxyEnabled={(enabled) =>
                       handleTogglePerKeyProxyEnabled(conn.id, enabled)
                     }
+                    quotaCache={quotaByConnectionId[conn.id]}
+                    quotaRefreshing={quotaRefreshingIds.has(conn.id)}
+                    onRefreshQuota={() => handleRefreshQuota(conn.id)}
                   />
                 ))}
               </div>
@@ -621,6 +703,7 @@ export default function ConnectionsListPanel({
           );
         })}
       </div>
+      {paginationBar}
     </>
   );
 }

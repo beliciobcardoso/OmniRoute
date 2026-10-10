@@ -1,14 +1,14 @@
 ---
 title: "open-sse Architecture"
-version: 3.8.16
-lastUpdated: 2026-06-08
+version: 3.8.40
+lastUpdated: 2026-06-28
 ---
 
 # open-sse Architecture
 
-> **TL;DR**: `open-sse/` is the core streaming engine that powers every LLM request in OmniRoute. It contains ~406 files implementing the request pipeline, executors, services, MCP server, and translation layer. This guide explains how the pieces fit together.
+> **TL;DR**: `open-sse/` is the core streaming engine that powers every LLM request in OmniRoute. It contains ~1,400 files implementing the request pipeline, executors, services, MCP server, and translation layer. This guide explains how the pieces fit together.
 
-**Source:** `open-sse/` (workspace package, ~143K LOC across 406 files)
+**Source:** `open-sse/` (workspace package, ~1,440 non-test `.ts` files)
 
 ---
 
@@ -36,11 +36,11 @@ open-sse/
 ├── types.d.ts            # Public type exports
 ├── package.json          # @omniroute/open-sse
 ├── config/               # Provider configs, constants, registries
-├── executors/            # Per-provider HTTP executors (59 files)
+├── executors/            # Per-provider HTTP executors (67 + base.ts/index.ts)
 ├── handlers/             # Request handlers (chatCore, responses, etc.)
 ├── lib/                  # Internal utilities
 ├── mcp-server/           # Model Context Protocol server
-├── services/             # ~114 service modules
+├── services/             # ~298 service modules
 ├── transformer/          # Responses API format transformer
 ├── translator/           # Format translation (OpenAI ↔ Claude ↔ Gemini)
 └── utils/                # Shared utilities (logging, error, stream, etc.)
@@ -49,13 +49,13 @@ open-sse/
 ### Module Counts
 
 | Directory | Files | Purpose |
-| `executors/` | 62 | Per-provider HTTP executors (unified via DefaultExecutor factory) |
-| `handlers/` | ~15 | Request entry points (chatCore, responses, embeddings) |
-| `services/` | ~114 | Routing, caching, rate limiting, refresh, etc. |
-| `translator/` | ~10 | Format conversion (OpenAI ↔ Claude ↔ Gemini) |
-| `mcp-server/` | 30 | MCP tools and transports |
-| `utils/` | ~30 | Cross-cutting utilities (logging, error, stream) |
-| `config/` | ~10 | Provider configs, constants, registries |
+| `executors/` | 167 | Per-provider HTTP executors (unified via DefaultExecutor factory) |
+| `handlers/` | 157 | Request entry points (chatCore, responses, embeddings) |
+| `services/` | ~536 | Routing, caching, rate limiting, refresh, etc. |
+| `translator/` | 56 | Format conversion (OpenAI ↔ Claude ↔ Gemini) |
+| `mcp-server/` | 44 | MCP tools and transports |
+| `utils/` | ~108 | Cross-cutting utilities (logging, error, stream) |
+| `config/` | ~339 | Provider configs, constants, registries |
 
 ---
 
@@ -104,7 +104,8 @@ Resolves the request to a concrete `(provider, model, account, credentials)` tup
 - Pick the next viable target
 
 For `auto/*` models, this stage also:
-- Runs the **9-factor scoring** algorithm (`services/autoCombo/`)
+
+- Runs the **16-factor scoring** algorithm (`services/autoCombo/`)
 - Selects a `provider+model` pair based on health, cost, latency, etc.
 
 ### Stage 2: Translate (translator/)
@@ -136,6 +137,7 @@ All providers use `DefaultExecutor` (`executors/default.ts`) via the `getExecuto
 - Handles auth refresh if needed (OAuth providers)
 
 All executors extend `BaseExecutor` (`executors/base.ts`, 1170 LOC) which provides:
+
 - Common retry logic
 - Proxy integration
 - Circuit breaker integration
@@ -177,17 +179,17 @@ export async function handleChat(request: NextRequest) {
   // 1. Auth + CORS
   await authenticateRequest(request);
   applyCorsHeaders(response);
-  
+
   // 2. Body validation
   const body = await parseRequestBody(request);
-  
+
   // 3. Format detection + translation
   const sourceFormat = detectFormat(request);
   const targetFormat = getTargetFormat(providerId);
   if (needsTranslation(sourceFormat, targetFormat)) {
     body = translateRequest(body, sourceFormat, targetFormat);
   }
-  
+
   // 4. Combo routing
   const targets = await resolveComboTargets(comboId, body);
   for (const target of targets) {
@@ -199,7 +201,7 @@ export async function handleChat(request: NextRequest) {
       // Continue to next target
     }
   }
-  
+
   // 5. Emergency fallback
   return await emergencyFallback(body);
 }
@@ -226,29 +228,31 @@ export async function handleComboChat(body, comboId): Promise<ChatResult> {
 }
 ```
 
-Supports **15 routing strategies** (see `src/shared/constants/routingStrategies.ts`):
+Supports **19 routing strategies** (see `src/shared/constants/routingStrategies.ts`):
 
-| Strategy | Behavior |
-|----------|----------|
-| `priority` | First-target ordered list |
-| `weighted` | Probabilistic by per-target weight |
-| `round-robin` | Cycle through targets in order |
-| `context-relay` | Hand off context across targets |
-| `fill-first` | Fill quota before moving to next |
-| `p2c` | Power of two choices |
-| `random` | Uniform random |
-| `least-used` | Pick the one with fewest recent uses |
-| `cost-optimized` | Cheapest healthy target first |
-| `reset-aware` | Aware of provider reset windows |
-| `reset-window` | Reset window-based routing |
-| `strict-random` | Truly uniform (no quality weighting) |
-| `auto` | Use 9-factor scoring (`autoCombo/`) |
-| `lkgp` | Last known good provider first |
-| `context-optimized` | Best for long-context requests |
+| Strategy            | Behavior                                                                  |
+| ------------------- | ------------------------------------------------------------------------- |
+| `priority`          | First-target ordered list                                                 |
+| `weighted`          | Probabilistic by per-target weight                                        |
+| `round-robin`       | Cycle through targets in order                                            |
+| `context-relay`     | Hand off context across targets                                           |
+| `fill-first`        | Fill quota before moving to next                                          |
+| `p2c`               | Power of two choices                                                      |
+| `random`            | Uniform random                                                            |
+| `least-used`        | Pick the one with fewest recent uses                                      |
+| `cost-optimized`    | Cheapest healthy target first                                             |
+| `reset-aware`       | Aware of provider reset windows                                           |
+| `reset-window`      | Reset window-based routing                                                |
+| `headroom`          | Most remaining quota headroom first                                       |
+| `strict-random`     | Truly uniform (no quality weighting)                                      |
+| `auto`              | Use 16-factor scoring (`autoCombo/`)                                      |
+| `lkgp`              | Last known good provider first                                            |
+| `context-optimized` | Best for long-context requests                                            |
+| `fusion`            | Fan out to a panel in parallel, then synthesize via a judge (`fusion.ts`) |
 
 ### base.ts (1170 LOC)
 
-The **abstract executor** that all 59 executors extend. It contains:
+The **abstract executor** that all 107 executors extend. It contains:
 
 - `buildUrl()` — default URL construction (subclasses override for custom)
 - `buildHeaders()` — default headers (auth, content-type)
@@ -264,7 +268,8 @@ export class DefaultExecutor extends BaseExecutor {
 ```
 
 Provider-specific behavior (auth headers, base URL, version headers) is configured via the provider registry, not separate executor classes.
-```
+
+````
 
 ---
 
@@ -275,7 +280,7 @@ Services are **focused, single-purpose modules** that handlers compose. The big 
 ### Routing & Combo
 
 - `combo.ts` — entry point for combo-routed requests
-- `services/autoCombo/` — 9-factor scoring, 8 auto routing strategies
+- `services/autoCombo/` — 16-factor scoring, 8 auto routing strategies
 - `wildcardRouter.ts` — matches wildcard routes (`gpt-*`)
 - `modelFamilyFallback.ts` — T5 intra-family fallback
 
@@ -341,12 +346,13 @@ export default {
   id: "together",
   baseURL: "https://api.together.xyz/v1/chat/completions",
 }
-```
+````
 
 **Custom auth** is handled through the provider registry's auth configuration (API key, OAuth, header profiles).
 
 **Custom request body** transformations (e.g., Anthropic separating `system` from `messages`) are registered per-provider in `open-sse/translator/`.
-```
+
+````
 
 ### The Executor Factory
 
@@ -360,9 +366,9 @@ const result = await executor.execute({
   model: "claude-sonnet-4-5",
   messages: [...],
 });
-```
+````
 
-The factory is generated from `config/providerRegistry.ts` which lists all 212+ providers and their executor class.
+Resolution goes through the `ExecutorRegistry` (`executors/registry.ts`): every specialized executor is declared in the built-in table of `executors/index.ts` and registered via `registerExecutor(alias, instance)` at module load; `getExecutor()` consults the registry and falls back to a memoized `DefaultExecutor` for any provider without a specialized entry. The full alias → executor mapping is characterized by the golden test `tests/unit/executor-map-golden.test.ts`.
 
 ---
 
@@ -381,6 +387,7 @@ if (needsTranslation(sourceFormat, targetFormat)) {
 ```
 
 Common translations:
+
 - `OpenAI → Anthropic`: separate `system` field, `x-api-key` header
 - `OpenAI → Gemini`: `contents` instead of `messages`, `systemInstruction`
 - `OpenAI → Responses API`: `input` array, `previous_response_id` state
@@ -399,9 +406,10 @@ Common translations:
 
 `open-sse/mcp-server/` implements the **Model Context Protocol** server:
 
-- **30+ tools** (provider management, combos, memory, cache, compression, 1proxy, skills)
+- **110 tools** (provider management, combos, memory, cache, compression, proxy, skills, gamification, plugins, Notion, Obsidian, local corpus)
 - **3 transports**: stdio, SSE, Streamable HTTP
-- **13 scopes** for fine-grained authorization
+- **33 scopes** for fine-grained authorization
+
 ### Tool Registration
 
 Tools are registered as standalone files in `open-sse/mcp-server/tools/`, each exporting a name, schema, handler, and scope:
@@ -465,6 +473,7 @@ createResponsesApiTransformStream(): TransformStream
 ```
 
 This handles:
+
 - `response.output_item.added` events
 - `response.output_text.delta` events
 - `response.completed` event
@@ -476,13 +485,13 @@ This handles:
 
 `open-sse/config/` holds the configuration layer:
 
-| File | Purpose |
-|------|---------|
-| `providerRegistry.ts` | 212+ provider definitions |
-| `providerModels.ts` | Model aliases, format mapping |
-| `constants.ts` | Timeouts, limits, status codes |
-| `defaultThinkingSignature.ts` | Default Claude thinking signature |
-| `modelStrip.ts` (in services) | Per-provider field stripping |
+| File                          | Purpose                                           |
+| ----------------------------- | ------------------------------------------------- |
+| `providerRegistry.ts`         | Chat-model registry over the 352-provider catalog |
+| `providerModels.ts`           | Model aliases, format mapping                     |
+| `constants.ts`                | Timeouts, limits, status codes                    |
+| `defaultThinkingSignature.ts` | Default Claude thinking signature                 |
+| `modelStrip.ts` (in services) | Per-provider field stripping                      |
 
 ### Provider Registry Schema
 
@@ -507,13 +516,13 @@ Zod validation at module load ensures all provider configs are valid.
 
 The routing engine has strict performance budgets:
 
-| Operation | Target | Measurement |
-|-----------|--------|-------------|
-| Combo resolution | <10ms | For 50 targets |
-| Rate limit check | <1ms | In-memory token bucket |
-| Model family fallback | <5ms | Cached family definitions |
-| Request routing dispatch | <2ms | Hot path |
-| **No blocking I/O in routing hot path** | — | All async |
+| Operation                               | Target | Measurement               |
+| --------------------------------------- | ------ | ------------------------- |
+| Combo resolution                        | <10ms  | For 50 targets            |
+| Rate limit check                        | <1ms   | In-memory token bucket    |
+| Model family fallback                   | <5ms   | Cached family definitions |
+| Request routing dispatch                | <2ms   | Hot path                  |
+| **No blocking I/O in routing hot path** | —      | All async                 |
 
 ---
 
@@ -561,7 +570,7 @@ The routing engine has strict performance budgets:
 - [ARCHITECTURE.md](../architecture/ARCHITECTURE.md) — high-level architecture
 - [CODEBASE_DOCUMENTATION.md](../architecture/CODEBASE_DOCUMENTATION.md) — engineering reference
 - [REPOSITORY_MAP.md](../architecture/REPOSITORY_MAP.md) — directory-by-directory
-- [AUTO-COMBO.md](../routing/AUTO-COMBO.md) — 9-factor scoring
+- [AUTO-COMBO.md](../routing/AUTO-COMBO.md) — 16-factor scoring
 - [MCP-SERVER.md](./MCP-SERVER.md) — MCP server
 - [A2A-SERVER.md](./A2A-SERVER.md) — A2A server
 - Source: `open-sse/` (400+ files, ~143K LOC)
