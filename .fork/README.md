@@ -17,30 +17,48 @@ commit prefixed `fork:` so it is easy to find, drop or upstream later.
 upstream/main ──ff──▶ main   (exact mirror — never commit here)
                         │ merge
                         ▼
-                      prod   (main + overlay) ──▶ Coolify production
-                        │ merge
+          feat/* ──▶  dev    (integration + test) ──▶ Coolify development
+                        │ PR dev → prod, merged by fast-forward
                         ▼
-                      dev    (prod + features under test) ──▶ Coolify development
-                        ▲
-                     feat/*
+                      prod   (only commits already deployed on dev) ──▶ Coolify production
 ```
 
 - Upstream only advances `main` on a stable release (one squash commit per release), so following
   `upstream/main` means following stable releases.
-- Feature work: `feat/*` from `dev` → PR into `dev` → validate on the dev environment → PR
-  `dev → prod`.
+- **Nothing reaches `prod` without passing through `dev` first** — not features, not upstream
+  updates, not hotfixes. `prod` only ever moves to a commit that is already on `dev` and was
+  deployed and validated on the dev environment.
+- No registry: each Coolify app builds from its own branch. Fast-forwarding `prod` to the tested
+  `dev` commit means prod builds the **same commit SHA** (same tree, same `package-lock.json`), so
+  the code is identical; the only drift left is base-image tags resolved at build time.
 
-## Syncing with upstream
+### Promote dev → prod
+
+1. Open a PR `dev → prod` (records what is being promoted; review the diff there).
+2. Merge it by **fast-forward**, not with the GitHub button — "Create a merge commit" adds a
+   commit prod has and dev does not, and "Rebase"/"Squash" rewrite SHAs, so prod would no longer
+   run the exact commit tested on dev:
+
+   ```bash
+   git fetch origin
+   git merge-base --is-ancestor origin/prod origin/dev   # must succeed (prod never ahead of dev)
+   git push origin <tested-sha>:prod                      # usually origin/dev; GitHub marks the PR merged
+   ```
+
+   Push the SHA that was actually deployed on dev, not a newer `dev` tip that was not tested.
+
+### Syncing with upstream
 
 ```bash
 git fetch upstream main
 git checkout main && git merge --ff-only upstream/main && git push origin main
-git checkout prod && git merge main && git push origin prod   # overlay = new files → no conflicts
-git checkout dev  && git merge prod && git push origin dev
+git checkout dev  && git merge main && git push origin dev    # overlay = new files → no conflicts
+# validate on the dev environment, then promote dev → prod as above
 ```
 
 A `--ff-only` failure on `main` means something was committed to it — move that commit to a
-branch and reset `main` to `upstream/main`.
+branch and reset `main` to `upstream/main`. A failure of the `is-ancestor` check means something
+was committed straight to `prod` — merge `prod` into `dev`, test, then promote.
 
 Upstream releases run SQLite migrations on boot. They are **forward-only**: back up the prod data
 directory before deploying a new upstream version to prod.
