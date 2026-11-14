@@ -7,8 +7,11 @@
 #
 #  One compose file serves both Coolify environments (prod / dev). Every
 #  value that must differ between them comes from Coolify env vars, and
-#  the ones whose collision would corrupt data are REQUIRED (`:?`) so a
-#  missing value fails the deploy instead of silently sharing state:
+#  the ones whose collision would corrupt data have no default, so a
+#  missing value fails the deploy instead of silently sharing state
+#  (secrets use `${VAR:?}`; the volume source is a bare `${VAR}` because
+#  Coolify 4.7 rejects `${VAR:?message}` in volume paths — unset gives an
+#  invalid `:/app/data` spec and the deploy stops):
 #
 #    OMNIROUTE_HOST_DATA_DIR  host bind path for /app/data (SQLite + WAL).
 #                             prod: /data/omniroute-prod  dev: /data/omniroute-dev
@@ -45,7 +48,7 @@ services:
     restart: "no"
     command: ["chown", "-R", "1000:1000", "/app/data"]
     volumes:
-      - ${OMNIROUTE_HOST_DATA_DIR:?set OMNIROUTE_HOST_DATA_DIR per environment}:/app/data
+      - ${OMNIROUTE_HOST_DATA_DIR}:/app/data
     exclude_from_hc: true
 
   # ── OmniRoute app ────────────────────────────────────────────────────
@@ -84,10 +87,10 @@ services:
       - AUTH_COOKIE_SECURE=true
       # Publicly reachable deployment: reject unauthenticated /v1/* calls.
       - REQUIRE_API_KEY=${REQUIRE_API_KEY:-true}
-      - JWT_SECRET=${JWT_SECRET:?set JWT_SECRET in Coolify env vars}
-      - API_KEY_SECRET=${API_KEY_SECRET:?set API_KEY_SECRET in Coolify env vars}
-      - OMNIROUTE_WS_BRIDGE_SECRET=${OMNIROUTE_WS_BRIDGE_SECRET:?set OMNIROUTE_WS_BRIDGE_SECRET in Coolify env vars}
-      - INITIAL_PASSWORD=${INITIAL_PASSWORD:?set INITIAL_PASSWORD in Coolify env vars}
+      - JWT_SECRET=${JWT_SECRET:?}
+      - API_KEY_SECRET=${API_KEY_SECRET:?}
+      - OMNIROUTE_WS_BRIDGE_SECRET=${OMNIROUTE_WS_BRIDGE_SECRET:?}
+      - INITIAL_PASSWORD=${INITIAL_PASSWORD:?}
     expose:
       - "20128"
     volumes:
@@ -95,7 +98,7 @@ services:
       # crash loop can delete a dangling named volume (and the database
       # with it); prune never touches a bind mount. Docker creates the
       # directory on first deploy; `data-init` fixes its ownership.
-      - ${OMNIROUTE_HOST_DATA_DIR:?set OMNIROUTE_HOST_DATA_DIR per environment}:/app/data
+      - ${OMNIROUTE_HOST_DATA_DIR}:/app/data
     healthcheck:
       test: ["CMD", "node", "healthcheck.mjs"]
       interval: 30s
