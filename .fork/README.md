@@ -111,13 +111,10 @@ Two halves, because a consistent SQLite copy must come from inside the app conta
 upload must not need a Docker socket:
 
 1. **03:00 — snapshot** (Coolify → app → Scheduled Tasks, container `omniroute`, frequency
-   `0 3 * * *`): online backup API → `offsite/omniroute-YYYY-MM-DD.sqlite` (single file: `journal_mode=DELETE`,
-   + `integrity_check`),
-   copies `server.env`, keeps the last 2 snapshots. Command:
-
-   ```sh
-   cd /app && node -e 'const D=require("better-sqlite3"),fs=require("fs"),dir="/app/data/offsite",out=dir+"/omniroute-"+new Date().toISOString().slice(0,10)+".sqlite";fs.mkdirSync(dir,{recursive:true});const db=new D("/app/data/storage.sqlite",{readonly:true,fileMustExist:true});db.backup(out).then(()=>{db.close();const c=new D(out);c.pragma("journal_mode = DELETE");const r=c.pragma("integrity_check",{simple:true});c.close();if(r!=="ok")throw new Error("integrity_check: "+r);fs.copyFileSync("/app/data/server.env",dir+"/server.env");fs.chmodSync(dir+"/server.env",0o600);for(const f of fs.readdirSync(dir).filter(f=>/^omniroute-\d{4}-\d{2}-\d{2}\.sqlite$/.test(f)).sort().slice(0,-2))for(const x of ["","-wal","-shm"])fs.rmSync(dir+"/"+f+x,{force:true});console.log("snapshot ok",out,fs.statSync(out).size)}).catch(e=>{console.error("snapshot failed:",e.message);process.exit(1)})'
-   ```
+   `0 3 * * *`, command `node /app/data/.fork-snapshot.cjs`): online backup API →
+   `offsite/omniroute-YYYY-MM-DD.sqlite` (single file: `journal_mode=DELETE`, + `integrity_check`),
+   copies `server.env`, keeps the last 2 snapshots. The script itself lives in the compose and is
+   written by `data-init` on every deploy — Coolify caps a task command at 255 characters.
 
 2. **03:30 — upload** (`backup` service in the compose): tars `offsite/`, encrypts it with GPG
    (`BACKUP_GPG_PASSPHRASE`) and uploads to `s3://$BACKUP_R2_BUCKET/$BACKUP_S3_PATH/`, pruning

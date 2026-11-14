@@ -59,6 +59,17 @@ test("offsite backup ships only the staging dir, encrypted, to a required target
   assert.doesNotMatch(block, /docker\.sock/);
 });
 
-test("data-init pre-creates the offsite dir so Docker never creates it as root", () => {
-  assert.match(prod, /mkdir -p \/app\/data\/offsite && chown -R 1000:1000 \/app\/data/);
+test("data-init pre-creates the offsite dir and writes the snapshot script", () => {
+  const block = prod.match(/^ {2}data-init:\n(?: {4}.*\n|\n)+/m)?.[0] ?? "";
+  assert.match(block, /mkdir -p \/app\/data\/offsite\n/);
+  // Ownership fix runs last, after every file data-init writes.
+  assert.match(block, /chown -R 1000:1000 \/app\/data\n(?! {8}\S)/);
+  // The scheduled task runs this file; Coolify caps a task command at 255 chars.
+  assert.match(block, /cat > \/app\/data\/\.fork-snapshot\.cjs <<'EOF'\n/);
+  const script = block.match(/<<'EOF'\n([\s\S]*?)\n {8}EOF\n/)?.[1] ?? "";
+  assert.ok(script.includes("db.backup(out)"), "snapshot must use the online backup API");
+  assert.ok(script.includes('"journal_mode = DELETE"'));
+  assert.ok(script.includes('"/app/data/server.env"'), "server.env must ship with the snapshot");
+  // A `$` would be interpolated by compose and silently corrupt the script.
+  assert.doesNotMatch(script, /\$/);
 });

@@ -48,8 +48,50 @@ services:
     user: "0:0"
     restart: "no"
     # `offsite` is the backup staging dir: create it here so the `backup`
-    # service's bind mount never makes Docker create it as root.
-    command: ["sh", "-c", "mkdir -p /app/data/offsite && chown -R 1000:1000 /app/data"]
+    # service's bind mount never makes Docker create it as root. Also writes
+    # the snapshot script run by the Coolify scheduled task (`node
+    # /app/data/.fork-snapshot.cjs`, container `omniroute`, 03:00) — Coolify
+    # caps a task command at 255 chars, so the script lives here, versioned.
+    # No `$` in the script: compose would interpolate it.
+    command:
+      - sh
+      - -c
+      - |
+        mkdir -p /app/data/offsite
+        cat > /app/data/.fork-snapshot.cjs <<'EOF'
+        // Consistent SQLite snapshot for the offsite backup (.fork/README.md).
+        const D = require("better-sqlite3");
+        const fs = require("fs");
+        const dir = "/app/data/offsite";
+        const out = dir + "/omniroute-" + new Date().toISOString().slice(0, 10) + ".sqlite";
+        fs.mkdirSync(dir, { recursive: true });
+        const db = new D("/app/data/storage.sqlite", { readonly: true, fileMustExist: true });
+        db.backup(out)
+          .then(() => {
+            db.close();
+            // Single self-contained file: no -wal/-shm next to it in the archive.
+            const copy = new D(out);
+            copy.pragma("journal_mode = DELETE");
+            const check = copy.pragma("integrity_check", { simple: true });
+            copy.close();
+            if (check !== "ok") throw new Error("integrity_check: " + check);
+            // STORAGE_ENCRYPTION_KEY: without it every provider credential is lost.
+            fs.copyFileSync("/app/data/server.env", dir + "/server.env");
+            fs.chmodSync(dir + "/server.env", 0o600);
+            const snaps = fs
+              .readdirSync(dir)
+              .filter((f) => f.startsWith("omniroute-") && f.endsWith(".sqlite"))
+              .sort();
+            for (const f of snaps.slice(0, -2))
+              for (const x of ["", "-wal", "-shm"]) fs.rmSync(dir + "/" + f + x, { force: true });
+            console.log("snapshot ok", out, fs.statSync(out).size);
+          })
+          .catch((e) => {
+            console.error("snapshot failed:", e.message);
+            process.exit(1);
+          });
+        EOF
+        chown -R 1000:1000 /app/data
     volumes:
       - /data/omniroute:/app/data
     exclude_from_hc: true
