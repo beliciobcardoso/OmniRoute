@@ -35,6 +35,19 @@ services:
       timeout: 5s
       retries: 3
 
+  # ── Data dir ownership (one-shot) ───────────────────────────────────
+  # Docker creates a missing bind-mount source as root:root, but the app runs
+  # as `node` (UID 1000) and cannot write SQLite there. Coolify gives no host
+  # shell, so fix ownership from inside the stack on every deploy.
+  data-init:
+    image: busybox:1.37.0
+    user: "0:0"
+    restart: "no"
+    command: ["chown", "-R", "1000:1000", "/app/data"]
+    volumes:
+      - ${OMNIROUTE_HOST_DATA_DIR:?set OMNIROUTE_HOST_DATA_DIR per environment}:/app/data
+    exclude_from_hc: true
+
   # ── OmniRoute app ────────────────────────────────────────────────────
   omniroute:
     build:
@@ -49,6 +62,8 @@ services:
     depends_on:
       redis:
         condition: service_healthy
+      data-init:
+        condition: service_completed_successfully
     environment:
       # Coolify magic var: routes the assigned domain to container port 20128.
       - SERVICE_FQDN_OMNIROUTE_20128
@@ -78,9 +93,8 @@ services:
     volumes:
       # Host bind mount, NOT a named volume: `docker system prune` after a
       # crash loop can delete a dangling named volume (and the database
-      # with it); prune never touches a bind mount. Create on the host
-      # before the first deploy:
-      #   mkdir -p <dir> && chown -R 1000:1000 <dir>
+      # with it); prune never touches a bind mount. Docker creates the
+      # directory on first deploy; `data-init` fixes its ownership.
       - ${OMNIROUTE_HOST_DATA_DIR:?set OMNIROUTE_HOST_DATA_DIR per environment}:/app/data
     healthcheck:
       test: ["CMD", "node", "healthcheck.mjs"]

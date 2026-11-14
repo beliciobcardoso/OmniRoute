@@ -92,7 +92,8 @@ App settings that live in Coolify, not in the repo:
 
 ### Data directory (host bind mount)
 
-Create once per environment on the app host before the first deploy:
+No host setup needed: Docker creates the directory on first deploy and the `data-init` service
+chowns it to the `node` user (UID 1000) before the app starts. Manual equivalent, if ever needed:
 
 ```bash
 mkdir -p /data/omniroute-prod && chown -R 1000:1000 /data/omniroute-prod   # node user
