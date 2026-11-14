@@ -1,0 +1,113 @@
+# ──────────────────────────────────────────────────────────────────────
+#  OmniRoute — Docker Compose (Coolify) — FORK OVERLAY
+# ──────────────────────────────────────────────────────────────────────
+#
+#  Fork-owned file (not in upstream). See .fork/README.md for the branch
+#  model and the Coolify runbook.
+#
+#  PRODUCTION compose. `docker-compose.coolify.dev.yaml` is the development
+#  twin and must differ ONLY in the data dir path (tests/unit/fork-coolify-
+#  compose.test.ts enforces it). Edit this file, then regenerate the twin:
+#    sed 's#^\( *- \)/data/omniroute:#\1/data/omniroute-dev:#' \
+#      docker-compose.coolify.yaml > docker-compose.coolify.dev.yaml
+#
+#  The data dir is a LITERAL host path because Coolify does not substitute
+#  app env vars into volume sources: `${VAR:-/x}` always resolves to `/x`,
+#  and a bare `${VAR}` becomes a fresh NAMED volume. Secrets are required
+#  (`${VAR:?}`) so a missing value fails the deploy.
+#
+#    JWT_SECRET, API_KEY_SECRET, OMNIROUTE_WS_BRIDGE_SECRET, INITIAL_PASSWORD
+#                             distinct per environment. Mark them
+#                             runtime-only in Coolify (uncheck "Build
+#                             Variable") so they never become --build-arg.
+#
+#  Domain + TLS: assign the domain to the `omniroute` service in Coolify.
+#  SERVICE_URL_OMNIROUTE is injected by Coolify with the public https URL.
+# ──────────────────────────────────────────────────────────────────────
+
+services:
+  # ── Redis (rate limiter / cache backend) ────────────────────────────
+  redis:
+    image: redis:8.6.5-alpine
+    restart: unless-stopped
+    volumes:
+      - redis-data:/data
+    command: redis-server --save 60 1 --loglevel warning
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+
+  # ── Data dir ownership (one-shot) ───────────────────────────────────
+  # Docker creates a missing bind-mount source as root:root, but the app runs
+  # as `node` (UID 1000) and cannot write SQLite there. Coolify gives no host
+  # shell, so fix ownership from inside the stack on every deploy.
+  data-init:
+    image: busybox:1.37.0
+    user: "0:0"
+    restart: "no"
+    command: ["chown", "-R", "1000:1000", "/app/data"]
+    volumes:
+      - /data/omniroute-dev:/app/data
+    exclude_from_hc: true
+
+  # ── OmniRoute app ────────────────────────────────────────────────────
+  omniroute:
+    build:
+      context: .
+      # CLI-capable runtime without the Docker client: Coolify does not
+      # mount a Docker socket, so the docker/compose binaries in
+      # `runner-cli` would be dead weight.
+      target: runner-cli-no-docker
+    restart: unless-stopped
+    # SQLite WAL checkpoint on shutdown — do not shorten.
+    stop_grace_period: 40s
+    depends_on:
+      redis:
+        condition: service_healthy
+      data-init:
+        condition: service_completed_successfully
+    environment:
+      # Coolify magic var: routes the assigned domain to container port 20128.
+      - SERVICE_FQDN_OMNIROUTE_20128
+      - NODE_ENV=production
+      - PORT=20128
+      - DASHBOARD_PORT=20128
+      - API_PORT=20129
+      - API_HOST=0.0.0.0
+      - HOSTNAME=0.0.0.0
+      - DATA_DIR=/app/data
+      - REDIS_URL=redis://redis:6379
+      # Public origin for OAuth callbacks and generated links. Must be the
+      # bare https origin — SERVICE_FQDN_*/SERVICE_URL_*_20128 carry no
+      # scheme or the internal port and break OAuth redirect URIs.
+      - NEXT_PUBLIC_BASE_URL=${SERVICE_URL_OMNIROUTE}
+      # Internal server-to-server URL for scheduled jobs / self-fetches.
+      - BASE_URL=http://omniroute:20128
+      - AUTH_COOKIE_SECURE=true
+      # Publicly reachable deployment: reject unauthenticated /v1/* calls.
+      - REQUIRE_API_KEY=${REQUIRE_API_KEY:-true}
+      - JWT_SECRET=${JWT_SECRET:?}
+      - API_KEY_SECRET=${API_KEY_SECRET:?}
+      - OMNIROUTE_WS_BRIDGE_SECRET=${OMNIROUTE_WS_BRIDGE_SECRET:?}
+      - INITIAL_PASSWORD=${INITIAL_PASSWORD:?}
+    expose:
+      - "20128"
+    volumes:
+      # Host bind mount, NOT a named volume: `docker system prune` after a
+      # crash loop can delete a dangling named volume (and the database
+      # with it); prune never touches a bind mount. Docker creates the
+      # directory on first deploy; `data-init` fixes its ownership.
+      - /data/omniroute-dev:/app/data
+    healthcheck:
+      test: ["CMD", "node", "healthcheck.mjs"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      # ~110 SQLite migrations on a cold boot; 15s reported a legitimately
+      # migrating container as unhealthy.
+      start_period: 90s
+
+volumes:
+  redis-data:

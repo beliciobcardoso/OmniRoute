@@ -5,7 +5,9 @@ Everything fork-specific lives in **new files** so upstream merges never conflic
 
 | File | Purpose |
 | --- | --- |
-| `docker-compose.coolify.yaml` | Coolify Docker Compose resource (prod + dev) |
+| `docker-compose.coolify.yaml` | Coolify Docker Compose — production (`/data/omniroute`) |
+| `docker-compose.coolify.dev.yaml` | Development twin — differs only in the data dir (`/data/omniroute-dev`) |
+| `tests/unit/fork-coolify-compose.test.ts` | Guards that the two compose files only differ in the data dir |
 | `.fork/README.md` | This file — branch model, sync, Coolify runbook |
 
 Do not edit upstream files on `prod`/`dev` unless unavoidable. If you must, make it one isolated
@@ -65,13 +67,15 @@ directory before deploying a new upstream version to prod.
 
 ## Coolify
 
-One compose file, two environments. Per-environment settings (Coolify → app → Environment
+One compose file per environment (the data dir is a literal path: Coolify does not substitute app
+env vars into volume sources — `${VAR:-/x}` always resolves to `/x` and a bare `${VAR}` silently
+becomes a fresh named volume). Per-environment settings (Coolify → app → Environment
 Variables). Mark every secret **runtime-only** (uncheck "Build Variable"), otherwise Coolify passes
 it as `--build-arg` and it ends up in the build log and image history.
 
 | Variable | prod | dev |
 | --- | --- | --- |
-| `OMNIROUTE_HOST_DATA_DIR` | `/data/omniroute` | `/data/omniroute-dev` |
+| Docker Compose Location (app setting) | `/docker-compose.coolify.yaml` | `/docker-compose.coolify.dev.yaml` |
 | `JWT_SECRET` (`openssl rand -base64 48`) | own | own |
 | `API_KEY_SECRET` (`openssl rand -hex 32`) | own | own |
 | `OMNIROUTE_WS_BRIDGE_SECRET` | own | own |

@@ -5,16 +5,17 @@
 #  Fork-owned file (not in upstream). See .fork/README.md for the branch
 #  model and the Coolify runbook.
 #
-#  One compose file serves both Coolify environments (prod / dev). Every
-#  value that must differ between them comes from Coolify env vars, and
-#  the ones whose collision would corrupt data never fall back to a shared
-#  value: secrets are required (`${VAR:?}`) and the data dir defaults to an
-#  isolated, empty `/data/omniroute-unset`. The volume source MUST keep the
-#  `${VAR:-/absolute/path}` form: Coolify turns a bare `${VAR}` source into
-#  a NAMED volume (fresh and empty), and rejects `${VAR:?message}` outright.
+#  PRODUCTION compose. `docker-compose.coolify.dev.yaml` is the development
+#  twin and must differ ONLY in the data dir path (tests/unit/fork-coolify-
+#  compose.test.ts enforces it). Edit this file, then regenerate the twin:
+#    sed 's#^\( *- \)/data/omniroute:#\1/data/omniroute-dev:#' \
+#      docker-compose.coolify.yaml > docker-compose.coolify.dev.yaml
 #
-#    OMNIROUTE_HOST_DATA_DIR  host bind path for /app/data (SQLite + WAL).
-#                             prod: /data/omniroute  dev: /data/omniroute-dev
+#  The data dir is a LITERAL host path because Coolify does not substitute
+#  app env vars into volume sources: `${VAR:-/x}` always resolves to `/x`,
+#  and a bare `${VAR}` becomes a fresh NAMED volume. Secrets are required
+#  (`${VAR:?}`) so a missing value fails the deploy.
+#
 #    JWT_SECRET, API_KEY_SECRET, OMNIROUTE_WS_BRIDGE_SECRET, INITIAL_PASSWORD
 #                             distinct per environment. Mark them
 #                             runtime-only in Coolify (uncheck "Build
@@ -48,7 +49,7 @@ services:
     restart: "no"
     command: ["chown", "-R", "1000:1000", "/app/data"]
     volumes:
-      - ${OMNIROUTE_HOST_DATA_DIR:-/data/omniroute-unset}:/app/data
+      - /data/omniroute:/app/data
     exclude_from_hc: true
 
   # ── OmniRoute app ────────────────────────────────────────────────────
@@ -98,7 +99,7 @@ services:
       # crash loop can delete a dangling named volume (and the database
       # with it); prune never touches a bind mount. Docker creates the
       # directory on first deploy; `data-init` fixes its ownership.
-      - ${OMNIROUTE_HOST_DATA_DIR:-/data/omniroute-unset}:/app/data
+      - /data/omniroute:/app/data
     healthcheck:
       test: ["CMD", "node", "healthcheck.mjs"]
       interval: 30s
