@@ -7,14 +7,14 @@
 #
 #  One compose file serves both Coolify environments (prod / dev). Every
 #  value that must differ between them comes from Coolify env vars, and
-#  the ones whose collision would corrupt data have no default, so a
-#  missing value fails the deploy instead of silently sharing state
-#  (secrets use `${VAR:?}`; the volume source is a bare `${VAR}` because
-#  Coolify 4.7 rejects `${VAR:?message}` in volume paths — unset gives an
-#  invalid `:/app/data` spec and the deploy stops):
+#  the ones whose collision would corrupt data never fall back to a shared
+#  value: secrets are required (`${VAR:?}`) and the data dir defaults to an
+#  isolated, empty `/data/omniroute-unset`. The volume source MUST keep the
+#  `${VAR:-/absolute/path}` form: Coolify turns a bare `${VAR}` source into
+#  a NAMED volume (fresh and empty), and rejects `${VAR:?message}` outright.
 #
 #    OMNIROUTE_HOST_DATA_DIR  host bind path for /app/data (SQLite + WAL).
-#                             prod: /data/omniroute-prod  dev: /data/omniroute-dev
+#                             prod: /data/omniroute  dev: /data/omniroute-dev
 #    JWT_SECRET, API_KEY_SECRET, OMNIROUTE_WS_BRIDGE_SECRET, INITIAL_PASSWORD
 #                             distinct per environment. Mark them
 #                             runtime-only in Coolify (uncheck "Build
@@ -48,7 +48,7 @@ services:
     restart: "no"
     command: ["chown", "-R", "1000:1000", "/app/data"]
     volumes:
-      - ${OMNIROUTE_HOST_DATA_DIR}:/app/data
+      - ${OMNIROUTE_HOST_DATA_DIR:-/data/omniroute-unset}:/app/data
     exclude_from_hc: true
 
   # ── OmniRoute app ────────────────────────────────────────────────────
@@ -98,7 +98,7 @@ services:
       # crash loop can delete a dangling named volume (and the database
       # with it); prune never touches a bind mount. Docker creates the
       # directory on first deploy; `data-init` fixes its ownership.
-      - ${OMNIROUTE_HOST_DATA_DIR}:/app/data
+      - ${OMNIROUTE_HOST_DATA_DIR:-/data/omniroute-unset}:/app/data
     healthcheck:
       test: ["CMD", "node", "healthcheck.mjs"]
       interval: 30s

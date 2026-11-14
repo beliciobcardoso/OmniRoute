@@ -71,7 +71,7 @@ it as `--build-arg` and it ends up in the build log and image history.
 
 | Variable | prod | dev |
 | --- | --- | --- |
-| `OMNIROUTE_HOST_DATA_DIR` | `/data/omniroute-prod` | `/data/omniroute-dev` |
+| `OMNIROUTE_HOST_DATA_DIR` | `/data/omniroute` | `/data/omniroute-dev` |
 | `JWT_SECRET` (`openssl rand -base64 48`) | own | own |
 | `API_KEY_SECRET` (`openssl rand -hex 32`) | own | own |
 | `OMNIROUTE_WS_BRIDGE_SECRET` | own | own |
