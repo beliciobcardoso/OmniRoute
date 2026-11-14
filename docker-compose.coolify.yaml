@@ -8,7 +8,7 @@
 #  PRODUCTION compose. `docker-compose.coolify.dev.yaml` is the development
 #  twin and must differ ONLY in the data dir path (tests/unit/fork-coolify-
 #  compose.test.ts enforces it). Edit this file, then regenerate the twin:
-#    sed 's#^\( *- \)/data/omniroute:#\1/data/omniroute-dev:#' \
+#    sed 's#^\( *- \)/data/omniroute\([:/]\)#\1/data/omniroute-dev\2#' \
 #      docker-compose.coolify.yaml > docker-compose.coolify.dev.yaml
 #
 #  The data dir is a LITERAL host path because Coolify does not substitute
@@ -47,7 +47,9 @@ services:
     image: busybox:1.37.0
     user: "0:0"
     restart: "no"
-    command: ["chown", "-R", "1000:1000", "/app/data"]
+    # `offsite` is the backup staging dir: create it here so the `backup`
+    # service's bind mount never makes Docker create it as root.
+    command: ["sh", "-c", "mkdir -p /app/data/offsite && chown -R 1000:1000 /app/data"]
     volumes:
       - /data/omniroute:/app/data
     exclude_from_hc: true
@@ -108,6 +110,34 @@ services:
       # ~110 SQLite migrations on a cold boot; 15s reported a legitimately
       # migrating container as unhealthy.
       start_period: 90s
+
+  # ── Offsite backup (daily, encrypted, R2) ───────────────────────────
+  # Ships ONLY /app/data/offsite, where a Coolify scheduled task in the
+  # `omniroute` container writes a consistent SQLite snapshot (online
+  # backup API) plus server.env at 03:00 — see .fork/README.md. Never point
+  # this at the live data dir: a tar of a running WAL database is corrupt.
+  # The archive holds server.env (STORAGE_ENCRYPTION_KEY), hence mandatory
+  # GPG. No Docker socket: nothing is stopped or exec'd.
+  backup:
+    image: offen/docker-volume-backup:v2.49.3
+    restart: unless-stopped
+    depends_on:
+      data-init:
+        condition: service_completed_successfully
+    environment:
+      - BACKUP_CRON_EXPRESSION=30 3 * * *
+      - BACKUP_FILENAME=omniroute-%Y-%m-%dT%H-%M-%S.tar.gz
+      - BACKUP_PRUNING_PREFIX=omniroute-
+      - BACKUP_RETENTION_DAYS=14
+      - GPG_PASSPHRASE=${BACKUP_GPG_PASSPHRASE:?}
+      - AWS_ENDPOINT=${BACKUP_R2_ENDPOINT:?}
+      - AWS_S3_BUCKET_NAME=${BACKUP_R2_BUCKET:?}
+      - AWS_S3_PATH=${BACKUP_S3_PATH:?}
+      - AWS_ACCESS_KEY_ID=${BACKUP_R2_ACCESS_KEY_ID:?}
+      - AWS_SECRET_ACCESS_KEY=${BACKUP_R2_SECRET_ACCESS_KEY:?}
+    volumes:
+      - /data/omniroute/offsite:/backup/omniroute:ro
+    exclude_from_hc: true
 
 volumes:
   redis-data:

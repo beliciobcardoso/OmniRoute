@@ -7,7 +7,7 @@ Everything fork-specific lives in **new files** so upstream merges never conflic
 | --- | --- |
 | `docker-compose.coolify.yaml` | Coolify Docker Compose — production (`/data/omniroute`) |
 | `docker-compose.coolify.dev.yaml` | Development twin — differs only in the data dir (`/data/omniroute-dev`) |
-| `tests/unit/fork-coolify-compose.test.ts` | Guards that the two compose files only differ in the data dir |
+| `tests/unit/fork-coolify-compose.test.ts` | Guards that the two compose files only differ in the data dir, and the backup service contract |
 | `.fork/README.md` | This file — branch model, sync, Coolify runbook |
 
 Do not edit upstream files on `prod`/`dev` unless unavoidable. If you must, make it one isolated
@@ -81,10 +81,16 @@ it as `--build-arg` and it ends up in the build log and image history.
 | `OMNIROUTE_WS_BRIDGE_SECRET` | own | own |
 | `INITIAL_PASSWORD` | own, strong | own |
 | `REQUIRE_API_KEY` | default `true` | default `true` |
+| `BACKUP_R2_ENDPOINT` (host only, no `https://`) | R2 endpoint | same |
+| `BACKUP_R2_BUCKET` | backup bucket | same |
+| `BACKUP_S3_PATH` | `omniroute/prod` | `omniroute/dev` |
+| `BACKUP_R2_ACCESS_KEY_ID` / `BACKUP_R2_SECRET_ACCESS_KEY` | R2 token with write on the bucket | same |
+| `BACKUP_GPG_PASSPHRASE` | own, strong — also keep it **outside** the server | own |
 
-`API_KEY_SECRET` encrypts stored provider credentials: changing it on an existing data directory
-makes those credentials unreadable. Never copy a data directory between environments without its
-secrets.
+Stored provider credentials are encrypted with `STORAGE_ENCRYPTION_KEY`, which the app generates
+on first boot and persists in `<data dir>/server.env`. A database restored without that file loses
+every provider credential (decryption fails, all connections need re-auth). Never copy a data
+directory — or restore a backup — without its `server.env`.
 
 App settings that live in Coolify, not in the repo:
 
@@ -97,17 +103,39 @@ App settings that live in Coolify, not in the repo:
 ### Data directory (host bind mount)
 
 No host setup needed: Docker creates the directory on first deploy and the `data-init` service
-chowns it to the `node` user (UID 1000) before the app starts. Manual equivalent, if ever needed:
+creates `offsite/` and chowns everything to the `node` user (UID 1000) before the app starts.
+
+### Backup (daily, encrypted, offsite)
+
+Two halves, because a consistent SQLite copy must come from inside the app container while the
+upload must not need a Docker socket:
+
+1. **03:00 — snapshot** (Coolify → app → Scheduled Tasks, container `omniroute`, frequency
+   `0 3 * * *`): online backup API → `offsite/omniroute-YYYY-MM-DD.sqlite` (single file: `journal_mode=DELETE`,
+   + `integrity_check`),
+   copies `server.env`, keeps the last 2 snapshots. Command:
+
+   ```sh
+   cd /app && node -e 'const D=require("better-sqlite3"),fs=require("fs"),dir="/app/data/offsite",out=dir+"/omniroute-"+new Date().toISOString().slice(0,10)+".sqlite";fs.mkdirSync(dir,{recursive:true});const db=new D("/app/data/storage.sqlite",{readonly:true,fileMustExist:true});db.backup(out).then(()=>{db.close();const c=new D(out);c.pragma("journal_mode = DELETE");const r=c.pragma("integrity_check",{simple:true});c.close();if(r!=="ok")throw new Error("integrity_check: "+r);fs.copyFileSync("/app/data/server.env",dir+"/server.env");fs.chmodSync(dir+"/server.env",0o600);for(const f of fs.readdirSync(dir).filter(f=>/^omniroute-\d{4}-\d{2}-\d{2}\.sqlite$/.test(f)).sort().slice(0,-2))for(const x of ["","-wal","-shm"])fs.rmSync(dir+"/"+f+x,{force:true});console.log("snapshot ok",out,fs.statSync(out).size)}).catch(e=>{console.error("snapshot failed:",e.message);process.exit(1)})'
+   ```
+
+2. **03:30 — upload** (`backup` service in the compose): tars `offsite/`, encrypts it with GPG
+   (`BACKUP_GPG_PASSPHRASE`) and uploads to `s3://$BACKUP_R2_BUCKET/$BACKUP_S3_PATH/`, pruning
+   archives older than 14 days.
+
+A failed snapshot does not stop the upload — it re-ships the previous day's files. Watch the
+scheduled task's executions (or a Coolify notification) so a stale backup does not go unnoticed.
+
+Restore:
 
 ```bash
-mkdir -p /data/omniroute-prod && chown -R 1000:1000 /data/omniroute-prod   # node user
+gpg --decrypt omniroute-<timestamp>.tar.gz.gpg | tar -xz     # → backup/omniroute/…
+sqlite3 backup/omniroute/omniroute-<date>.sqlite "PRAGMA integrity_check"
 ```
 
-Backup (app may stay up — `.backup` is WAL-safe):
-
-```bash
-sqlite3 /data/omniroute-prod/storage.sqlite ".backup '/backup/omniroute-$(date +%F).sqlite'"
-```
+Then stop the app and put **both** files back into the data dir (`storage.sqlite`, `server.env`;
+delete any stale `storage.sqlite-wal`/`-shm`), or import the `.sqlite` from the dashboard
+(Settings → Database) and restore `server.env` by hand before restarting.
 
 ### Crash-loop runbook
 
