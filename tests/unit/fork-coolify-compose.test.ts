@@ -53,6 +53,9 @@ test("offsite backup ships only the staging dir, encrypted, to a required target
     "AWS_ENDPOINT=${BACKUP_R2_ENDPOINT:?}",
     "AWS_S3_BUCKET_NAME=${BACKUP_R2_BUCKET:?}",
     "AWS_S3_PATH=${BACKUP_S3_PATH:?}",
+    // A failed upload must alert someone, not just log in the container.
+    "NOTIFICATION_URLS=${BACKUP_NOTIFICATION_URLS:?}",
+    "NOTIFICATION_LEVEL=error",
   ]) {
     assert.ok(block.includes(`- ${key}`), `backup env missing ${key}`);
   }

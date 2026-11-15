@@ -1,0 +1,48 @@
+# Fork overlay (see .fork/README.md): fast gate for the Coolify deploy
+# branches. A push to dev/prod triggers a ~30 min Coolify build; this catches
+# compose drift (prod/dev twin, backup contract, broken interpolation) first.
+name: Fork gate
+
+on:
+  push:
+    branches: [dev, prod]
+  pull_request:
+    branches: [dev, prod]
+
+permissions:
+  contents: read
+
+jobs:
+  compose:
+    if: github.repository == 'beliciobcardoso/OmniRoute'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+      # Node 24 strips the TS types natively: no npm install needed.
+      - run: node --test tests/unit/fork-coolify-compose.test.ts
+      - name: docker compose config
+        # Dummy values satisfy the `${VAR:?}` guards; `exclude_from_hc` is a
+        # Coolify-only key that plain compose rejects.
+        env:
+          SERVICE_URL_OMNIROUTE: https://example.test
+          JWT_SECRET: x
+          API_KEY_SECRET: x
+          OMNIROUTE_WS_BRIDGE_SECRET: x
+          INITIAL_PASSWORD: x
+          BACKUP_GPG_PASSPHRASE: x
+          BACKUP_R2_ENDPOINT: x
+          BACKUP_R2_BUCKET: x
+          BACKUP_S3_PATH: x
+          BACKUP_R2_ACCESS_KEY_ID: x
+          BACKUP_R2_SECRET_ACCESS_KEY: x
+          BACKUP_NOTIFICATION_URLS: x
+        run: |
+          for f in docker-compose.coolify.yaml docker-compose.coolify.dev.yaml; do
+            grep -v 'exclude_from_hc' "$f" > /tmp/compose.yaml
+            docker compose -f /tmp/compose.yaml --project-directory . config --quiet
+            echo "ok $f"
+          done

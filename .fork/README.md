@@ -8,6 +8,7 @@ Everything fork-specific lives in **new files** so upstream merges never conflic
 | `docker-compose.coolify.yaml` | Coolify Docker Compose — production (`/data/omniroute`) |
 | `docker-compose.coolify.dev.yaml` | Development twin — differs only in the data dir (`/data/omniroute-dev`) |
 | `tests/unit/fork-coolify-compose.test.ts` | Guards that the two compose files only differ in the data dir, and the backup service contract |
+| `.github/workflows/fork-gate.yml` | Runs that test + `docker compose config` on every push/PR to `dev`/`prod`, before the Coolify build |
 | `.fork/README.md` | This file — branch model, sync, Coolify runbook |
 
 Do not edit upstream files on `prod`/`dev` unless unavoidable. If you must, make it one isolated
@@ -86,6 +87,7 @@ it as `--build-arg` and it ends up in the build log and image history.
 | `BACKUP_S3_PATH` | `omniroute/prod` | `omniroute/dev` |
 | `BACKUP_R2_ACCESS_KEY_ID` / `BACKUP_R2_SECRET_ACCESS_KEY` | R2 token with write on the bucket | same |
 | `BACKUP_GPG_PASSPHRASE` | own, strong — also keep it **outside** the server | own |
+| `BACKUP_NOTIFICATION_URLS` ([shoutrrr](https://containrrr.dev/shoutrrr/) URL, e.g. `telegram://<token>@telegram?chats=<id>`) | upload-failure alert | same |
 
 Stored provider credentials are encrypted with `STORAGE_ENCRYPTION_KEY`, which the app generates
 on first boot and persists in `<data dir>/server.env`. A database restored without that file loses
@@ -118,10 +120,11 @@ upload must not need a Docker socket:
 
 2. **03:30 — upload** (`backup` service in the compose): tars `offsite/`, encrypts it with GPG
    (`BACKUP_GPG_PASSPHRASE`) and uploads to `s3://$BACKUP_R2_BUCKET/$BACKUP_S3_PATH/`, pruning
-   archives older than 14 days.
+   archives older than 14 days. A failed upload alerts via `BACKUP_NOTIFICATION_URLS`.
 
-A failed snapshot does not stop the upload — it re-ships the previous day's files. Watch the
-scheduled task's executions (or a Coolify notification) so a stale backup does not go unnoticed.
+A failed snapshot does not stop the upload — it re-ships the previous day's files. The Coolify
+team notification (Telegram, scheduled task failure/success) covers the snapshot: a failure, or
+a missing daily success message, means the backup is stale.
 
 Restore:
 

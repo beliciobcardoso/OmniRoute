@@ -177,6 +177,10 @@ services:
       - AWS_S3_PATH=${BACKUP_S3_PATH:?}
       - AWS_ACCESS_KEY_ID=${BACKUP_R2_ACCESS_KEY_ID:?}
       - AWS_SECRET_ACCESS_KEY=${BACKUP_R2_SECRET_ACCESS_KEY:?}
+      # shoutrrr URL (e.g. telegram://<token>@telegram?chats=<id>). A failed
+      # upload is otherwise silent: the 03:00 task already reports via Coolify.
+      - NOTIFICATION_URLS=${BACKUP_NOTIFICATION_URLS:?}
+      - NOTIFICATION_LEVEL=error
     volumes:
       - /data/omniroute-dev/offsite:/backup/omniroute:ro
     exclude_from_hc: true
