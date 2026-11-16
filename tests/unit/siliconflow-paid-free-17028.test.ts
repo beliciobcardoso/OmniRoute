@@ -36,7 +36,9 @@ describe("#17028 SiliconFlow pay-as-you-go model protection", () => {
     // 485 → 484: #18418 drops NVIDIA's retired openai/gpt-oss-120b endpoint.
     // 484 → 485: #18579 replaces the stale Token Harbor claude-haiku-5.5:free route with its two
     // sourced :free routes (deepseek-v4.1-flash, mimo-v2.6-flash).
-    assert.equal(totals.modelCount, 485);
+    // 485 → 486: Cloudflare Workers AI sweep 2026-11-16 drops four ids (deprecated
+    // 2026-11-20 or Workers-Paid-only kimi-k2.6) and adds five live Free-plan models.
+    assert.equal(totals.modelCount, 486);
     assert.equal(totals.poolCount, 34);
     assert.equal(totals.uncappedProviders.includes("siliconflow"), false);
   });
