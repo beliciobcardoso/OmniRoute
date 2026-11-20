@@ -94,6 +94,9 @@ export const COLLECTORS = [
   { glob: "tests/integration/services/*.test.ts", sources: ["package.json"] },
   // Node native runner — test:combo:matrix / test:integration (combo strategy decision matrix, 17 strategies)
   { glob: "tests/integration/combo-matrix/*.test.ts", sources: ["package.json"] },
+  // Node native runner — test:postgres (opt-in Postgres backend; ci.yml test-postgres-backend
+  // job with a postgres service container; files skip when DATABASE_URL is unset)
+  { glob: "tests/integration/postgres/*.test.ts", sources: ["package.json"] },
   // Node native runner — test:combo:live (gated real-upstream smoke; RUN_COMBO_LIVE=1 + VPS creds)
   { glob: "tests/integration/combo-live/*.live.test.ts", sources: ["package.json"] },
   // Node native runner — test:boundary:live (gated real-upstream smoke; RUN_BOUNDARY_LIVE=1,

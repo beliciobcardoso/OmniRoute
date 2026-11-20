@@ -193,6 +193,8 @@ jobs:
       - run: npm run check:migration-numbering
       - run: npm run check:public-creds
       - run: npm run check:db-rules
+      - run: npm run check:postgres-boundary
+      - run: npm run check:postgres-schema
       - run: npm run check:known-symbols
       - run: npm run check:route-guard-membership
       - run: npm run check:test-discovery
@@ -1602,6 +1604,50 @@ jobs:
           TEST_SHARD: ${{ matrix.shard }}/2
         run: npm run test:integration:ci
 
+  test-postgres-backend:
+    name: Postgres Backend (opt-in)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    # needs: changes (not build) — no artifact consumed; see test-unit note.
+    needs: changes
+    if: ${{ github.event_name != 'pull_request' || (needs.changes.outputs.code == 'true' && (github.event.pull_request.draft == false || needs.changes.outputs.queueCandidate == 'true')) }}
+    # Opt-in Postgres persistence backend (docs/architecture/POSTGRES_SUPPORT.md).
+    # SQLite stays the default backend for every other job in this workflow.
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: omniroute
+          POSTGRES_PASSWORD: omniroute
+          POSTGRES_DB: omniroute
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U omniroute"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    env:
+      JWT_SECRET: ci-test-secret-with-sufficient-length-for-validation
+      API_KEY_SECRET: ci-test-api-key-secret-long
+      DISABLE_SQLITE_AUTO_BACKUP: "true"
+      DB_DRIVER: postgres
+      DATABASE_URL: postgres://omniroute:omniroute@localhost:5432/omniroute
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v7
+        with:
+          package-manager-cache: false
+          node-version: ${{ env.CI_NODE_VERSION }}
+      - uses: ./.github/actions/npm-ci-retry
+        with:
+          # PR acceleration is not release-candidate provenance.
+          cache: ${{ github.event_name == 'pull_request' }}
+      - run: npm run check:node-runtime
+      - run: npm run test:postgres
+
   test-security:
     name: Security Tests
     runs-on: ubuntu-latest
@@ -1775,6 +1821,7 @@ jobs:
       - test-e2e
       - test-integration
       - test-security
+      - test-postgres-backend
       - test-ecosystem
       - test-protocols-e2e
     steps:
