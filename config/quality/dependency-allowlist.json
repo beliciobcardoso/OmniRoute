@@ -26,7 +26,10 @@
     "vite": "",
     "harfbuzzjs": "devDependency used only by scripts/docs/readme-outline.mjs to shape the kit's Switzer text roles and turn them into vector outlines for the README SVGs (the font's licence forbids embedding a subset). MIT; HarfBuzz compiled to WASM, no native build, no network at runtime. Already in the tree through subset-font; pinned exact at 1.6.4.",
     "fontverter": "devDependency used only by scripts/docs/readme-outline.mjs to read the vendored Switzer woff2 into memory as sfnt for HarfBuzz; nothing it converts is ever written or embedded. BSD-3-Clause; maintained by papandreou (assetgraph). Already in the tree through subset-font; pinned exact at 2.0.0.",
-    "subset-font": "devDependency used only by scripts/docs/readme-fonts.mjs to subset the OFL IBM Plex Mono @fontsource woff2 to the code characters each README SVG keeps as real text, embedded as a data: URI that renders inside GitHub's <img> sandbox. BSD-3-Clause; HarfBuzz compiled to WASM (harfbuzzjs, MIT), no native build, no network at runtime. Maintained by papandreou (assetgraph), 2.x line since 2022."
+    "subset-font": "devDependency used only by scripts/docs/readme-fonts.mjs to subset the OFL IBM Plex Mono @fontsource woff2 to the code characters each README SVG keeps as real text, embedded as a data: URI that renders inside GitHub's <img> sandbox. BSD-3-Clause; HarfBuzz compiled to WASM (harfbuzzjs, MIT), no native build, no network at runtime. Maintained by papandreou (assetgraph), 2.x line since 2022.",
+    "kysely": "Type-safe SQL query builder (kysely-org/kysely, MIT, maintainers koskimas/igalklebanov, published since 2021). Used only by the opt-in Postgres persistence backend under src/lib/db/postgres/ (docs/architecture/POSTGRES_SUPPORT.md); boundary enforced by check:postgres-boundary.",
+    "pg": "node-postgres driver (brianc/node-postgres, MIT, published since 2010; already in the lockfile as a transitive dev dependency). Runtime driver for the opt-in Postgres persistence backend (src/lib/db/postgres/dialect.ts).",
+    "@types/pg": "DefinitelyTyped typings for pg (MIT). Dev-only, pairs with the pg runtime dependency of the opt-in Postgres backend."
   },
   "allowed": [
     "@agentclientprotocol/sdk",
@@ -71,6 +74,7 @@
     "@types/bun",
     "@types/mdx",
     "@types/node",
+    "@types/pg",
     "@types/qrcode",
     "@types/react",
     "@types/react-dom",
@@ -137,6 +141,7 @@
     "katex",
     "keytar",
     "knip",
+    "kysely",
     "license-checker-rseidelsohn",
     "lint-staged",
     "lockfile-lint",
@@ -157,6 +162,7 @@
     "opencode-ai",
     "ora",
     "parse5",
+    "pg",
     "pino",
     "pino-abstract-transport",
     "pino-pretty",
