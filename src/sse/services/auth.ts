@@ -3106,6 +3106,36 @@ export async function markAccountUnavailable(
       return { shouldFallback: true, cooldownMs: lockout.cooldownMs };
     }
 
+    // Cloudflare Workers AI 410: the model was removed from the catalog. Same
+    // contract as the NVIDIA/OpenCode `isModelGone` case (#9833, #17472), but kept
+    // as its own branch because Cloudflare is not a per-model-quota provider: its
+    // 429s (neuron allocation) are account-wide and must keep the connection
+    // cooldown. Without this, one request to a retired model (e.g.
+    // @cf/moonshotai/kimi-k2.6) cooled every Free-plan model of the account for 24h.
+    if (provider && resolveProviderId(provider) === "cloudflare-ai" && status === 410 && model) {
+      const lockout = recordModelLockoutFailure(
+        provider,
+        connectionId,
+        model,
+        "not_found",
+        status,
+        effectiveProviderProfile?.baseCooldownMs ?? COOLDOWN_MS.notFoundLocal,
+        effectiveProviderProfile,
+        { maxCooldownMs: mlSettings.maxCooldownMs }
+      );
+      updateProviderConnection(connectionId, {
+        lastErrorType: "not_found",
+        lastError: `Model ${model} is no longer available on Workers AI`,
+        lastErrorAt: new Date().toISOString(),
+        errorCode: status,
+      }).catch(() => {});
+      log.info(
+        "AUTH",
+        `Model-only lockout for ${provider}:${model} — 410 retired model ${Math.ceil(lockout.cooldownMs / 1000)}s (connection stays active)`
+      );
+      return { shouldFallback: true, cooldownMs: lockout.cooldownMs };
+    }
+
     let terminalStatus = resolveTerminalConnectionStatus(
       status,
       result as { permanent?: boolean; creditsExhausted?: boolean; ambiguousAuth?: boolean },
