@@ -24,17 +24,27 @@ function grantedComboName(rule: string): string {
  *
  * - Skipped while another combo with the same name (any case) still exists:
  *   requests resolve combos case-insensitively, so that grant can still apply.
+ *   By default the check reads the SQLite `combos` table; a caller whose combos
+ *   live in another backend passes `nameStillInUse` with that backend's answer.
  * - `combo/*` and every other rule are kept.
  * - An emptied list is written as `[]` (deny all), never NULL (legacy allow-all).
  * - NULL and malformed lists are left untouched.
  */
-export function revokeComboGrantsByName(db: Db, comboName: string): string[] {
+export function revokeComboGrantsByName(
+  db: Db,
+  comboName: string,
+  options: { nameStillInUse?: boolean } = {}
+): string[] {
   const target = comboName.trim().toLowerCase();
   if (!target) return [];
 
-  const stillExists = db
-    .prepare("SELECT 1 FROM combos WHERE name = ? COLLATE NOCASE LIMIT 1")
-    .get(comboName.trim());
+  const stillExists =
+    options.nameStillInUse ??
+    Boolean(
+      db
+        .prepare("SELECT 1 FROM combos WHERE name = ? COLLATE NOCASE LIMIT 1")
+        .get(comboName.trim())
+    );
   if (stillExists) return [];
 
   const rows = db

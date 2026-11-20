@@ -1108,7 +1108,7 @@ CREATE TABLE IF NOT EXISTS model_combo_mappings (
   pattern TEXT NOT NULL,
   combo_id TEXT NOT NULL,
   priority BIGINT DEFAULT 0,
-  enabled BIGINT DEFAULT 1,
+  enabled BOOLEAN DEFAULT TRUE,
   description TEXT DEFAULT '',
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL,

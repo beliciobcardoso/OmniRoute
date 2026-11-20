@@ -31,13 +31,12 @@ registerComboRepositoryConformance(async () => ({
   },
 }));
 
-test("legacy combo count facade remains synchronous", async () => {
+test("combo count facade delegates to the repository count", async () => {
   await resetStorage();
 
-  assert.equal(typeof combosDb.getCombosCount(), "number");
-  assert.equal(combosDb.getCombosCount(), 0);
+  assert.equal(await combosDb.getCombosCount(), 0);
   await sqliteComboRepository.create({ name: "Counted", models: [] });
-  assert.equal(combosDb.getCombosCount(), 1);
+  assert.equal(await combosDb.getCombosCount(), 1);
 });
 
 test.after(() => {

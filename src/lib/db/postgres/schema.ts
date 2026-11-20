@@ -1027,7 +1027,7 @@ export interface ModelComboMappingsTable {
   pattern: string;
   combo_id: string;
   priority: Generated<number | null>;
-  enabled: Generated<number | null>;
+  enabled: Generated<boolean | null>;
   description: Generated<string | null>;
   created_at: string;
   updated_at: string;

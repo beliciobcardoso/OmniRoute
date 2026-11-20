@@ -35,7 +35,11 @@ test("getPostgresDb throws when the sqlite backend is selected", async () => {
 test("getPostgresDb returns one cached Kysely instance when DB_DRIVER=postgres", async () => {
   await resetPostgresDb();
   await withEnv(
-    { DB_DRIVER: "postgres", DATABASE_URL: "postgres://user:pass@localhost:5432/omniroute" },
+    {
+      DB_DRIVER: "postgres",
+      DATABASE_URL: "postgres://user:pass@localhost:5432/omniroute",
+      OMNIROUTE_POSTGRES_PARTIAL_BACKEND: "1",
+    },
     () => {
       const db = getPostgresDb();
       assert.equal(typeof db.selectFrom, "function");

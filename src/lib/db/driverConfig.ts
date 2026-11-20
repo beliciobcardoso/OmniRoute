@@ -37,9 +37,19 @@ function readDbDriver(): DbDriver {
 }
 
 /**
+ * Domains are ported to Postgres one slice at a time. Until every domain is
+ * ported, DB_DRIVER=postgres runs a *partial* backend: ported domains read and
+ * write Postgres while the rest stay in SQLite, cross-domain writes are not
+ * atomic, and code that still reads ported tables through raw SQLite SQL sees
+ * an empty table. Booting that by accident must not be possible, so it needs
+ * an explicit acknowledgement. Remove this gate once the port is complete.
+ */
+export const POSTGRES_PARTIAL_ACK_ENV = "OMNIROUTE_POSTGRES_PARTIAL_BACKEND";
+
+/**
  * Throws a clear, fail-fast error at boot when DB_DRIVER=postgres is set
- * without a usable DATABASE_URL, instead of surfacing a confusing error
- * later from the first query.
+ * without a usable DATABASE_URL or without acknowledging the partial backend,
+ * instead of surfacing a confusing error later from the first query.
  */
 export function resolveDbDriverConfig(): DbDriverConfig {
   const driver = readDbDriver();
@@ -53,6 +63,13 @@ export function resolveDbDriverConfig(): DbDriverConfig {
     throw new DbDriverConfigError(
       "DB_DRIVER=postgres requires DATABASE_URL to be set " +
         "(e.g. postgres://user:password@host:5432/omniroute)."
+    );
+  }
+
+  if (process.env[POSTGRES_PARTIAL_ACK_ENV]?.trim() !== "1") {
+    throw new DbDriverConfigError(
+      `DB_DRIVER=postgres is a partial, experimental backend (only some domains are ported). ` +
+        `Set ${POSTGRES_PARTIAL_ACK_ENV}=1 to acknowledge it; see docs/architecture/POSTGRES_SUPPORT.md.`
     );
   }
 

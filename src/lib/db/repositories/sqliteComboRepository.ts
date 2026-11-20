@@ -11,10 +11,13 @@ import type {
 import { normalizeComboRecord } from "@/lib/combos/steps";
 import { validateComboInvariant } from "@/lib/combos/invariants";
 import { getDbInstance } from "../core";
-import { deleteLKGPRowsByComboName } from "../settings/lkgp";
-import { clearRotationState } from "../proxies/rotation";
 import { bumpProxyRegistryGeneration } from "../proxies/registryGeneration";
 import { revokeComboGrantsByName } from "../apiKeys/comboGrantRevocation";
+import {
+  applyComboDeletionEffects,
+  purgeComboOwnedState,
+  type ComboImportBatchResult,
+} from "./comboDependents";
 
 type JsonRecord = Record<string, unknown>;
 
@@ -362,20 +365,7 @@ function deleteComboRow(db: ReturnType<typeof getDbInstance>, id: string) {
   const result = db.prepare("DELETE FROM combos WHERE id = ?").run(id);
   if (result.changes === 0)
     return { deleted: false, name: combo?.name, lkgpKeys: [] as string[], purged: 0 };
-  // Purge the combo's proxy assignments and rotation cursor with the combo row
-  // (#14553, same shape as the account-scope purge in providers/deletion.ts
-  // for #9232): orphaned proxy_assignments rows would keep answering for a
-  // scope_id that no longer exists.
-  const purged = db
-    .prepare("DELETE FROM proxy_assignments WHERE scope = 'combo' AND scope_id IS ?")
-    .run(id).changes;
-  clearRotationState(db, "combo", id);
-  return {
-    deleted: true,
-    name: combo?.name,
-    lkgpKeys: combo?.name ? deleteLKGPRowsByComboName(combo.name) : ([] as string[]),
-    purged,
-  };
+  return { deleted: true, name: combo?.name, ...purgeComboOwnedState(db, id, combo?.name) };
 }
 
 export async function deleteCombo(id: string) {
@@ -392,33 +382,11 @@ export async function deleteCombo(id: string) {
   const { deleted, lkgpKeys, purged, revokedKeys } = deleteTransaction();
   if (!deleted) return false;
 
-  if (revokedKeys > 0) {
-    const { clearApiKeyCaches } = await import("../apiKeys");
-    const { invalidateModelCatalogCache } = await import("../readCache");
-    clearApiKeyCaches();
-    invalidateModelCatalogCache();
-  }
-
-  if (purged > 0) {
-    bumpProxyRegistryGeneration();
-  }
-
-  if (lkgpKeys.length > 0) {
-    const { invalidateCachedLKGP } = await import("../readCache");
-    for (const key of lkgpKeys) {
-      invalidateCachedLKGP(key);
-    }
-  }
-
+  await applyComboDeletionEffects({ lkgpKeys, purged, revokedKeys });
   return true;
 }
 
-export interface ComboImportBatchResult {
-  created: JsonRecord[];
-  removed: number;
-  lkgpKeys: string[];
-  revokedKeys: number;
-}
+export type { ComboImportBatchResult } from "./comboDependents";
 
 /**
  * Write a batch of already-validated combos in ONE transaction: any failure

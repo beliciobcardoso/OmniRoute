@@ -1,11 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 
-import {
-  mapDefault,
-  mapType,
-  quoteIdent,
-} from "../../../../scripts/db/gen-postgres-schema.ts";
+import { mapDefault, mapType, quoteIdent } from "../../../../scripts/db/gen-postgres-schema.ts";
 
 test("maps SQLite affinities to Postgres types", () => {
   assert.equal(mapType("INTEGER", false, "t.c"), "BIGINT");

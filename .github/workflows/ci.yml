@@ -1632,6 +1632,7 @@ jobs:
       API_KEY_SECRET: ci-test-api-key-secret-long
       DISABLE_SQLITE_AUTO_BACKUP: "true"
       DB_DRIVER: postgres
+      OMNIROUTE_POSTGRES_PARTIAL_BACKEND: "1"
       DATABASE_URL: postgres://omniroute:omniroute@localhost:5432/omniroute
     steps:
       - uses: actions/checkout@v7

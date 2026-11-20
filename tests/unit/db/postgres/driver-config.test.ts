@@ -35,9 +35,13 @@ test("defaults to sqlite when DB_DRIVER is blank", () => {
   });
 });
 
-test("resolves postgres when DATABASE_URL is set", () => {
+test("resolves postgres when DATABASE_URL is set and the partial backend is acknowledged", () => {
   withEnv(
-    { DB_DRIVER: "postgres", DATABASE_URL: "postgres://user:pass@localhost:5432/omniroute" },
+    {
+      DB_DRIVER: "postgres",
+      DATABASE_URL: "postgres://user:pass@localhost:5432/omniroute",
+      OMNIROUTE_POSTGRES_PARTIAL_BACKEND: "1",
+    },
     () => {
       const config = resolveDbDriverConfig();
       assert.equal(config.driver, "postgres");
@@ -62,4 +66,19 @@ test("rejects an unknown DB_DRIVER value", () => {
   withEnv({ DB_DRIVER: "mysql", DATABASE_URL: undefined }, () => {
     assert.throws(() => resolveDbDriverConfig(), DbDriverConfigError);
   });
+});
+
+test("refuses the partial Postgres backend without an explicit acknowledgement", () => {
+  for (const ack of [undefined, "", "0", "true"]) {
+    withEnv(
+      {
+        DB_DRIVER: "postgres",
+        DATABASE_URL: "postgres://user:pass@localhost:5432/omniroute",
+        OMNIROUTE_POSTGRES_PARTIAL_BACKEND: ack,
+      },
+      () => {
+        assert.throws(() => resolveDbDriverConfig(), /OMNIROUTE_POSTGRES_PARTIAL_BACKEND=1/);
+      }
+    );
+  }
 });

@@ -24,6 +24,7 @@ export const BOOLEAN_COLUMNS: ReadonlySet<string> = new Set([
   "api_keys.usage_limit_enabled",
   "combos.context_cache_protection",
   "inspector_custom_hosts.enabled",
+  "model_combo_mappings.enabled",
   "provider_connections.is_active",
   "provider_connections.per_key_proxy_enabled",
   "provider_connections.proxy_enabled",

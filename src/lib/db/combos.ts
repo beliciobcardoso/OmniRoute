@@ -20,9 +20,8 @@ export function getCombos(limit?: number, offset?: number): Promise<ComboRecord[
   return repository.list(limit, offset);
 }
 
-/** Keep the existing synchronous facade contract while repository APIs become async. */
-export function getCombosCount(): number {
-  return routingConfigRepositories.legacySync.getCombosCount();
+export function getCombosCount(): Promise<number> {
+  return repository.count();
 }
 
 export function getComboById(id: string): Promise<ComboRecord | null> {
@@ -95,7 +94,7 @@ export async function importCombos(
   options: { replaceVisible: boolean }
 ): Promise<{ created: ComboRecord[]; removed: number }> {
   backupDbFile("pre-write");
-  const result = routingConfigRepositories.legacySync.importComboBatch(entries, options);
+  const result = await routingConfigRepositories.comboImport.importBatch(entries, options);
   for (const key of result.lkgpKeys) invalidateCachedLKGP(key);
   if (result.removed > 0) invalidateReasoningRoutingRuleCache();
   if (result.revokedKeys > 0) {
