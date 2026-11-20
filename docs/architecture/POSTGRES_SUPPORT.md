@@ -5,9 +5,13 @@ lastUpdated: 2026-11-20
 
 # PostgreSQL backend (opt-in)
 
-**Status:** foundation only. No domain reads or writes Postgres yet — every repository is still
-SQLite. Domains move over one slice at a time, behind the repository contracts defined by the
-[persistence boundary ADR](./persistence-backend-boundary.md).
+**Status:** partial. Domains move over one slice at a time, behind the repository contracts
+defined by the [persistence boundary ADR](./persistence-backend-boundary.md). Not for production.
+
+| Slice                       | Contract                                      | Postgres implementation                                                  |
+| --------------------------- | --------------------------------------------- | ------------------------------------------------------------------------ |
+| Combos, model→combo mapping | `src/domain/persistence/comboRepositories.ts` | `src/lib/db/repositories/postgres{Combo,ModelComboMapping}Repository.ts` |
+| Everything else             | —                                             | still SQLite                                                             |
 
 SQLite stays the default and the only backend of the Electron build. Postgres is an opt-in,
 server-mode backend for an **externally managed** Postgres 15+ instance. It is not a migration
@@ -16,14 +20,34 @@ exists or is planned.
 
 ## Selecting the backend
 
-| Variable       | Values                         | Notes                                             |
-| -------------- | ------------------------------ | ------------------------------------------------- |
-| `DB_DRIVER`    | `sqlite` (default), `postgres` | Any other value fails at boot.                    |
-| `DATABASE_URL` | `postgres://…`                 | Required when `DB_DRIVER=postgres`; else ignored. |
+| Variable                             | Values                         | Notes                                                            |
+| ------------------------------------ | ------------------------------ | ---------------------------------------------------------------- |
+| `DB_DRIVER`                          | `sqlite` (default), `postgres` | Any other value fails at boot.                                   |
+| `DATABASE_URL`                       | `postgres://…`                 | Required when `DB_DRIVER=postgres`; else ignored.                |
+| `OMNIROUTE_POSTGRES_PARTIAL_BACKEND` | `1`                            | Required with `DB_DRIVER=postgres` until every domain is ported. |
 
 Validation lives in `src/lib/db/driverConfig.ts` (`resolveDbDriverConfig()`). It selects the
 _persistence backend_ and is unrelated to `src/lib/db/adapters/driverFactory.ts`, which picks a
 SQLite _runtime_.
+
+Backend selection happens once per slice in its composition root — for combos,
+`selectRoutingConfigRepositories()` in `src/lib/db/repositories/routingConfigRepositories.ts`.
+
+## Partial backend: what does not hold yet
+
+With `DB_DRIVER=postgres`, ported domains live in Postgres and the rest stays in SQLite:
+
+- **Cross-store writes are not atomic.** Deleting or replace-importing combos commits in Postgres,
+  then cleans the combo's proxy assignments, rotation cursor, LKGP rows, and API key grants in a
+  separate SQLite transaction (`src/lib/db/repositories/comboDependents.ts`). A crash between the
+  two leaves that state behind.
+- **Raw SQLite readers of ported tables see an empty table.** For combos: the health-check combo
+  repair (`src/lib/db/healthCheck.ts`), combo-level proxy resolution (`src/lib/db/settings.ts`),
+  backups (`src/lib/db/backup.ts`), and the legacy JSON migration (`src/lib/db/jsonMigration.ts`).
+  They move to their own repositories when their slice is ported.
+
+The boot gate (`OMNIROUTE_POSTGRES_PARTIAL_BACKEND=1`) exists so this mode is never enabled by
+accident. Remove it when the last domain is ported.
 
 ## Layout
 
@@ -75,9 +99,11 @@ composition root under `src/lib/db/repositories/`.
 ```bash
 docker run -d --rm --name omniroute-pg-test -e POSTGRES_USER=omniroute \
   -e POSTGRES_PASSWORD=omniroute -e POSTGRES_DB=omniroute -p 127.0.0.1:55440:5432 postgres:16-alpine
-DB_DRIVER=postgres DATABASE_URL=postgres://omniroute:omniroute@127.0.0.1:55440/omniroute \
-  npm run test:postgres
+DB_DRIVER=postgres OMNIROUTE_POSTGRES_PARTIAL_BACKEND=1 \
+  DATABASE_URL=postgres://omniroute:omniroute@127.0.0.1:55440/omniroute npm run test:postgres
 ```
 
-`tests/integration/postgres/*.test.ts` skip when `DATABASE_URL` is unset. CI runs them in the
+`tests/integration/postgres/*.test.ts` skip when `DATABASE_URL` is unset. Each ported slice runs
+the same conformance suite as its SQLite repository (for combos,
+`tests/helpers/persistence/comboRepositoryConformance.ts`). CI runs them in the
 `test-postgres-backend` job against a `postgres:16-alpine` service container.
